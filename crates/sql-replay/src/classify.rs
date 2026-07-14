@@ -14,6 +14,11 @@ pub fn should_execute(query: &str, allow_writes: bool) -> bool {
     allow_writes || classify(query) == QueryClass::Read
 }
 
+/// True when the statement is a `USE <db>` database switch.
+pub fn is_use_statement(sql: &str) -> bool {
+    TokenScanner::new(sql).next_word().as_deref() == Some("use")
+}
+
 pub fn classify(sql: &str) -> QueryClass {
     let mut scan = TokenScanner::new(sql);
     let Some(first) = scan.next_word() else {
@@ -253,6 +258,16 @@ mod tests {
         ] {
             assert_eq!(classify(q), QueryClass::Write, "misclassified: {q}");
         }
+    }
+
+    #[test]
+    fn use_statements_are_detected() {
+        assert!(is_use_statement("USE mydb"));
+        assert!(is_use_statement("use `my-db`;"));
+        assert!(is_use_statement("  /* c */ Use mydb"));
+        assert!(!is_use_statement("SELECT 'use mydb'"));
+        assert!(!is_use_statement("SELECT used FROM t"));
+        assert!(!is_use_statement("INSERT INTO uses VALUES (1)"));
     }
 
     #[test]

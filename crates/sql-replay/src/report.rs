@@ -96,7 +96,7 @@ impl RunReport {
             t.events, t.sessions, self.wall_secs, t.qps
         ));
         out.push_str(&format!(
-            "  executed: {}  skipped (write-gated): {}  errors: {}  not run: {}  connect failures: {}\n",
+            "  executed: {}  skipped: {}  errors: {}  not run: {}  connect failures: {}\n",
             t.executed, t.skipped, t.errors, t.not_run, t.connect_failures
         ));
         out.push_str(&format!(

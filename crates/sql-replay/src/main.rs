@@ -44,7 +44,8 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         max_connections: usize,
         /// Replay every event against this database instead of the captured
-        /// per-session databases
+        /// per-session databases (captured USE statements are then skipped
+        /// and counted)
         #[arg(long)]
         db_override: Option<String>,
         /// Execute non-read statements (INSERT/UPDATE/DDL/...). Without this

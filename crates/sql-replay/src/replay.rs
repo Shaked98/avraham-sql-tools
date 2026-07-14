@@ -18,7 +18,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts, OptsBuilder};
 use tokio::sync::Semaphore;
 
-use crate::classify::should_execute;
+use crate::classify::{is_use_statement, should_execute};
 use crate::format::{read_capture, Event};
 use crate::report::{
     redact_url, FingerprintReport, ReportFlags, RunReport, SaturationReport, Totals,
@@ -225,6 +225,14 @@ async fn run_session(
         pacer.pace(&ev).await;
 
         if !should_execute(&ev.query, allow_writes) {
+            metrics.record_skip(ev.fingerprint_id);
+            continue;
+        }
+
+        // With --db-override every session is pinned to the override
+        // database; a captured USE statement would silently unpin it, so
+        // skip (and count) those instead of executing them.
+        if !use_event_db && is_use_statement(&ev.query) {
             metrics.record_skip(ev.fingerprint_id);
             continue;
         }

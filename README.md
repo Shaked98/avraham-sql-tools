@@ -69,7 +69,8 @@ $ sql-replay replay \
   with `--allow-writes`). Replay against a disposable target when using
   `--allow-writes`.
 - `--db-override <db>` replays everything against one database instead of
-  the captured per-session databases.
+  the captured per-session databases; captured `USE` statements are then
+  skipped (and counted as skipped) so sessions stay pinned to the override.
 - `run.json` carries run metadata (target server version, flags, wall
   clock, QPS, saturation) plus per-fingerprint stats (count, errors with a
   first-error sample, skipped, p50/p95/p99/max/mean latency in µs); stdout
