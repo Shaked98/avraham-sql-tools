@@ -596,11 +596,16 @@ async fn collect_target_settings(conn: &mut Conn) -> std::collections::BTreeMap<
 async fn show_variable(conn: &mut Conn, name: &str) -> Option<String> {
     // SHOW VARIABLES LIKE returns no row (rather than an error) for
     // variables the server doesn't have, and always returns strings.
-    let row: Option<(String, String)> = conn
+    let row: Option<(String, String)> = match conn
         .query_first(format!("SHOW VARIABLES LIKE '{name}'"))
         .await
-        .ok()
-        .flatten();
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(variable = name, error = %e, "failed to read target variable");
+            None
+        }
+    };
     row.map(|(_, v)| v)
 }
 

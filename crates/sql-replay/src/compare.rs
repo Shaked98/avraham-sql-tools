@@ -45,7 +45,9 @@ pub struct CompareReport {
     /// only one side).
     pub settings_diff: Vec<SettingDiff>,
     pub totals: TotalsDelta,
-    /// Matched fingerprints with p95 delta >= threshold, worst first.
+    /// Matched fingerprints with p95 delta >= threshold — plus zero-baseline
+    /// fingerprints whose candidate p95 is nonzero (`delta_pct` is null for
+    /// those; they rank worst) — worst first.
     pub regressions: Vec<FpDelta>,
     /// Matched fingerprints with p95 delta <= -threshold, best first.
     pub improvements: Vec<FpDelta>,
@@ -268,6 +270,9 @@ pub fn compare_runs(
             match delta.p95.delta_pct {
                 Some(p) if p >= options.threshold_pct => regressions.push(delta),
                 Some(p) if p <= -options.threshold_pct => improvements.push(delta),
+                // A zero baseline yields no percentage, but any nonzero
+                // candidate is an unbounded regression, not noise.
+                None if delta.p95.candidate_us > 0.0 => regressions.push(delta),
                 _ => stable.push(delta),
             }
         }
@@ -287,9 +292,10 @@ pub fn compare_runs(
     // Rank: worst p95 regression first / best improvement first; ties by
     // absolute delta so big absolute movers outrank tiny ones.
     let pct = |d: &FpDelta| d.p95.delta_pct.unwrap_or(0.0);
+    let reg_pct = |d: &FpDelta| d.p95.delta_pct.unwrap_or(f64::INFINITY);
     regressions.sort_by(|a, b| {
-        pct(b)
-            .total_cmp(&pct(a))
+        reg_pct(b)
+            .total_cmp(&reg_pct(a))
             .then(b.p95.delta_us.total_cmp(&a.p95.delta_us))
     });
     improvements.sort_by(|a, b| {
@@ -692,6 +698,42 @@ mod tests {
         let cand = run("8.0", vec![fp("q", 10, 0, 12_000)]);
         let rep = compare_runs("a", &base, "b", &cand, OPTS);
         assert_eq!(rep.regressions.len(), 1);
+    }
+
+    #[test]
+    fn zero_baseline_with_nonzero_candidate_is_a_regression() {
+        let base = run(
+            "5.7.42",
+            vec![
+                fp("q_zero_big", 10, 0, 0),
+                fp("q_zero_small", 10, 0, 0),
+                fp("q_pct_reg", 10, 0, 10_000),
+                fp("q_zero_both", 10, 0, 0),
+            ],
+        );
+        let cand = run(
+            "8.0.46",
+            vec![
+                fp("q_zero_big", 10, 0, 50_000),
+                fp("q_zero_small", 10, 0, 5_000),
+                fp("q_pct_reg", 10, 0, 30_000), // +200%
+                fp("q_zero_both", 10, 0, 0),
+            ],
+        );
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        // Zero-baseline regressions rank worst (as if +inf), ordered among
+        // themselves by absolute p95 delta; delta_pct stays None.
+        assert_eq!(
+            texts(&rep.regressions),
+            ["q_zero_big", "q_zero_small", "q_pct_reg"]
+        );
+        assert!(rep.regressed);
+        assert_eq!(rep.regressions[0].p95.delta_pct, None);
+        assert_eq!(rep.regressions[0].p95.delta_us, 50_000.0);
+        let json = serde_json::to_value(&rep.regressions[0]).unwrap();
+        assert_eq!(json["p95"]["delta_pct"], serde_json::Value::Null);
+        // 0 -> 0 stays stable.
+        assert_eq!(texts(&rep.stable), ["q_zero_both"]);
     }
 
     #[test]
