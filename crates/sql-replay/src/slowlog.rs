@@ -1,9 +1,16 @@
 //! Streaming parser for MySQL slow query logs.
 //!
-//! Handles both the 5.7 (`# Time: YYMMDD HH:MM:SS`) and 8.0
-//! (`# Time: 2023-09-01T12:00:01.123456Z`, RFC 3339) header dialects, plus
-//! Percona-style `# Thread_id: N Schema: db ...` lines and the 8.0
-//! `log_slow_extra` fields.
+//! Handles both the legacy (`# Time: YYMMDD HH:MM:SS`, 5.6/older and
+//! MariaDB) and modern (`# Time: 2023-09-01T12:00:01.123456Z`, RFC 3339,
+//! written since 5.7.2) header dialects, plus Percona-style
+//! `# Thread_id: N Schema: db ...` lines and the 8.0 `log_slow_extra`
+//! fields.
+//!
+//! The reported dialect label prefers hard evidence: a restart banner's
+//! version string is authoritative; otherwise the label is inferred from
+//! the `# Time:` format (`mysql-5.6-or-older` vs `mysql-5.7-or-newer`),
+//! refined to `mysql-8.0` when `log_slow_extra` fields appear in the
+//! `# Query_time:` line.
 //!
 //! Notable behaviors:
 //! - `use <db>;` metadata lines are **log-global**, not per-thread: the
@@ -25,14 +32,22 @@ use time::format_description::well_known::Rfc3339;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
+    /// Legacy `YYMMDD HH:MM:SS` timestamps: MySQL 5.6/older or MariaDB.
+    Mysql56OrOlder,
+    /// Exact version known from a restart banner.
     Mysql57,
+    /// RFC 3339 timestamps without further evidence (written since 5.7.2).
+    Mysql57OrNewer,
+    /// Restart banner, or RFC 3339 plus `log_slow_extra` fields.
     Mysql80,
 }
 
 impl Dialect {
     pub fn as_str(self) -> &'static str {
         match self {
+            Dialect::Mysql56OrOlder => "mysql-5.6-or-older",
             Dialect::Mysql57 => "mysql-5.7",
+            Dialect::Mysql57OrNewer => "mysql-5.7-or-newer",
             Dialect::Mysql80 => "mysql-8.0",
         }
     }
@@ -70,6 +85,7 @@ enum SqlState {
 
 pub struct SlowLogParser {
     dialect: Option<Dialect>,
+    dialect_from_banner: bool,
     time_micros: Option<i64>,
     set_ts_micros: Option<i64>,
     user: Option<String>,
@@ -93,6 +109,7 @@ impl SlowLogParser {
     pub fn new() -> Self {
         SlowLogParser {
             dialect: None,
+            dialect_from_banner: false,
             time_micros: None,
             set_ts_micros: None,
             user: None,
@@ -175,7 +192,7 @@ impl SlowLogParser {
         if let Some(rest) = line.strip_prefix("# Time: ") {
             if let Some((micros, dialect)) = parse_time_value(rest.trim()) {
                 self.time_micros = Some(micros);
-                self.observe_dialect(dialect);
+                self.observe_time_dialect(dialect);
             }
         } else if let Some(rest) = line.strip_prefix("# User@Host: ") {
             self.handle_user_host(rest);
@@ -183,6 +200,11 @@ impl SlowLogParser {
             self.stats.admin_commands += 1;
             self.reset_entry();
         } else {
+            if line.starts_with("# Query_time:")
+                && (line.contains("Thread_id:") || line.contains("Errno:"))
+            {
+                self.observe_log_slow_extra();
+            }
             self.handle_kv_line(line);
         }
     }
@@ -255,10 +277,12 @@ impl SlowLogParser {
             self.set_ts_micros = None;
             if let Some(pos) = line.find(", Version: ") {
                 let ver = &line[pos + ", Version: ".len()..];
-                if ver.starts_with('5') {
-                    self.observe_dialect(Dialect::Mysql57);
+                if ver.starts_with("5.7") {
+                    self.observe_banner_dialect(Dialect::Mysql57);
+                } else if ver.starts_with('5') {
+                    self.observe_banner_dialect(Dialect::Mysql56OrOlder);
                 } else if ver.starts_with('8') {
-                    self.observe_dialect(Dialect::Mysql80);
+                    self.observe_banner_dialect(Dialect::Mysql80);
                 }
             }
             return true;
@@ -277,9 +301,29 @@ impl SlowLogParser {
         false
     }
 
-    fn observe_dialect(&mut self, d: Dialect) {
+    /// A restart banner states the exact server version; it beats any
+    /// format-inferred guess. The first banner wins.
+    fn observe_banner_dialect(&mut self, d: Dialect) {
+        if !self.dialect_from_banner {
+            self.dialect = Some(d);
+            self.dialect_from_banner = true;
+        }
+    }
+
+    /// The `# Time:` format alone only bounds the version; never override
+    /// an earlier observation.
+    fn observe_time_dialect(&mut self, d: Dialect) {
         if self.dialect.is_none() {
             self.dialect = Some(d);
+        }
+    }
+
+    /// `log_slow_extra` fields in the Query_time line only exist on 8.0;
+    /// they refine a format-inferred guess but never a banner's version.
+    fn observe_log_slow_extra(&mut self) {
+        if !self.dialect_from_banner && matches!(self.dialect, None | Some(Dialect::Mysql57OrNewer))
+        {
+            self.dialect = Some(Dialect::Mysql80);
         }
     }
 
@@ -395,13 +439,17 @@ fn scan_sql_state(mut state: SqlState, line: &str) -> SqlState {
 }
 
 /// Parse the value of a `# Time:` header in either dialect, returning
-/// microseconds since the Unix epoch. The old `YYMMDD HH:MM:SS` format has
-/// no zone information and is assumed to be UTC.
+/// microseconds since the Unix epoch and the dialect the format implies
+/// (RFC 3339 is written since 5.7.2; `YYMMDD HH:MM:SS` means 5.6/older or
+/// MariaDB). The old format has no zone information and is assumed UTC.
 fn parse_time_value(s: &str) -> Option<(i64, Dialect)> {
     let s = s.trim();
     if s.contains('T') {
         let odt = time::OffsetDateTime::parse(s, &Rfc3339).ok()?;
-        return Some(((odt.unix_timestamp_nanos() / 1000) as i64, Dialect::Mysql80));
+        return Some((
+            (odt.unix_timestamp_nanos() / 1000) as i64,
+            Dialect::Mysql57OrNewer,
+        ));
     }
     let mut parts = s.split_whitespace();
     let date = parts.next()?;
@@ -418,7 +466,10 @@ fn parse_time_value(s: &str) -> Option<(i64, Dialect)> {
     let second: u8 = hms.next()?.parse().ok()?;
     let d = time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok()?;
     let dt = d.with_hms(hour, minute, second).ok()?.assume_utc();
-    Some(((dt.unix_timestamp_nanos() / 1000) as i64, Dialect::Mysql57))
+    Some((
+        (dt.unix_timestamp_nanos() / 1000) as i64,
+        Dialect::Mysql56OrOlder,
+    ))
 }
 
 /// Parse a `use <db>;` metadata line.
@@ -471,7 +522,7 @@ mod tests {
     #[test]
     fn old_time_format_parses() {
         let (micros, dialect) = parse_time_value("230901 12:00:01").unwrap();
-        assert_eq!(dialect, Dialect::Mysql57);
+        assert_eq!(dialect, Dialect::Mysql56OrOlder);
         assert_eq!(micros, 1_693_569_601_000_000);
         // Single-digit hour variant.
         let (micros, _) = parse_time_value("230901  1:02:03").unwrap();
@@ -481,7 +532,7 @@ mod tests {
     #[test]
     fn rfc3339_time_format_parses() {
         let (micros, dialect) = parse_time_value("2023-09-01T12:00:01.123456Z").unwrap();
-        assert_eq!(dialect, Dialect::Mysql80);
+        assert_eq!(dialect, Dialect::Mysql57OrNewer);
         assert_eq!(micros, 1_693_569_601_123_456);
         let (micros, _) = parse_time_value("2023-09-01T15:00:01.500000+03:00").unwrap();
         assert_eq!(micros, 1_693_569_601_500_000);
@@ -602,7 +653,7 @@ SELECT x FROM y;
         assert_eq!(qs[0].thread_id, 33);
         assert_eq!(qs[0].db.as_deref(), Some("shop"));
         assert_eq!(qs[0].query_time_s, 0.5);
-        assert_eq!(dialect, Some(Dialect::Mysql57));
+        assert_eq!(dialect, Some(Dialect::Mysql56OrOlder));
     }
 
     #[test]
@@ -652,5 +703,59 @@ SELECT 1;
         assert_eq!(qs.len(), 1);
         assert_eq!(stats.restarts, 1);
         assert_eq!(dialect, Some(Dialect::Mysql57));
+    }
+
+    #[test]
+    fn rfc3339_without_log_slow_extra_is_57_or_newer() {
+        let log = "\
+# Time: 2023-09-01T12:00:01.000000Z
+# User@Host: u[u] @ h []  Id:    9
+# Query_time: 0.000212  Lock_time: 0.000045 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1693569601;
+SELECT 1;
+";
+        let (qs, _, dialect) = parse_all(log);
+        assert_eq!(qs.len(), 1);
+        assert_eq!(dialect, Some(Dialect::Mysql57OrNewer));
+    }
+
+    #[test]
+    fn banner_dialect_beats_format_and_log_slow_extra_evidence() {
+        let log = "\
+/usr/sbin/mysqld, Version: 5.7.42-log (MySQL Community Server (GPL)). started with:
+Tcp port: 3306  Unix socket: /var/lib/mysql/mysql.sock
+Time                 Id Command    Argument
+# Time: 2023-09-01T12:00:01.000000Z
+# User@Host: u[u] @ h []  Id:    9
+# Query_time: 0.000212 Lock_time: 0.000045 Rows_sent: 1 Rows_examined: 1 Thread_id: 9 Errno: 0
+SET timestamp=1693569601;
+SELECT 1;
+";
+        let (qs, _, dialect) = parse_all(log);
+        assert_eq!(qs.len(), 1);
+        assert_eq!(dialect, Some(Dialect::Mysql57));
+    }
+
+    #[test]
+    fn late_banner_overrides_format_guess() {
+        let log = "\
+# Time: 2023-09-01T12:00:01.000000Z
+# User@Host: u[u] @ h []  Id:    9
+# Query_time: 0.000212  Lock_time: 0.000045 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1693569601;
+SELECT 1;
+/usr/sbin/mysqld, Version: 8.0.46 (MySQL Community Server - GPL). started with:
+Tcp port: 3306  Unix socket: /var/lib/mysql/mysql.sock
+Time                 Id Command    Argument
+# Time: 2023-09-01T12:10:00.000000Z
+# User@Host: u[u] @ h []  Id:    2
+# Query_time: 0.000100  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1693570200;
+SELECT 2;
+";
+        let (qs, stats, dialect) = parse_all(log);
+        assert_eq!(qs.len(), 2);
+        assert_eq!(stats.restarts, 1);
+        assert_eq!(dialect, Some(Dialect::Mysql80));
     }
 }

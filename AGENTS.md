@@ -47,9 +47,13 @@ recreate it rather than adding repo-level workarounds.
 All handled in `crates/sql-replay/src/slowlog.rs` (see its module docs and
 tests, which are the executable spec):
 
-- `# Time:` is `YYMMDD HH:MM:SS` on old servers, RFC 3339 on 8.0 — and old
-  servers only print it **when the second changes**, so it must be carried
-  forward. `SET timestamp=N;` (per entry) is the primary event timestamp.
+- `# Time:` is `YYMMDD HH:MM:SS` on MySQL 5.6/older and MariaDB, RFC 3339
+  since MySQL 5.7.2 (so real 5.7 logs use RFC 3339) — and old servers only
+  print it **when the second changes**, so it must be carried forward.
+  `SET timestamp=N;` (per entry) is the primary event timestamp. The
+  dialect label prefers the restart banner's version; the time format only
+  bounds it (`mysql-5.6-or-older`/`mysql-5.7-or-newer`, refined to
+  `mysql-8.0` by `log_slow_extra` fields).
 - `use <db>;` metadata lines are **log-global**, not per-thread: absence of
   a `use` line means "same db as the previous entry in the log", even for a
   different connection.
@@ -71,11 +75,13 @@ tests, which are the executable spec):
 
 `crates/sql-replay/src/classify.rs` (its tests are the spec): anything not
 provably read-only is a write and only runs with `--allow-writes`.
-Non-obvious cases handled there: `SET GLOBAL`/`PERSIST` are writes while
-session-level `SET` is a read; `EXPLAIN ANALYZE` executes the underlying
-statement on 8.0, so DML under it is a write (plain `EXPLAIN`/`DESCRIBE`
-stay reads); `SELECT ... INTO OUTFILE`/`DUMPFILE` writes files on the
-server; `WITH` is classified by the first top-level verb after the CTEs.
+Non-obvious cases handled there: `SET GLOBAL`/`PERSIST`/`SET PASSWORD`/
+`SET DEFAULT ROLE` are writes while session-level `SET` is a read;
+`EXPLAIN ANALYZE` executes the underlying statement on 8.0, so DML under it
+is a write (plain `EXPLAIN`/`DESCRIBE` stay reads); `SELECT ... INTO
+OUTFILE`/`DUMPFILE` writes files on the server; `WITH` is classified by the
+first top-level verb after the CTEs; multi-statement text (a top-level `;`
+followed by more content) is always a write.
 
 ## Capture format
 

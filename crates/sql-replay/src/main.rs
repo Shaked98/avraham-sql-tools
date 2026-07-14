@@ -19,8 +19,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Parse a MySQL slow query log (5.7 or 8.0 dialect) into a compressed
-    /// replay file
+    /// Parse a MySQL slow query log (legacy YYMMDD or modern RFC 3339
+    /// dialect) into a compressed replay file
     Capture {
         /// Slow query log to parse (produce it with long_query_time=0)
         #[arg(long)]

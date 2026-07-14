@@ -37,10 +37,14 @@ $ sql-replay capture --input /var/lib/mysql/slow.log --out capture.jsonl.zst
 captured 6 events / 4 sessions / 5 fingerprints (dialect: mysql-5.7, admin commands ignored: 1) in 0.00s -> capture.jsonl.zst
 ```
 
-Both the 5.7 (`# Time: YYMMDD HH:MM:SS`) and 8.0 (RFC 3339 `# Time:`,
-`log_slow_extra`) slow-log dialects are auto-detected (`--dialect` overrides
-the recorded label), as are Percona-style
-`# Thread_id: ... Schema: ...` lines. The capture file is zstd-compressed
+Both the legacy (`# Time: YYMMDD HH:MM:SS`, written by MySQL 5.6/older and
+MariaDB) and modern (RFC 3339 `# Time:`, written since MySQL 5.7.2, plus the
+8.0 `log_slow_extra` fields) slow-log dialects are parsed, as are
+Percona-style `# Thread_id: ... Schema: ...` lines. The recorded dialect
+label comes from the server-restart banner when the log contains one;
+otherwise it is inferred from the timestamp format (`mysql-5.6-or-older` /
+`mysql-5.7-or-newer`, refined to `mysql-8.0` when `log_slow_extra` fields
+are present), and `--dialect` overrides the label either way. The capture file is zstd-compressed
 JSONL: a header record, one event per query
 (`ts_micros`, `session_id`, `user`, `db`, `query`, `orig_query_time_s`,
 `fingerprint_id`), and a summary record with the fingerprint table
