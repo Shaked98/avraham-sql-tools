@@ -1,0 +1,33 @@
+/usr/sbin/mysqld, Version: 8.0.46 (MySQL Community Server - GPL). started with:
+Tcp port: 3306  Unix socket: /var/lib/mysql/mysql.sock
+Time                 Id Command    Argument
+# Time: 2023-09-01T12:00:01.123456Z
+# User@Host: appuser[appuser] @ app01 [10.0.0.5]  Id:    21
+# Query_time: 0.000212 Lock_time: 0.000045 Rows_sent: 1 Rows_examined: 1 Thread_id: 21 Errno: 0 Killed: 0 Bytes_received: 96 Bytes_sent: 190 Read_first: 0 Read_last: 0 Read_key: 1 Read_next: 0 Read_prev: 0 Read_rnd: 0 Read_rnd_next: 0 Sort_merge_passes: 0 Sort_range_count: 0 Sort_rows: 0 Sort_scan_count: 0 Created_tmp_disk_tables: 0 Created_tmp_tables: 0 Start: 2023-09-01T12:00:01.123244Z End: 2023-09-01T12:00:01.123456Z
+use orders;
+SET timestamp=1693569601;
+SELECT * FROM orders WHERE id = 777;
+# User@Host: appuser[appuser] @ app01 [10.0.0.5]  Id:    22
+# Query_time: 0.000900 Lock_time: 0.000020 Rows_sent: 2 Rows_examined: 40 Thread_id: 22 Errno: 0 Killed: 0 Bytes_received: 120 Bytes_sent: 240 Read_first: 0 Read_last: 0 Read_key: 1 Read_next: 0 Read_prev: 0 Read_rnd: 0 Read_rnd_next: 0 Sort_merge_passes: 0 Sort_range_count: 0 Sort_rows: 0 Sort_scan_count: 0 Created_tmp_disk_tables: 0 Created_tmp_tables: 0 Start: 2023-09-01T12:00:01.200000Z End: 2023-09-01T12:00:01.200900Z
+SET timestamp=1693569601;
+SELECT body FROM posts WHERE body = 'embedded log lines:
+# User@Host: fake[fake] @ evil []  Id: 999
+# Query_time: 9.9 Lock_time: 9.9
+' OR title = "double \" quoted # text" LIMIT 3;
+# Time: 2023-09-01T15:00:02.500000+03:00
+# User@Host: appuser[appuser] @ app03 [10.0.0.7]  Id:    23
+# Query_time: 0.004000 Lock_time: 0.000100 Rows_sent: 0 Rows_examined: 1 Thread_id: 23 Errno: 0 Killed: 0 Bytes_received: 80 Bytes_sent: 52 Read_first: 0 Read_last: 0 Read_key: 1 Read_next: 0 Read_prev: 0 Read_rnd: 0 Read_rnd_next: 0 Sort_merge_passes: 0 Sort_range_count: 0 Sort_rows: 0 Sort_scan_count: 0 Created_tmp_disk_tables: 0 Created_tmp_tables: 0 Start: 2023-09-01T15:00:02.496000+03:00 End: 2023-09-01T15:00:02.500000+03:00
+UPDATE orders SET total = 99.5 WHERE id = 777;
+# User@Host: appuser[appuser] @ app01 [10.0.0.5]  Id:    21
+# Query_time: 0.001100 Lock_time: 0.000000 Rows_sent: 12 Rows_examined: 12 Thread_id: 21 Errno: 0 Killed: 0 Bytes_received: 44 Bytes_sent: 890 Read_first: 0 Read_last: 0 Read_key: 0 Read_next: 0 Read_prev: 0 Read_rnd: 0 Read_rnd_next: 0 Sort_merge_passes: 0 Sort_range_count: 0 Sort_rows: 0 Sort_scan_count: 0 Created_tmp_disk_tables: 0 Created_tmp_tables: 0 Start: 2023-09-01T12:00:03.000000Z End: 2023-09-01T12:00:03.001100Z
+SET timestamp=1693569603;
+SHOW VARIABLES LIKE 'max%';
+# User@Host: appuser[appuser] @ app01 [10.0.0.5]  Id:    22
+# Query_time: 0.000002 Lock_time: 0.000000 Rows_sent: 0 Rows_examined: 0 Thread_id: 22 Errno: 0 Killed: 0 Bytes_received: 0 Bytes_sent: 0 Read_first: 0 Read_last: 0 Read_key: 0 Read_next: 0 Read_prev: 0 Read_rnd: 0 Read_rnd_next: 0 Sort_merge_passes: 0 Sort_range_count: 0 Sort_rows: 0 Sort_scan_count: 0 Created_tmp_disk_tables: 0 Created_tmp_tables: 0 Start: 2023-09-01T12:00:04.000000Z End: 2023-09-01T12:00:04.000002Z
+SET timestamp=1693569604;
+# administrator command: Quit;
+# User@Host: appuser[appuser] @ app03 [10.0.0.7]  Id:    23
+# Query_time: 0.030000 Lock_time: 0.000200 Rows_sent: 1 Rows_examined: 90000 Thread_id: 23 Errno: 0 Killed: 0 Bytes_received: 150 Bytes_sent: 70 Read_first: 1 Read_last: 0 Read_key: 1 Read_next: 90000 Read_prev: 0 Read_rnd: 0 Read_rnd_next: 0 Sort_merge_passes: 0 Sort_range_count: 0 Sort_rows: 0 Sort_scan_count: 0 Created_tmp_disk_tables: 0 Created_tmp_tables: 1 Start: 2023-09-01T12:00:04.970000Z End: 2023-09-01T12:00:05.000000Z
+use analytics;
+SET timestamp=1693569604;
+SELECT COUNT(*) FROM events WHERE day BETWEEN '2023-08-01' AND '2023-09-01' AND kind IN ('a', 'b', 'c');

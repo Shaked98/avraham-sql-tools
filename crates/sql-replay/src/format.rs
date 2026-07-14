@@ -1,0 +1,149 @@
+//! The capture file format: zstd-compressed JSONL.
+//!
+//! Line 1 is a `header` record, followed by one `event` record per query,
+//! and a final `summary` record carrying the source dialect, event count,
+//! and the fingerprint id -> normalized text table.
+
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
+pub const FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Record {
+    Header(Header),
+    Event(Event),
+    Summary(Summary),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Header {
+    pub version: u32,
+    pub tool_version: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Event {
+    pub ts_micros: i64,
+    /// Original connection thread id; replay runs one session per id.
+    pub session_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db: Option<String>,
+    pub query: String,
+    pub orig_query_time_s: f64,
+    pub fingerprint_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Summary {
+    pub source_dialect: String,
+    pub event_count: u64,
+    pub session_count: u64,
+    pub admin_commands_ignored: u64,
+    pub server_restarts_seen: u64,
+    /// fingerprint_id -> normalized query text
+    pub fingerprints: Vec<FingerprintEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FingerprintEntry {
+    pub id: u32,
+    pub text: String,
+}
+
+impl Summary {
+    pub fn fingerprint_text(&self, id: u32) -> Option<&str> {
+        self.fingerprints
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.text.as_str())
+    }
+}
+
+pub struct CaptureWriter {
+    enc: zstd::stream::write::Encoder<'static, BufWriter<File>>,
+}
+
+impl CaptureWriter {
+    pub fn create(path: &Path) -> Result<Self> {
+        let file = File::create(path)
+            .with_context(|| format!("cannot create capture file {}", path.display()))?;
+        let enc = zstd::stream::write::Encoder::new(BufWriter::new(file), 3)?;
+        Ok(CaptureWriter { enc })
+    }
+
+    pub fn write(&mut self, rec: &Record) -> Result<()> {
+        serde_json::to_writer(&mut self.enc, rec)?;
+        self.enc.write_all(b"\n")?;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<()> {
+        self.enc.finish()?.flush()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct CaptureFile {
+    pub header: Header,
+    pub events: Vec<Event>,
+    pub summary: Summary,
+}
+
+pub fn read_capture(path: &Path) -> Result<CaptureFile> {
+    let file =
+        File::open(path).with_context(|| format!("cannot open capture file {}", path.display()))?;
+    let dec = zstd::stream::read::Decoder::new(file)?;
+    let reader = BufReader::new(dec);
+
+    let mut header: Option<Header> = None;
+    let mut summary: Option<Summary> = None;
+    let mut events: Vec<Event> = Vec::new();
+
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("capture line {}", idx + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let rec: Record = serde_json::from_str(&line)
+            .with_context(|| format!("malformed capture record on line {}", idx + 1))?;
+        match rec {
+            Record::Header(h) => {
+                if h.version != FORMAT_VERSION {
+                    bail!(
+                        "unsupported capture format version {} (this build reads {})",
+                        h.version,
+                        FORMAT_VERSION
+                    );
+                }
+                header = Some(h);
+            }
+            Record::Event(e) => events.push(e),
+            Record::Summary(s) => summary = Some(s),
+        }
+    }
+
+    let header = header.context("capture file has no header record")?;
+    let summary = summary.context("capture file has no summary record (truncated capture?)")?;
+    if summary.event_count != events.len() as u64 {
+        bail!(
+            "capture summary declares {} events but file contains {}",
+            summary.event_count,
+            events.len()
+        );
+    }
+    Ok(CaptureFile {
+        header,
+        events,
+        summary,
+    })
+}

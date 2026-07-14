@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: unit and fixture tests
+        run: cargo test --workspace
+      - name: release build
+        run: cargo build --release -p sql-replay
+
+  integration:
+    name: replay vs MySQL ${{ matrix.mysql }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["5.7", "8.0"]
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql }}
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: sqlreplay
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --release -p sql-replay
+      - name: capture the smoke fixture
+        run: |
+          ./target/release/sql-replay capture \
+            --input crates/sql-replay/tests/fixtures/replay_smoke.log \
+            --out capture.jsonl.zst
+      - name: replay against MySQL ${{ matrix.mysql }}
+        run: |
+          ./target/release/sql-replay replay \
+            --capture capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --max-connections 8 \
+            --out run.json
+      - name: assert run.json sanity
+        run: |
+          jq . run.json
+          jq -e '.totals.events == 12' run.json
+          jq -e '.totals.sessions == 3' run.json
+          jq -e '.totals.executed == 10' run.json
+          jq -e '.totals.skipped == 2' run.json
+          jq -e '.totals.errors == 0' run.json
+          jq -e '.totals.not_run == 0' run.json
+          jq -e '.totals.qps > 0' run.json
+          jq -e '.target_server_version | startswith("${{ matrix.mysql }}")' run.json
+          jq -e '.fingerprints | length == 12' run.json
+          jq -e '[.fingerprints[] | select(.count > 0) | .p50_us] | all(. >= 1)' run.json
+          jq -e '[.fingerprints[] | select(.skipped > 0)] | length == 2' run.json
+          jq -e '[.fingerprints[] | select(.skipped > 0) | .count] | all(. == 0)' run.json
+          jq -e '.flags.allow_writes == false' run.json
+      - name: replay with --db-override against MySQL ${{ matrix.mysql }}
+        run: |
+          ./target/release/sql-replay replay \
+            --capture capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --max-connections 8 \
+            --db-override sqlreplay \
+            --out run-override.json
+      - name: assert run-override.json sanity
+        run: |
+          jq . run-override.json
+          jq -e '.totals.events == 12' run-override.json
+          jq -e '.totals.executed == 9' run-override.json
+          jq -e '.totals.skipped == 3' run-override.json
+          jq -e '.totals.errors == 0' run-override.json
+          jq -e '.totals.not_run == 0' run-override.json
+          jq -e '.flags.db_override == "sqlreplay"' run-override.json
+      - name: env-gated live integration test
+        run: cargo test -p sql-replay --test replay_integration
+        env:
+          SQL_REPLAY_TEST_URL: mysql://root@127.0.0.1:3306/sqlreplay
