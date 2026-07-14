@@ -146,7 +146,10 @@ fn capture_of_smoke_fixture_matches_replay_expectations() {
     // The genuine USE statement is captured as an event and is a read.
     let use_event = cap.events.last().unwrap();
     assert_eq!(use_event.query, "use information_schema");
-    assert!(sql_replay::classify::should_execute(&use_event.query, false));
+    assert!(sql_replay::classify::should_execute(
+        &use_event.query,
+        false
+    ));
     let writes: Vec<&str> = cap
         .events
         .iter()
