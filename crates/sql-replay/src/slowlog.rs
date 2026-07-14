@@ -16,7 +16,9 @@
 //! - `use <db>;` metadata lines are **log-global**, not per-thread: the
 //!   server prints one whenever the default db differs from the previous
 //!   entry in the log. Events inherit the most recent `use` (or a
-//!   per-entry `Schema:` field when present).
+//!   per-entry `Schema:` field when present). The metadata line appears
+//!   before the entry's `SET timestamp=N;`; a `use ...;` line after it is
+//!   the logged statement itself (a client-issued USE) and becomes an event.
 //! - `SET timestamp=N;` lines set the event timestamp and are not emitted
 //!   as queries. `# Time:` is carried forward as a fallback (old servers
 //!   only print it when the second changes).
@@ -173,9 +175,15 @@ impl SlowLogParser {
         if t.is_empty() {
             return;
         }
-        if let Some(db) = parse_use_line(t) {
-            self.current_db = Some(db);
-            return;
+        // The server prints the metadata `use <db>;` line before the entry's
+        // `SET timestamp=N;` line. Once SET timestamp has been consumed, a
+        // `use ...;` line is the logged statement itself (a client-issued
+        // USE), not metadata.
+        if self.set_ts_micros.is_none() {
+            if let Some(db) = parse_use_line(t) {
+                self.current_db = Some(db);
+                return;
+            }
         }
         if let Some(ts) = parse_set_timestamp(t) {
             self.set_ts_micros = Some(ts);
@@ -636,6 +644,29 @@ SELECT 3;
         // No `use` printed for thread 2 => same db as previous log entry.
         assert_eq!(qs[1].db.as_deref(), Some("db_a"));
         assert_eq!(qs[2].db.as_deref(), Some("db_b"));
+    }
+
+    #[test]
+    fn use_before_set_timestamp_is_metadata_after_is_statement() {
+        let log = "\
+# User@Host: u[u] @ h []  Id: 1
+# Query_time: 0.0  Lock_time: 0.0 Rows_sent: 0  Rows_examined: 0
+use meta_db;
+SET timestamp=100;
+SELECT 1;
+# User@Host: u[u] @ h []  Id: 2
+# Query_time: 0.0  Lock_time: 0.0 Rows_sent: 0  Rows_examined: 0
+SET timestamp=101;
+use real_db;
+";
+        let (qs, _, _) = parse_all(log);
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].db.as_deref(), Some("meta_db"));
+        assert_eq!(qs[0].query, "SELECT 1");
+        // The second entry's `use` came after SET timestamp: it is the
+        // logged statement, not metadata.
+        assert_eq!(qs[1].query, "use real_db");
+        assert_eq!(qs[1].db.as_deref(), Some("meta_db"));
     }
 
     #[test]

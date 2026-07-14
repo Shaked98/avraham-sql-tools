@@ -56,7 +56,9 @@ tests, which are the executable spec):
   `mysql-8.0` by `log_slow_extra` fields).
 - `use <db>;` metadata lines are **log-global**, not per-thread: absence of
   a `use` line means "same db as the previous entry in the log", even for a
-  different connection.
+  different connection. They only count as metadata before the entry's
+  `SET timestamp=N;`; a `use ...;` line after it is a client-issued USE
+  statement and becomes an event.
 - Thread id comes from `Id:` on the `User@Host` line (5.6+), from
   `Thread_id:` in 8.0 `log_slow_extra` Query_time lines, or from Percona's
   `# Thread_id: N Schema: db` line (which also carries a per-entry schema).

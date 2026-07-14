@@ -24,10 +24,10 @@ fn replay_smoke_against_live_mysql() {
         std::process::id()
     ));
     let summary = run_capture(&fixture, &capture_path, None).expect("capture succeeds");
-    assert_eq!(summary.event_count, 11);
+    assert_eq!(summary.event_count, 12);
 
     let options = ReplayOptions {
-        url,
+        url: url.clone(),
         max_connections: 4,
         allow_writes: false,
         read_only: false,
@@ -41,16 +41,15 @@ fn replay_smoke_against_live_mysql() {
     let report = rt
         .block_on(run_replay(&capture_path, options))
         .expect("replay succeeds");
-    std::fs::remove_file(&capture_path).ok();
 
     assert!(
         !report.target_server_version.is_empty(),
         "server version probed"
     );
     let t = &report.totals;
-    assert_eq!(t.events, 11);
+    assert_eq!(t.events, 12);
     assert_eq!(t.sessions, 3);
-    assert_eq!(t.executed, 9, "all read statements execute: {report:#?}");
+    assert_eq!(t.executed, 10, "all read statements execute: {report:#?}");
     assert_eq!(t.skipped, 2, "DROP and INSERT are write-gated");
     assert_eq!(
         t.errors, 0,
@@ -62,7 +61,7 @@ fn replay_smoke_against_live_mysql() {
     assert!(t.qps > 0.0);
     assert!(report.wall_secs > 0.0);
 
-    assert_eq!(report.fingerprints.len(), 11);
+    assert_eq!(report.fingerprints.len(), 12);
     // Executed fingerprints have real latency data.
     for fp in report.fingerprints.iter().filter(|f| f.count > 0) {
         assert!(fp.p50_us >= 1, "p50 recorded for {}", fp.fingerprint);
@@ -85,4 +84,41 @@ fn replay_smoke_against_live_mysql() {
         assert_eq!(fp.errors, 0);
     }
     assert!(!report.flags.allow_writes);
+
+    // Second run with --db-override: the captured USE statement is skipped
+    // so sessions stay pinned to the override database. The override db is
+    // the URL's path segment (e.g. `sqlreplay` in CI).
+    let db = url
+        .rsplit('/')
+        .next()
+        .map(|s| s.split('?').next().unwrap_or(""))
+        .filter(|s| !s.is_empty() && !s.contains(':') && !s.contains('@'));
+    let Some(db) = db else {
+        std::fs::remove_file(&capture_path).ok();
+        eprintln!("SQL_REPLAY_TEST_URL has no database path segment; skipping db-override leg");
+        return;
+    };
+    let options = ReplayOptions {
+        url: url.clone(),
+        max_connections: 4,
+        allow_writes: false,
+        read_only: false,
+        db_override: Some(db.to_string()),
+        speed: Speed::Max,
+    };
+    let report = rt
+        .block_on(run_replay(&capture_path, options))
+        .expect("db-override replay succeeds");
+    std::fs::remove_file(&capture_path).ok();
+
+    let t = &report.totals;
+    assert_eq!(t.events, 12);
+    assert_eq!(
+        t.executed, 9,
+        "USE is skipped under --db-override: {report:#?}"
+    );
+    assert_eq!(t.skipped, 3, "2 write-gated + 1 USE under override");
+    assert_eq!(t.errors, 0);
+    assert_eq!(t.not_run, 0);
+    assert_eq!(report.flags.db_override.as_deref(), Some(db));
 }

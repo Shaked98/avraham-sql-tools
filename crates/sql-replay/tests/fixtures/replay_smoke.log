@@ -45,3 +45,7 @@ end of string' AS c;
 # Query_time: 0.005000 Lock_time: 0.000200 Rows_sent: 0 Rows_examined: 0
 SET timestamp=1693569604;
 INSERT INTO t_skip_me VALUES (1, 'never runs');
+# User@Host: smoke[smoke] @ localhost []  Id:    3
+# Query_time: 0.000100 Lock_time: 0.000000 Rows_sent: 0 Rows_examined: 0
+SET timestamp=1693569604;
+use information_schema;

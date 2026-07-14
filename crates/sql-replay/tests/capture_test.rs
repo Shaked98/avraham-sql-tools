@@ -140,9 +140,13 @@ fn captures_mysql80_dialect() {
 #[test]
 fn capture_of_smoke_fixture_matches_replay_expectations() {
     let cap = capture_fixture("replay_smoke.log");
-    assert_eq!(cap.summary.event_count, 11);
+    assert_eq!(cap.summary.event_count, 12);
     assert_eq!(cap.summary.session_count, 3);
-    assert_eq!(cap.summary.fingerprints.len(), 11);
+    assert_eq!(cap.summary.fingerprints.len(), 12);
+    // The genuine USE statement is captured as an event and is a read.
+    let use_event = cap.events.last().unwrap();
+    assert_eq!(use_event.query, "use information_schema");
+    assert!(sql_replay::classify::should_execute(&use_event.query, false));
     let writes: Vec<&str> = cap
         .events
         .iter()

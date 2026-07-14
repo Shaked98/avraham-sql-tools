@@ -68,19 +68,36 @@ jobs:
       - name: assert run.json sanity
         run: |
           jq . run.json
-          jq -e '.totals.events == 11' run.json
+          jq -e '.totals.events == 12' run.json
           jq -e '.totals.sessions == 3' run.json
-          jq -e '.totals.executed == 9' run.json
+          jq -e '.totals.executed == 10' run.json
           jq -e '.totals.skipped == 2' run.json
           jq -e '.totals.errors == 0' run.json
           jq -e '.totals.not_run == 0' run.json
           jq -e '.totals.qps > 0' run.json
           jq -e '.target_server_version | startswith("${{ matrix.mysql }}")' run.json
-          jq -e '.fingerprints | length == 11' run.json
+          jq -e '.fingerprints | length == 12' run.json
           jq -e '[.fingerprints[] | select(.count > 0) | .p50_us] | all(. >= 1)' run.json
           jq -e '[.fingerprints[] | select(.skipped > 0)] | length == 2' run.json
           jq -e '[.fingerprints[] | select(.skipped > 0) | .count] | all(. == 0)' run.json
           jq -e '.flags.allow_writes == false' run.json
+      - name: replay with --db-override against MySQL ${{ matrix.mysql }}
+        run: |
+          ./target/release/sql-replay replay \
+            --capture capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --max-connections 8 \
+            --db-override sqlreplay \
+            --out run-override.json
+      - name: assert run-override.json sanity
+        run: |
+          jq . run-override.json
+          jq -e '.totals.events == 12' run-override.json
+          jq -e '.totals.executed == 9' run-override.json
+          jq -e '.totals.skipped == 3' run-override.json
+          jq -e '.totals.errors == 0' run-override.json
+          jq -e '.totals.not_run == 0' run-override.json
+          jq -e '.flags.db_override == "sqlreplay"' run-override.json
       - name: env-gated live integration test
         run: cargo test -p sql-replay --test replay_integration
         env:
