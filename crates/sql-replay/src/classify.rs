@@ -1,0 +1,214 @@
+//! Statement classification for the replay safety gate.
+//!
+//! Anything not provably read-only is classified as a write and is only
+//! executed when `--allow-writes` is passed.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryClass {
+    Read,
+    Write,
+}
+
+/// Decide whether a statement may run without `--allow-writes`.
+pub fn should_execute(query: &str, allow_writes: bool) -> bool {
+    allow_writes || classify(query) == QueryClass::Read
+}
+
+pub fn classify(sql: &str) -> QueryClass {
+    let mut scan = TokenScanner::new(sql);
+    let Some(first) = scan.next_word() else {
+        return QueryClass::Write;
+    };
+    match first.as_str() {
+        "select" | "show" | "explain" | "describe" | "desc" | "use" | "help" => QueryClass::Read,
+        // Session-level SET is required for faithful replay (SET NAMES,
+        // SET @vars, ...), but SET GLOBAL/PERSIST mutate server state.
+        "set" => match scan.next_word().as_deref() {
+            Some("global") | Some("persist") | Some("persist_only") => QueryClass::Write,
+            _ => QueryClass::Read,
+        },
+        // In 8.0, WITH can prefix UPDATE/DELETE as well as SELECT; the first
+        // top-level verb after the CTE bodies decides.
+        "with" => {
+            while let Some(w) = scan.next_word() {
+                if scan.last_word_depth() == 0 {
+                    match w.as_str() {
+                        "select" => return QueryClass::Read,
+                        "insert" | "update" | "delete" | "replace" => return QueryClass::Write,
+                        _ => {}
+                    }
+                }
+            }
+            QueryClass::Write
+        }
+        _ => QueryClass::Write,
+    }
+}
+
+/// Yields lowercased word tokens, skipping strings, comments and literals,
+/// tracking parenthesis depth.
+struct TokenScanner<'a> {
+    b: &'a [u8],
+    i: usize,
+    depth: i32,
+    word_depth: i32,
+}
+
+impl<'a> TokenScanner<'a> {
+    fn new(sql: &'a str) -> Self {
+        TokenScanner {
+            b: sql.as_bytes(),
+            i: 0,
+            depth: 0,
+            word_depth: 0,
+        }
+    }
+
+    /// Parenthesis depth at the start of the last yielded word.
+    fn last_word_depth(&self) -> i32 {
+        self.word_depth
+    }
+
+    fn next_word(&mut self) -> Option<String> {
+        let b = self.b;
+        let n = b.len();
+        while self.i < n {
+            let c = b[self.i];
+            match c {
+                b'(' => {
+                    self.depth += 1;
+                    self.i += 1;
+                }
+                b')' => {
+                    self.depth -= 1;
+                    self.i += 1;
+                }
+                b'\'' | b'"' | b'`' => {
+                    self.i = skip_quoted(b, self.i);
+                }
+                b'/' if self.i + 1 < n && b[self.i + 1] == b'*' => {
+                    self.i += 2;
+                    while self.i + 1 < n && !(b[self.i] == b'*' && b[self.i + 1] == b'/') {
+                        self.i += 1;
+                    }
+                    self.i = (self.i + 2).min(n);
+                }
+                b'-' if self.i + 1 < n
+                    && b[self.i + 1] == b'-'
+                    && (self.i + 2 >= n || b[self.i + 2].is_ascii_whitespace()) =>
+                {
+                    while self.i < n && b[self.i] != b'\n' {
+                        self.i += 1;
+                    }
+                }
+                b'#' => {
+                    while self.i < n && b[self.i] != b'\n' {
+                        self.i += 1;
+                    }
+                }
+                _ if c.is_ascii_alphabetic() || c == b'_' => {
+                    self.word_depth = self.depth;
+                    let start = self.i;
+                    while self.i < n
+                        && (b[self.i].is_ascii_alphanumeric()
+                            || b[self.i] == b'_'
+                            || b[self.i] == b'$')
+                    {
+                        self.i += 1;
+                    }
+                    return Some(
+                        std::str::from_utf8(&b[start..self.i])
+                            .expect("ASCII word")
+                            .to_ascii_lowercase(),
+                    );
+                }
+                _ => self.i += 1,
+            }
+        }
+        None
+    }
+}
+
+fn skip_quoted(b: &[u8], mut i: usize) -> usize {
+    let n = b.len();
+    let quote = b[i];
+    i += 1;
+    while i < n {
+        if b[i] == b'\\' && quote != b'`' {
+            i += 2;
+            continue;
+        }
+        if b[i] == quote {
+            if i + 1 < n && b[i + 1] == quote {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_are_reads() {
+        for q in [
+            "SELECT 1",
+            "  select * from t",
+            "/* lead */ SELECT 1",
+            "-- c\nSELECT 1",
+            "(SELECT 1) UNION (SELECT 2)",
+            "SHOW VARIABLES LIKE 'x%'",
+            "EXPLAIN SELECT * FROM t",
+            "DESCRIBE t",
+            "DESC t",
+            "USE mydb",
+            "SET NAMES utf8mb4",
+            "SET @a = 1, @b = 2",
+            "set session sort_buffer_size = 1000000",
+            "WITH q AS (SELECT 1) SELECT * FROM q",
+            "WITH RECURSIVE q AS (SELECT 1) SELECT * FROM q",
+        ] {
+            assert_eq!(classify(q), QueryClass::Read, "misclassified: {q}");
+        }
+    }
+
+    #[test]
+    fn writes_are_writes() {
+        for q in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "REPLACE INTO t VALUES (1)",
+            "CREATE TABLE t (a INT)",
+            "ALTER TABLE t ADD COLUMN b INT",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "CALL some_proc()",
+            "LOCK TABLES t WRITE",
+            "GRANT ALL ON *.* TO 'x'",
+            "BEGIN",
+            "COMMIT",
+            "SET GLOBAL max_connections = 100",
+            "SET PERSIST max_connections = 100",
+            "WITH q AS (SELECT 1) UPDATE t SET a = 1 WHERE b IN (SELECT * FROM q)",
+            "WITH q AS (SELECT 1) DELETE FROM t WHERE b IN (SELECT * FROM q)",
+            "DO SLEEP(1)",
+            "",
+        ] {
+            assert_eq!(classify(q), QueryClass::Write, "misclassified: {q}");
+        }
+    }
+
+    #[test]
+    fn safety_gate_requires_allow_writes() {
+        assert!(!should_execute("INSERT INTO t VALUES (1)", false));
+        assert!(!should_execute("DROP TABLE t", false));
+        assert!(should_execute("INSERT INTO t VALUES (1)", true));
+        assert!(should_execute("SELECT 1", false));
+    }
+}
