@@ -1,5 +1,5 @@
-//! sql-replay: capture MySQL slow query logs and replay them against a
-//! target server to find performance regressions.
+//! sql-replay: capture MySQL slow query logs, replay them against a
+//! target server, and compare run reports to find performance regressions.
 
 pub mod capture;
 pub mod classify;

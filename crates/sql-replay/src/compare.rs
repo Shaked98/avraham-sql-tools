@@ -6,9 +6,10 @@
 //! different captures still line up where the workload overlaps — with
 //! loud comparability warnings when the runs don't look comparable.
 //! Regression gate: a fingerprint counts as regressed when its p95 delta
-//! is at least `threshold_pct` and it executed at least `min_count` times
-//! in both runs; `compare` exits with code 2 when any exist (see
-//! [`EXIT_REGRESSED`]).
+//! is at least `threshold_pct` (or its baseline p95 is zero while the
+//! candidate's is not — an unbounded regression with no percentage) and it
+//! executed at least `min_count` times in both runs; `compare` exits with
+//! code 2 when any exist (see [`EXIT_REGRESSED`]).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -39,7 +40,8 @@ pub struct CompareReport {
     pub baseline: RunMeta,
     pub candidate: RunMeta,
     /// Non-empty when the two runs don't look comparable (different capture
-    /// file, flags, fingerprint tables, executed counts, target settings).
+    /// file, dialect, flags, fingerprint tables, executed counts, target
+    /// settings).
     pub comparability_warnings: Vec<String>,
     /// Target variables whose values differ between the runs (or exist on
     /// only one side).

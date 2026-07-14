@@ -130,13 +130,15 @@ $ sql-replay compare \
   separately. `--threshold-pct` (default 20) splits regressed/improved
   from noise; `--min-count` (default 5) keeps low-sample fingerprints out
   of the headline ranking (they are still listed below the fold).
-- Outputs: a stdout summary (top regressions/improvements, QPS/wall-clock
-  deltas, error deltas, fingerprints only in one run), `--json` for
+- Outputs: a stdout summary (top regressions/improvements — capped per
+  section by `--top`, default 10 — QPS/wall-clock deltas, error deltas,
+  fingerprints only in one run), `--json` for
   machines, and `--out` for a self-contained HTML report (inline CSS/JS,
   renders offline with zero network requests) with a sortable table and
   both runs' metadata side by side.
-- Comparability preflight: if the runs differ in capture file, replay
-  flags, fingerprint-table shape, executed counts, or target settings, a
+- Comparability preflight: if the runs differ in capture file, capture
+  dialect, replay flags, fingerprint-table shape, executed counts, or
+  target settings, a
   loud warning block tops every output; both `target_server_version`s are
   always shown prominently, and a settings-diff section lists changed
   variables (e.g. `character_set_server: latin1 -> utf8mb4`).
