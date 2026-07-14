@@ -155,10 +155,11 @@ pub fn redact_url(url: &str) -> String {
         return url.to_string();
     };
     let rest = &url[scheme_end + 3..];
-    let Some(at) = rest.find('@') else {
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let Some(at) = authority.rfind('@') else {
         return url.to_string();
     };
-    let userinfo = &rest[..at];
+    let userinfo = &authority[..at];
     match userinfo.find(':') {
         Some(colon) => format!(
             "{}://{}:***@{}",
@@ -187,6 +188,14 @@ mod tests {
         assert_eq!(
             redact_url("mysql://db.example:3306/"),
             "mysql://db.example:3306/"
+        );
+        assert_eq!(
+            redact_url("mysql://user:p@ss@db.example:3306/prod"),
+            "mysql://user:***@db.example:3306/prod"
+        );
+        assert_eq!(
+            redact_url("mysql://db.example:3306/db@name"),
+            "mysql://db.example:3306/db@name"
         );
     }
 }

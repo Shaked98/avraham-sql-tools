@@ -20,29 +20,66 @@ pub fn classify(sql: &str) -> QueryClass {
         return QueryClass::Write;
     };
     match first.as_str() {
-        "select" | "show" | "explain" | "describe" | "desc" | "use" | "help" => QueryClass::Read,
+        "select" => classify_select_tail(&mut scan),
+        "show" | "use" | "help" => QueryClass::Read,
+        // EXPLAIN ANALYZE (unlike plain EXPLAIN) executes the underlying
+        // statement on MySQL 8.0, so DML under it is a write. DESCRIBE/DESC
+        // are EXPLAIN synonyms.
+        "explain" | "describe" | "desc" => match scan.next_word().as_deref() {
+            Some("analyze") => classify_explain_analyze_tail(&mut scan),
+            _ => QueryClass::Read,
+        },
         // Session-level SET is required for faithful replay (SET NAMES,
         // SET @vars, ...), but SET GLOBAL/PERSIST mutate server state.
         "set" => match scan.next_word().as_deref() {
             Some("global") | Some("persist") | Some("persist_only") => QueryClass::Write,
             _ => QueryClass::Read,
         },
-        // In 8.0, WITH can prefix UPDATE/DELETE as well as SELECT; the first
-        // top-level verb after the CTE bodies decides.
-        "with" => {
-            while let Some(w) = scan.next_word() {
-                if scan.last_word_depth() == 0 {
-                    match w.as_str() {
-                        "select" => return QueryClass::Read,
-                        "insert" | "update" | "delete" | "replace" => return QueryClass::Write,
-                        _ => {}
-                    }
-                }
-            }
-            QueryClass::Write
-        }
+        "with" => classify_with_tail(&mut scan),
         _ => QueryClass::Write,
     }
+}
+
+/// Classify the remainder of a SELECT: `INTO OUTFILE`/`INTO DUMPFILE`
+/// writes files on the target server even though the statement is a read.
+fn classify_select_tail(scan: &mut TokenScanner) -> QueryClass {
+    let mut after_into = false;
+    while let Some(w) = scan.next_word() {
+        match w.as_str() {
+            "outfile" | "dumpfile" if after_into => return QueryClass::Write,
+            _ => after_into = w == "into",
+        }
+    }
+    QueryClass::Read
+}
+
+/// In 8.0, WITH can prefix UPDATE/DELETE as well as SELECT; the first
+/// top-level verb after the CTE bodies decides.
+fn classify_with_tail(scan: &mut TokenScanner) -> QueryClass {
+    while let Some(w) = scan.next_word() {
+        if scan.last_word_depth() == 0 {
+            match w.as_str() {
+                "select" => return classify_select_tail(scan),
+                "insert" | "update" | "delete" | "replace" => return QueryClass::Write,
+                _ => {}
+            }
+        }
+    }
+    QueryClass::Write
+}
+
+/// Classify the statement under `EXPLAIN ANALYZE [FORMAT = ...]`, which
+/// MySQL executes for real.
+fn classify_explain_analyze_tail(scan: &mut TokenScanner) -> QueryClass {
+    while let Some(w) = scan.next_word() {
+        match w.as_str() {
+            "format" | "tree" | "json" => continue,
+            "select" | "table" => return classify_select_tail(scan),
+            "with" => return classify_with_tail(scan),
+            _ => return QueryClass::Write,
+        }
+    }
+    QueryClass::Write
 }
 
 /// Yields lowercased word tokens, skipping strings, comments and literals,
@@ -164,8 +201,14 @@ mod tests {
             "(SELECT 1) UNION (SELECT 2)",
             "SHOW VARIABLES LIKE 'x%'",
             "EXPLAIN SELECT * FROM t",
+            "EXPLAIN UPDATE t SET a = 1",
+            "EXPLAIN ANALYZE SELECT * FROM t",
+            "EXPLAIN ANALYZE FORMAT=TREE SELECT * FROM t",
+            "EXPLAIN ANALYZE WITH q AS (SELECT 1) SELECT * FROM q",
             "DESCRIBE t",
             "DESC t",
+            "SELECT 'into outfile' FROM t",
+            "SELECT a INTO @v FROM t",
             "USE mydb",
             "SET NAMES utf8mb4",
             "SET @a = 1, @b = 2",
@@ -197,6 +240,14 @@ mod tests {
             "SET PERSIST max_connections = 100",
             "WITH q AS (SELECT 1) UPDATE t SET a = 1 WHERE b IN (SELECT * FROM q)",
             "WITH q AS (SELECT 1) DELETE FROM t WHERE b IN (SELECT * FROM q)",
+            "EXPLAIN ANALYZE UPDATE t SET a = 1",
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "EXPLAIN ANALYZE FORMAT=TREE DELETE FROM t",
+            "EXPLAIN ANALYZE WITH q AS (SELECT 1) DELETE FROM t WHERE b IN (SELECT * FROM q)",
+            "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+            "SELECT a, b INTO DUMPFILE '/tmp/x' FROM t",
+            "select * from t into outfile '/tmp/x'",
+            "WITH q AS (SELECT 1) SELECT * FROM q INTO OUTFILE '/tmp/x'",
             "DO SLEEP(1)",
             "",
         ] {
