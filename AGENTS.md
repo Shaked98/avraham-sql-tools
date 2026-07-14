@@ -35,9 +35,10 @@ recreate it rather than adding repo-level workarounds.
 
 ## Dependency constraints
 
-- `mysql_async` uses `default-features = false, features = ["minimal-rust"]`
-  so the dependency tree stays pure-Rust (no OpenSSL/system libs; TLS is not
-  needed for M1). Don't re-enable default features casually.
+- `mysql_async` uses `default-features = false` with only the
+  `minimal-rust` and `time` features so the dependency tree stays pure-Rust
+  (no OpenSSL/system libs; TLS is not needed for M1). Don't re-enable
+  default features casually.
 - `hdrhistogram` has default features off (serialization deps not needed).
 - Stable Rust only; no nightly features.
 
@@ -65,6 +66,16 @@ tests, which are the executable spec):
   are ordinary captured statements.
 - Slow logs can contain invalid UTF-8 inside queries — capture reads raw
   bytes and converts lossily.
+
+## Replay write gate
+
+`crates/sql-replay/src/classify.rs` (its tests are the spec): anything not
+provably read-only is a write and only runs with `--allow-writes`.
+Non-obvious cases handled there: `SET GLOBAL`/`PERSIST` are writes while
+session-level `SET` is a read; `EXPLAIN ANALYZE` executes the underlying
+statement on 8.0, so DML under it is a write (plain `EXPLAIN`/`DESCRIBE`
+stay reads); `SELECT ... INTO OUTFILE`/`DUMPFILE` writes files on the
+server; `WITH` is classified by the first top-level verb after the CTEs.
 
 ## Capture format
 

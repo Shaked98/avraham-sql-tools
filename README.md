@@ -38,7 +38,8 @@ captured 6 events / 4 sessions / 5 fingerprints (dialect: mysql-5.7, admin comma
 ```
 
 Both the 5.7 (`# Time: YYMMDD HH:MM:SS`) and 8.0 (RFC 3339 `# Time:`,
-`log_slow_extra`) slow-log dialects are auto-detected, as are Percona-style
+`log_slow_extra`) slow-log dialects are auto-detected (`--dialect` overrides
+the recorded label), as are Percona-style
 `# Thread_id: ... Schema: ...` lines. The capture file is zstd-compressed
 JSONL: a header record, one event per query
 (`ts_micros`, `session_id`, `user`, `db`, `query`, `orig_query_time_s`,
@@ -61,15 +62,18 @@ $ sql-replay replay \
   a warning is printed (results would reflect the cap, not the server).
 - **Safety:** non-read statements (anything but SELECT / SHOW / EXPLAIN /
   DESCRIBE / session-level SET / USE) are skipped and counted unless you
-  explicitly pass `--allow-writes`. `SET GLOBAL`/`SET PERSIST` also count
-  as writes. Replay against a disposable target when using
+  explicitly pass `--allow-writes`. `SET GLOBAL`/`SET PERSIST`,
+  `EXPLAIN ANALYZE` over DML (8.0 actually executes the statement), and
+  `SELECT ... INTO OUTFILE`/`DUMPFILE` (writes files on the server) also
+  count as writes. `--read-only` makes the default explicit (and conflicts
+  with `--allow-writes`). Replay against a disposable target when using
   `--allow-writes`.
 - `--db-override <db>` replays everything against one database instead of
   the captured per-session databases.
 - `run.json` carries run metadata (target server version, flags, wall
   clock, QPS, saturation) plus per-fingerprint stats (count, errors with a
   first-error sample, skipped, p50/p95/p99/max/mean latency in µs); stdout
-  gets a top-N slowest-fingerprints table.
+  gets a top-N slowest-fingerprints table (`--top`, default 10).
 
 ### Building & testing
 
