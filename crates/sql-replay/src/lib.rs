@@ -3,6 +3,8 @@
 
 pub mod capture;
 pub mod classify;
+pub mod compare;
+pub mod compare_html;
 pub mod fingerprint;
 pub mod format;
 pub mod replay;

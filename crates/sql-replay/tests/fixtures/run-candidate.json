@@ -1,0 +1,87 @@
+{
+  "tool": "sql-replay",
+  "tool_version": "0.1.0",
+  "capture_file": "capture.jsonl.zst",
+  "capture_dialect": "mysql-5.7",
+  "target_url": "mysql://bench@mysql80.internal:3306/shop",
+  "target_server_version": "8.0.46",
+  "started_at": "2026-07-01T11:00:00Z",
+  "ended_at": "2026-07-01T11:00:12Z",
+  "wall_secs": 12.5,
+  "flags": {
+    "max_connections": 50,
+    "allow_writes": false,
+    "read_only": false,
+    "db_override": null,
+    "speed": "1"
+  },
+  "totals": {
+    "events": 332,
+    "sessions": 4,
+    "executed": 292,
+    "skipped": 0,
+    "errors": 25,
+    "not_run": 0,
+    "connect_failures": 0,
+    "qps": 23.36
+  },
+  "saturation": { "samples": 250, "saturated_samples": 0, "saturated_pct": 0.0 },
+  "pacing": { "speed": 1.0, "paced_events": 292, "max_lag_us": 1500, "mean_lag_us": 12.5 },
+  "target_settings": {
+    "character_set_server": "utf8mb4",
+    "collation_server": "utf8mb4_0900_ai_ci",
+    "innodb_buffer_pool_size": "134217728",
+    "sql_mode": "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+    "transaction_isolation": "REPEATABLE-READ"
+  },
+  "fingerprints": [
+    {
+      "id": 1,
+      "fingerprint": "select * from orders where id = ?",
+      "count": 100, "errors": 0, "first_error": null, "skipped": 0, "not_run": 0,
+      "p50_us": 15000, "p95_us": 30000, "p99_us": 60000, "max_us": 90000, "mean_us": 16500.0
+    },
+    {
+      "id": 2,
+      "fingerprint": "select * from users where email = ?",
+      "count": 50, "errors": 0, "first_error": null, "skipped": 0, "not_run": 0,
+      "p50_us": 13000, "p95_us": 26000, "p99_us": 52000, "max_us": 78000, "mean_us": 14300.0
+    },
+    {
+      "id": 3,
+      "fingerprint": "select count(*) from sessions",
+      "count": 80, "errors": 0, "first_error": null, "skipped": 0, "not_run": 0,
+      "p50_us": 12500, "p95_us": 25000, "p99_us": 50000, "max_us": 75000, "mean_us": 13750.0
+    },
+    {
+      "id": 4,
+      "fingerprint": "show variables like ?",
+      "count": 40, "errors": 0, "first_error": null, "skipped": 0, "not_run": 0,
+      "p50_us": 525, "p95_us": 1050, "p99_us": 2100, "max_us": 3150, "mean_us": 577.5
+    },
+    {
+      "id": 5,
+      "fingerprint": "select * from rare_table",
+      "count": 2, "errors": 0, "first_error": null, "skipped": 0, "not_run": 0,
+      "p50_us": 5000, "p95_us": 10000, "p99_us": 10000, "max_us": 10000, "mean_us": 5500.0
+    },
+    {
+      "id": 7,
+      "fingerprint": "insert into audit values(?)",
+      "count": 10, "errors": 0, "first_error": null, "skipped": 0, "not_run": 0,
+      "p50_us": 6000, "p95_us": 12000, "p99_us": 24000, "max_us": 36000, "mean_us": 6600.0
+    },
+    {
+      "id": 8,
+      "fingerprint": "select json_extract(doc, ?) from docs",
+      "count": 5, "errors": 25, "first_error": "Server error: `ERROR 3141 (22032): Invalid JSON text in argument 1 to function json_extract'", "skipped": 0, "not_run": 0,
+      "p50_us": 2200, "p95_us": 4400, "p99_us": 8800, "max_us": 13200, "mean_us": 2420.0
+    },
+    {
+      "id": 9,
+      "fingerprint": "select /* new */ ? from dual",
+      "count": 5, "errors": 0, "first_error": null, "skipped": 0, "not_run": 0,
+      "p50_us": 100, "p95_us": 200, "p99_us": 400, "max_us": 600, "mean_us": 110.0
+    }
+  ]
+}

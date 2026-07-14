@@ -1,6 +1,8 @@
 //! Machine-readable run report (`--out run.json`) and the human summary
 //! table printed to stdout.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,7 +19,26 @@ pub struct RunReport {
     pub flags: ReportFlags,
     pub totals: Totals,
     pub saturation: SaturationReport,
+    /// Present only for paced runs (`--speed <factor>`); `--speed max` has
+    /// no schedule to lag behind. Absent in M1 reports (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pacing: Option<PacingReport>,
+    /// Comparability-relevant target variables (sql_mode, charset/collation,
+    /// buffer pool size, transaction isolation). Absent in M1 reports.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub target_settings: BTreeMap<String, String>,
     pub fingerprints: Vec<FingerprintReport>,
+}
+
+/// Pacing fidelity for paced replays: how far behind its schedule each
+/// event fired. Large lag means the target (or the connection cap) could
+/// not keep up with the captured timeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PacingReport {
+    pub speed: f64,
+    pub paced_events: u64,
+    pub max_lag_us: u64,
+    pub mean_lag_us: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,9 +121,19 @@ impl RunReport {
             t.executed, t.skipped, t.errors, t.not_run, t.connect_failures
         ));
         out.push_str(&format!(
-            "Target: {} ({})\n\n",
+            "Target: {} ({})\n",
             self.target_server_version, self.target_url
         ));
+        if let Some(p) = &self.pacing {
+            out.push_str(&format!(
+                "Pacing: speed {}x over {} events — max lag {:.1} ms, mean lag {:.1} ms\n",
+                p.speed,
+                p.paced_events,
+                p.max_lag_us as f64 / 1000.0,
+                p.mean_lag_us / 1000.0,
+            ));
+        }
+        out.push('\n');
 
         out.push_str(&format!("Top {top} fingerprints by p95 latency:\n"));
         out.push_str(&format!(

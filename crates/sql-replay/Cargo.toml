@@ -17,3 +17,8 @@ tokio = { version = "1.52.3", default-features = false, features = ["rt-multi-th
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zstd = "0.13.3"
+
+[dev-dependencies]
+# test-util enables tokio::time::pause so pacing tests run without
+# wall-clock sleeps; dev-only so release builds stay lean.
+tokio = { version = "1.52.3", default-features = false, features = ["test-util"] }

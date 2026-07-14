@@ -1,0 +1,846 @@
+//! The `compare` subcommand: diff two `replay --out run.json` reports to
+//! find per-fingerprint latency regressions (baseline vs candidate, e.g.
+//! MySQL 5.7 vs 8.0).
+//!
+//! Fingerprints are matched by normalized text (not id), so runs from
+//! different captures still line up where the workload overlaps — with
+//! loud comparability warnings when the runs don't look comparable.
+//! Regression gate: a fingerprint counts as regressed when its p95 delta
+//! is at least `threshold_pct` and it executed at least `min_count` times
+//! in both runs; `compare` exits with code 2 when any exist (see
+//! [`EXIT_REGRESSED`]).
+
+use std::collections::{BTreeMap, HashMap};
+
+use serde::{Deserialize, Serialize};
+
+use crate::report::{PacingReport, ReportFlags, RunReport, Totals};
+
+/// Process exit code when regressions at/beyond the threshold exist, so CI
+/// can gate on `sql-replay compare` (0 = no regression, 1 = tool error).
+pub const EXIT_REGRESSED: i32 = 2;
+
+#[derive(Clone, Copy, Debug)]
+pub struct CompareOptions {
+    /// p95 percentage change at/beyond which a fingerprint is regressed
+    /// (or, negated, improved) rather than noise.
+    pub threshold_pct: f64,
+    /// Minimum executed count in *both* runs for a fingerprint to enter the
+    /// headline ranking; below it the fingerprint is listed as low-sample.
+    pub min_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompareReport {
+    pub tool: String,
+    pub tool_version: String,
+    pub threshold_pct: f64,
+    pub min_count: u64,
+    pub baseline: RunMeta,
+    pub candidate: RunMeta,
+    /// Non-empty when the two runs don't look comparable (different capture
+    /// file, flags, fingerprint tables, executed counts, target settings).
+    pub comparability_warnings: Vec<String>,
+    /// Target variables whose values differ between the runs (or exist on
+    /// only one side).
+    pub settings_diff: Vec<SettingDiff>,
+    pub totals: TotalsDelta,
+    /// Matched fingerprints with p95 delta >= threshold, worst first.
+    pub regressions: Vec<FpDelta>,
+    /// Matched fingerprints with p95 delta <= -threshold, best first.
+    pub improvements: Vec<FpDelta>,
+    /// Matched fingerprints within the threshold (noise).
+    pub stable: Vec<FpDelta>,
+    /// Matched fingerprints executed fewer than `min_count` times in either
+    /// run — excluded from the headline ranking, listed below the fold.
+    pub low_sample: Vec<FpDelta>,
+    pub only_in_baseline: Vec<OnlyIn>,
+    pub only_in_candidate: Vec<OnlyIn>,
+    /// Matched fingerprints whose executed counts differ between the runs.
+    pub count_mismatches: u64,
+    /// True when `regressions` is non-empty; drives the exit code.
+    pub regressed: bool,
+}
+
+/// Per-run metadata carried into the compare report so both runs' context
+/// (server version, flags, settings) is visible side by side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunMeta {
+    pub file: String,
+    pub target_server_version: String,
+    pub target_url: String,
+    pub capture_file: String,
+    pub capture_dialect: String,
+    pub started_at: String,
+    pub wall_secs: f64,
+    pub flags: ReportFlags,
+    pub totals: Totals,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pacing: Option<PacingReport>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub target_settings: BTreeMap<String, String>,
+}
+
+impl RunMeta {
+    fn from_report(file: &str, r: &RunReport) -> Self {
+        RunMeta {
+            file: file.to_string(),
+            target_server_version: r.target_server_version.clone(),
+            target_url: r.target_url.clone(),
+            capture_file: r.capture_file.clone(),
+            capture_dialect: r.capture_dialect.clone(),
+            started_at: r.started_at.clone(),
+            wall_secs: r.wall_secs,
+            flags: r.flags.clone(),
+            totals: r.totals.clone(),
+            pacing: r.pacing.clone(),
+            target_settings: r.target_settings.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingDiff {
+    pub name: String,
+    pub baseline: Option<String>,
+    pub candidate: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TotalsDelta {
+    pub baseline_qps: f64,
+    pub candidate_qps: f64,
+    pub qps_delta_pct: Option<f64>,
+    pub baseline_wall_secs: f64,
+    pub candidate_wall_secs: f64,
+    pub wall_delta_pct: Option<f64>,
+    pub baseline_executed: u64,
+    pub candidate_executed: u64,
+    pub baseline_errors: u64,
+    pub candidate_errors: u64,
+    pub error_delta: i64,
+}
+
+/// One latency metric compared across the runs. `delta_pct` is `None` when
+/// the baseline value is zero (no percentage is meaningful).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricDelta {
+    pub baseline_us: f64,
+    pub candidate_us: f64,
+    pub delta_us: f64,
+    pub delta_pct: Option<f64>,
+}
+
+impl MetricDelta {
+    fn new(baseline_us: f64, candidate_us: f64) -> Self {
+        MetricDelta {
+            baseline_us,
+            candidate_us,
+            delta_us: candidate_us - baseline_us,
+            delta_pct: pct_change(baseline_us, candidate_us),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FpDelta {
+    pub fingerprint: String,
+    pub baseline_count: u64,
+    pub candidate_count: u64,
+    /// The runs executed this fingerprint a different number of times, so
+    /// its latency populations may not be comparable.
+    pub count_mismatch: bool,
+    pub baseline_errors: u64,
+    pub candidate_errors: u64,
+    pub error_delta: i64,
+    pub p50: MetricDelta,
+    pub p95: MetricDelta,
+    pub p99: MetricDelta,
+    pub mean: MetricDelta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnlyIn {
+    pub fingerprint: String,
+    pub count: u64,
+    pub errors: u64,
+}
+
+fn pct_change(base: f64, cand: f64) -> Option<f64> {
+    if base > 0.0 {
+        Some((cand - base) / base * 100.0)
+    } else {
+        None
+    }
+}
+
+pub fn compare_runs(
+    baseline_file: &str,
+    baseline: &RunReport,
+    candidate_file: &str,
+    candidate: &RunReport,
+    options: CompareOptions,
+) -> CompareReport {
+    let mut warnings = Vec::new();
+
+    if baseline.capture_file != candidate.capture_file {
+        warnings.push(format!(
+            "the runs replayed different capture files ({} vs {}) — deltas may reflect \
+             different workloads, not server behavior",
+            baseline.capture_file, candidate.capture_file
+        ));
+    }
+    if baseline.capture_dialect != candidate.capture_dialect {
+        warnings.push(format!(
+            "capture dialects differ ({} vs {})",
+            baseline.capture_dialect, candidate.capture_dialect
+        ));
+    }
+    for (name, b, c) in flag_diffs(&baseline.flags, &candidate.flags) {
+        warnings.push(format!(
+            "replay flag --{name} differs: {b} (baseline) vs {c} (candidate)"
+        ));
+    }
+
+    let settings_diff = settings_diff(&baseline.target_settings, &candidate.target_settings);
+    if !settings_diff.is_empty() {
+        let names: Vec<&str> = settings_diff.iter().map(|d| d.name.as_str()).collect();
+        warnings.push(format!(
+            "target server settings differ: {} (see settings diff)",
+            names.join(", ")
+        ));
+    }
+
+    // Match fingerprints by normalized text; ids are capture-local.
+    let cand_by_text: HashMap<&str, &crate::report::FingerprintReport> = candidate
+        .fingerprints
+        .iter()
+        .map(|f| (f.fingerprint.as_str(), f))
+        .collect();
+    let base_texts: std::collections::HashSet<&str> = baseline
+        .fingerprints
+        .iter()
+        .map(|f| f.fingerprint.as_str())
+        .collect();
+
+    let mut regressions = Vec::new();
+    let mut improvements = Vec::new();
+    let mut stable = Vec::new();
+    let mut low_sample = Vec::new();
+    let mut only_in_baseline = Vec::new();
+    let mut count_mismatches = 0u64;
+
+    for b in &baseline.fingerprints {
+        let Some(c) = cand_by_text.get(b.fingerprint.as_str()) else {
+            only_in_baseline.push(OnlyIn {
+                fingerprint: b.fingerprint.clone(),
+                count: b.count,
+                errors: b.errors,
+            });
+            continue;
+        };
+        let count_mismatch = b.count != c.count;
+        if count_mismatch {
+            count_mismatches += 1;
+        }
+        let delta = FpDelta {
+            fingerprint: b.fingerprint.clone(),
+            baseline_count: b.count,
+            candidate_count: c.count,
+            count_mismatch,
+            baseline_errors: b.errors,
+            candidate_errors: c.errors,
+            error_delta: c.errors as i64 - b.errors as i64,
+            p50: MetricDelta::new(b.p50_us as f64, c.p50_us as f64),
+            p95: MetricDelta::new(b.p95_us as f64, c.p95_us as f64),
+            p99: MetricDelta::new(b.p99_us as f64, c.p99_us as f64),
+            mean: MetricDelta::new(b.mean_us, c.mean_us),
+        };
+        // Zero-count sides carry no latency population, so they can never
+        // enter the headline ranking regardless of --min-count.
+        if b.count == 0
+            || c.count == 0
+            || b.count < options.min_count
+            || c.count < options.min_count
+        {
+            low_sample.push(delta);
+        } else {
+            match delta.p95.delta_pct {
+                Some(p) if p >= options.threshold_pct => regressions.push(delta),
+                Some(p) if p <= -options.threshold_pct => improvements.push(delta),
+                _ => stable.push(delta),
+            }
+        }
+    }
+
+    let mut only_in_candidate: Vec<OnlyIn> = candidate
+        .fingerprints
+        .iter()
+        .filter(|c| !base_texts.contains(c.fingerprint.as_str()))
+        .map(|c| OnlyIn {
+            fingerprint: c.fingerprint.clone(),
+            count: c.count,
+            errors: c.errors,
+        })
+        .collect();
+
+    // Rank: worst p95 regression first / best improvement first; ties by
+    // absolute delta so big absolute movers outrank tiny ones.
+    let pct = |d: &FpDelta| d.p95.delta_pct.unwrap_or(0.0);
+    regressions.sort_by(|a, b| {
+        pct(b)
+            .total_cmp(&pct(a))
+            .then(b.p95.delta_us.total_cmp(&a.p95.delta_us))
+    });
+    improvements.sort_by(|a, b| {
+        pct(a)
+            .total_cmp(&pct(b))
+            .then(a.p95.delta_us.total_cmp(&b.p95.delta_us))
+    });
+    low_sample.sort_by(|a, b| pct(b).total_cmp(&pct(a)));
+    only_in_baseline.sort_by_key(|o| std::cmp::Reverse(o.count));
+    only_in_candidate.sort_by_key(|o| std::cmp::Reverse(o.count));
+
+    if !only_in_baseline.is_empty() || !only_in_candidate.is_empty() {
+        warnings.push(format!(
+            "fingerprint tables differ: {} fingerprint(s) only in the baseline run, {} only \
+             in the candidate run — the runs may not cover the same workload",
+            only_in_baseline.len(),
+            only_in_candidate.len()
+        ));
+    }
+    if count_mismatches > 0 {
+        warnings.push(format!(
+            "{count_mismatches} matched fingerprint(s) executed a different number of times \
+             in the two runs — their latency populations may not be comparable"
+        ));
+    }
+
+    let bt = &baseline.totals;
+    let ct = &candidate.totals;
+    let regressed = !regressions.is_empty();
+    CompareReport {
+        tool: "sql-replay".to_string(),
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        threshold_pct: options.threshold_pct,
+        min_count: options.min_count,
+        baseline: RunMeta::from_report(baseline_file, baseline),
+        candidate: RunMeta::from_report(candidate_file, candidate),
+        comparability_warnings: warnings,
+        settings_diff,
+        totals: TotalsDelta {
+            baseline_qps: bt.qps,
+            candidate_qps: ct.qps,
+            qps_delta_pct: pct_change(bt.qps, ct.qps),
+            baseline_wall_secs: baseline.wall_secs,
+            candidate_wall_secs: candidate.wall_secs,
+            wall_delta_pct: pct_change(baseline.wall_secs, candidate.wall_secs),
+            baseline_executed: bt.executed,
+            candidate_executed: ct.executed,
+            baseline_errors: bt.errors,
+            candidate_errors: ct.errors,
+            error_delta: ct.errors as i64 - bt.errors as i64,
+        },
+        regressions,
+        improvements,
+        stable,
+        low_sample,
+        only_in_baseline,
+        only_in_candidate,
+        count_mismatches,
+        regressed,
+    }
+}
+
+fn flag_diffs(b: &ReportFlags, c: &ReportFlags) -> Vec<(&'static str, String, String)> {
+    let mut out = Vec::new();
+    if b.max_connections != c.max_connections {
+        out.push((
+            "max-connections",
+            b.max_connections.to_string(),
+            c.max_connections.to_string(),
+        ));
+    }
+    if b.allow_writes != c.allow_writes {
+        out.push((
+            "allow-writes",
+            b.allow_writes.to_string(),
+            c.allow_writes.to_string(),
+        ));
+    }
+    if b.db_override != c.db_override {
+        let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "<none>".to_string());
+        out.push(("db-override", show(&b.db_override), show(&c.db_override)));
+    }
+    if b.speed != c.speed {
+        out.push(("speed", b.speed.clone(), c.speed.clone()));
+    }
+    out
+}
+
+fn settings_diff(b: &BTreeMap<String, String>, c: &BTreeMap<String, String>) -> Vec<SettingDiff> {
+    let mut names: Vec<&String> = b.keys().chain(c.keys()).collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|n| b.get(*n) != c.get(*n))
+        .map(|n| SettingDiff {
+            name: n.clone(),
+            baseline: b.get(n).cloned(),
+            candidate: c.get(n).cloned(),
+        })
+        .collect()
+}
+
+fn fmt_pct(p: Option<f64>) -> String {
+    match p {
+        Some(p) => format!("{p:+.1}%"),
+        None => "n/a".to_string(),
+    }
+}
+
+fn fmt_ms(us: f64) -> String {
+    format!("{:.3}", us / 1000.0)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
+    }
+}
+
+impl CompareReport {
+    fn push_fp_table(out: &mut String, rows: &[FpDelta], top: usize) {
+        out.push_str(&format!(
+            "{:>12} {:>12} {:>9} {:>9} {:>11}  {}\n",
+            "p95 base(ms)", "p95 cand(ms)", "Δp95", "Δmean", "count b/c", "fingerprint"
+        ));
+        for d in rows.iter().take(top) {
+            out.push_str(&format!(
+                "{:>12} {:>12} {:>9} {:>9} {:>11}  {}{}\n",
+                fmt_ms(d.p95.baseline_us),
+                fmt_ms(d.p95.candidate_us),
+                fmt_pct(d.p95.delta_pct),
+                fmt_pct(d.mean.delta_pct),
+                format!("{}/{}", d.baseline_count, d.candidate_count),
+                truncate_chars(&d.fingerprint, 70),
+                if d.count_mismatch {
+                    "  [count mismatch]"
+                } else {
+                    ""
+                },
+            ));
+        }
+        if rows.len() > top {
+            out.push_str(&format!("  … and {} more\n", rows.len() - top));
+        }
+    }
+
+    pub fn render_stdout(&self, top: usize) -> String {
+        let mut out = String::new();
+        out.push_str("Comparing replay runs:\n");
+        for (label, m) in [("baseline", &self.baseline), ("candidate", &self.candidate)] {
+            out.push_str(&format!(
+                "  {label:>9}: {} — target {} ({})\n",
+                m.file, m.target_server_version, m.target_url
+            ));
+        }
+        out.push('\n');
+
+        if !self.comparability_warnings.is_empty() {
+            out.push_str(
+                "!!! COMPARABILITY WARNINGS — the runs may not be directly comparable !!!\n",
+            );
+            for w in &self.comparability_warnings {
+                out.push_str(&format!("  - {w}\n"));
+            }
+            out.push('\n');
+        }
+
+        if !self.settings_diff.is_empty() {
+            out.push_str("Target settings diff (baseline -> candidate):\n");
+            for d in &self.settings_diff {
+                let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "<absent>".to_string());
+                out.push_str(&format!(
+                    "  {}: {} -> {}\n",
+                    d.name,
+                    show(&d.baseline),
+                    show(&d.candidate)
+                ));
+            }
+            out.push('\n');
+        }
+
+        let t = &self.totals;
+        out.push_str(&format!(
+            "Totals: QPS {:.1} -> {:.1} ({}) | wall {:.2}s -> {:.2}s ({}) | executed {} -> {} | errors {} -> {} ({:+})\n",
+            t.baseline_qps,
+            t.candidate_qps,
+            fmt_pct(t.qps_delta_pct),
+            t.baseline_wall_secs,
+            t.candidate_wall_secs,
+            fmt_pct(t.wall_delta_pct),
+            t.baseline_executed,
+            t.candidate_executed,
+            t.baseline_errors,
+            t.candidate_errors,
+            t.error_delta,
+        ));
+        let matched = self.regressions.len()
+            + self.improvements.len()
+            + self.stable.len()
+            + self.low_sample.len();
+        out.push_str(&format!(
+            "Fingerprints: {} matched ({} within threshold), {} only in baseline, {} only in candidate, {} with executed-count mismatch\n\n",
+            matched,
+            self.stable.len(),
+            self.only_in_baseline.len(),
+            self.only_in_candidate.len(),
+            self.count_mismatches,
+        ));
+
+        out.push_str(&format!(
+            "Regressions (p95 {:+.0}% or worse, count >= {} in both runs): {}\n",
+            self.threshold_pct,
+            self.min_count,
+            self.regressions.len()
+        ));
+        if !self.regressions.is_empty() {
+            Self::push_fp_table(&mut out, &self.regressions, top);
+        }
+        out.push('\n');
+
+        out.push_str(&format!(
+            "Improvements (p95 -{:.0}% or better): {}\n",
+            self.threshold_pct,
+            self.improvements.len()
+        ));
+        if !self.improvements.is_empty() {
+            Self::push_fp_table(&mut out, &self.improvements, top);
+        }
+        out.push('\n');
+
+        if !self.low_sample.is_empty() {
+            out.push_str(&format!(
+                "Low-sample fingerprints (count < {} in either run, excluded from the ranking): {}\n",
+                self.min_count,
+                self.low_sample.len()
+            ));
+            Self::push_fp_table(&mut out, &self.low_sample, top);
+            out.push('\n');
+        }
+
+        for (label, list) in [
+            ("Only in baseline", &self.only_in_baseline),
+            ("Only in candidate", &self.only_in_candidate),
+        ] {
+            if !list.is_empty() {
+                out.push_str(&format!("{label}: {}\n", list.len()));
+                for o in list.iter().take(top) {
+                    out.push_str(&format!(
+                        "  {:>6}x ({} errors)  {}\n",
+                        o.count,
+                        o.errors,
+                        truncate_chars(&o.fingerprint, 70)
+                    ));
+                }
+                if list.len() > top {
+                    out.push_str(&format!("  … and {} more\n", list.len() - top));
+                }
+                out.push('\n');
+            }
+        }
+
+        let error_changes: Vec<&FpDelta> = self
+            .regressions
+            .iter()
+            .chain(&self.improvements)
+            .chain(&self.stable)
+            .chain(&self.low_sample)
+            .filter(|d| d.error_delta != 0)
+            .collect();
+        if !error_changes.is_empty() {
+            out.push_str(&format!(
+                "Fingerprints with error-count changes: {}\n",
+                error_changes.len()
+            ));
+            for d in error_changes.iter().take(top) {
+                out.push_str(&format!(
+                    "  {} -> {} errors ({:+})  {}\n",
+                    d.baseline_errors,
+                    d.candidate_errors,
+                    d.error_delta,
+                    truncate_chars(&d.fingerprint, 70)
+                ));
+            }
+            if error_changes.len() > top {
+                out.push_str(&format!("  … and {} more\n", error_changes.len() - top));
+            }
+            out.push('\n');
+        }
+
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::{FingerprintReport, SaturationReport};
+
+    fn fp(text: &str, count: u64, errors: u64, p95_us: u64) -> FingerprintReport {
+        FingerprintReport {
+            id: 0,
+            fingerprint: text.to_string(),
+            count,
+            errors,
+            first_error: None,
+            skipped: 0,
+            not_run: 0,
+            p50_us: p95_us / 2,
+            p95_us,
+            p99_us: p95_us * 2,
+            max_us: p95_us * 3,
+            mean_us: p95_us as f64 / 2.0,
+        }
+    }
+
+    fn run(version: &str, fps: Vec<FingerprintReport>) -> RunReport {
+        let executed: u64 = fps.iter().map(|f| f.count).sum();
+        let errors: u64 = fps.iter().map(|f| f.errors).sum();
+        RunReport {
+            tool: "sql-replay".to_string(),
+            tool_version: "test".to_string(),
+            capture_file: "capture.jsonl.zst".to_string(),
+            capture_dialect: "mysql-5.7".to_string(),
+            target_url: "mysql://t/".to_string(),
+            target_server_version: version.to_string(),
+            started_at: String::new(),
+            ended_at: String::new(),
+            wall_secs: 10.0,
+            flags: ReportFlags {
+                max_connections: 8,
+                allow_writes: false,
+                read_only: false,
+                db_override: None,
+                speed: "max".to_string(),
+            },
+            totals: Totals {
+                events: executed,
+                sessions: 1,
+                executed,
+                skipped: 0,
+                errors,
+                not_run: 0,
+                connect_failures: 0,
+                qps: executed as f64 / 10.0,
+            },
+            saturation: SaturationReport {
+                samples: 0,
+                saturated_samples: 0,
+                saturated_pct: 0.0,
+            },
+            pacing: None,
+            target_settings: BTreeMap::new(),
+            fingerprints: fps,
+        }
+    }
+
+    const OPTS: CompareOptions = CompareOptions {
+        threshold_pct: 20.0,
+        min_count: 5,
+    };
+
+    fn texts(list: &[FpDelta]) -> Vec<&str> {
+        list.iter().map(|d| d.fingerprint.as_str()).collect()
+    }
+
+    #[test]
+    fn classifies_and_ranks_by_p95_regression() {
+        let base = run(
+            "5.7.42",
+            vec![
+                fp("q_reg_small", 50, 0, 20_000),
+                fp("q_reg_big", 100, 0, 10_000),
+                fp("q_improved", 80, 0, 50_000),
+                fp("q_stable", 40, 0, 1_000),
+            ],
+        );
+        let cand = run(
+            "8.0.46",
+            vec![
+                fp("q_reg_small", 50, 0, 26_000), // +30%
+                fp("q_reg_big", 100, 0, 30_000),  // +200%
+                fp("q_improved", 80, 0, 25_000),  // -50%
+                fp("q_stable", 40, 0, 1_050),     // +5%
+            ],
+        );
+        let rep = compare_runs("a.json", &base, "b.json", &cand, OPTS);
+        assert_eq!(texts(&rep.regressions), ["q_reg_big", "q_reg_small"]);
+        assert_eq!(texts(&rep.improvements), ["q_improved"]);
+        assert_eq!(texts(&rep.stable), ["q_stable"]);
+        assert!(rep.regressed);
+        let worst = &rep.regressions[0];
+        assert_eq!(worst.p95.delta_us, 20_000.0);
+        assert_eq!(worst.p95.delta_pct, Some(200.0));
+        // Boundary: exactly the threshold counts as regressed.
+        let base = run("5.7", vec![fp("q", 10, 0, 10_000)]);
+        let cand = run("8.0", vec![fp("q", 10, 0, 12_000)]);
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert_eq!(rep.regressions.len(), 1);
+    }
+
+    #[test]
+    fn low_sample_and_zero_count_stay_out_of_headline() {
+        let base = run(
+            "5.7.42",
+            vec![fp("q_rare", 2, 0, 1_000), fp("q_never_ran", 0, 0, 0)],
+        );
+        let cand = run(
+            "8.0.46",
+            vec![fp("q_rare", 2, 0, 10_000), fp("q_never_ran", 0, 5, 0)],
+        );
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert!(rep.regressions.is_empty());
+        assert!(!rep.regressed);
+        assert_eq!(texts(&rep.low_sample), ["q_rare", "q_never_ran"]);
+        // Zero-count matches are low-sample even with --min-count 0.
+        let rep = compare_runs(
+            "a",
+            &base,
+            "b",
+            &cand,
+            CompareOptions {
+                threshold_pct: 20.0,
+                min_count: 0,
+            },
+        );
+        assert!(texts(&rep.low_sample).contains(&"q_never_ran"));
+        assert_eq!(texts(&rep.regressions), ["q_rare"]);
+    }
+
+    #[test]
+    fn only_in_one_run_and_count_mismatches_warn() {
+        let base = run(
+            "5.7.42",
+            vec![fp("q_common", 20, 0, 5_000), fp("q_old_only", 10, 0, 2_000)],
+        );
+        let cand = run(
+            "8.0.46",
+            vec![fp("q_common", 10, 0, 5_100), fp("q_new_only", 5, 1, 3_000)],
+        );
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert_eq!(rep.only_in_baseline.len(), 1);
+        assert_eq!(rep.only_in_baseline[0].fingerprint, "q_old_only");
+        assert_eq!(rep.only_in_candidate.len(), 1);
+        assert_eq!(rep.only_in_candidate[0].fingerprint, "q_new_only");
+        assert_eq!(rep.count_mismatches, 1);
+        assert!(rep.stable[0].count_mismatch);
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("only in the baseline")));
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("different number of times")));
+    }
+
+    #[test]
+    fn capture_and_flag_differences_warn() {
+        let base = run("5.7.42", vec![]);
+        let mut cand = run("8.0.46", vec![]);
+        cand.capture_file = "other.jsonl.zst".to_string();
+        cand.flags.allow_writes = true;
+        cand.flags.speed = "1".to_string();
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("different capture files")));
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("--allow-writes differs")));
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("--speed differs")));
+    }
+
+    #[test]
+    fn settings_diff_lists_changed_and_one_sided_variables() {
+        let mut base = run("5.7.42", vec![]);
+        let mut cand = run("8.0.46", vec![]);
+        base.target_settings = BTreeMap::from([
+            ("sql_mode".to_string(), "NO_ENGINE_SUBSTITUTION".to_string()),
+            ("character_set_server".to_string(), "latin1".to_string()),
+            (
+                "collation_server".to_string(),
+                "latin1_swedish_ci".to_string(),
+            ),
+        ]);
+        cand.target_settings = BTreeMap::from([
+            ("sql_mode".to_string(), "NO_ENGINE_SUBSTITUTION".to_string()),
+            ("character_set_server".to_string(), "utf8mb4".to_string()),
+            ("new_only".to_string(), "1".to_string()),
+        ]);
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        let names: Vec<&str> = rep.settings_diff.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["character_set_server", "collation_server", "new_only"]
+        );
+        assert_eq!(rep.settings_diff[0].baseline.as_deref(), Some("latin1"));
+        assert_eq!(rep.settings_diff[0].candidate.as_deref(), Some("utf8mb4"));
+        assert_eq!(rep.settings_diff[1].candidate, None);
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("target server settings differ")));
+        // Identical settings produce no diff and no warning.
+        cand.target_settings = base.target_settings.clone();
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert!(rep.settings_diff.is_empty());
+        assert!(rep.comparability_warnings.is_empty());
+    }
+
+    #[test]
+    fn totals_deltas_and_pct_edge_cases() {
+        let base = run("5.7.42", vec![fp("q", 100, 0, 1_000)]);
+        let cand = run("8.0.46", vec![fp("q", 80, 20, 1_100)]);
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert_eq!(rep.totals.baseline_qps, 10.0);
+        assert_eq!(rep.totals.candidate_qps, 8.0);
+        assert_eq!(rep.totals.qps_delta_pct, Some(-20.0));
+        assert_eq!(rep.totals.error_delta, 20);
+        assert_eq!(pct_change(0.0, 5.0), None);
+        assert_eq!(pct_change(10.0, 5.0), Some(-50.0));
+    }
+
+    #[test]
+    fn stdout_rendering_mentions_key_sections() {
+        let base = run(
+            "5.7.42",
+            vec![fp("q_reg", 10, 0, 10_000), fp("q_rare", 1, 0, 100)],
+        );
+        let mut cand = run(
+            "8.0.46",
+            vec![fp("q_reg", 10, 2, 30_000), fp("q_rare", 1, 0, 500)],
+        );
+        cand.capture_file = "other.zst".to_string();
+        let rep = compare_runs("base.json", &base, "cand.json", &cand, OPTS);
+        let text = rep.render_stdout(10);
+        assert!(text.contains("COMPARABILITY WARNINGS"));
+        assert!(text.contains("5.7.42"));
+        assert!(text.contains("8.0.46"));
+        assert!(text.contains("Regressions"));
+        assert!(text.contains("q_reg"));
+        assert!(text.contains("Low-sample"));
+        assert!(text.contains("error-count changes"));
+    }
+}
