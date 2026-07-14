@@ -65,19 +65,22 @@ $ sql-replay replay \
   backpressure. If the cap is saturated for a significant share of the run,
   a warning is printed (results would reflect the cap, not the server).
 - **Safety:** non-read statements (anything but SELECT / SHOW / EXPLAIN /
-  DESCRIBE / session-level SET / USE) are skipped and counted unless you
-  explicitly pass `--allow-writes`. `SET GLOBAL`/`SET PERSIST`,
-  `EXPLAIN ANALYZE` over DML (8.0 actually executes the statement), and
-  `SELECT ... INTO OUTFILE`/`DUMPFILE` (writes files on the server) also
-  count as writes. `--read-only` makes the default explicit (and conflicts
-  with `--allow-writes`). Replay against a disposable target when using
+  DESCRIBE / HELP / session-level SET / USE) are skipped and counted unless
+  you explicitly pass `--allow-writes`.
+  `SET GLOBAL`/`SET PERSIST`/`SET PASSWORD`/`SET DEFAULT ROLE`,
+  `EXPLAIN ANALYZE` over DML (8.0 actually executes the statement),
+  `SELECT ... INTO OUTFILE`/`DUMPFILE` (writes files on the server), and
+  multi-statement text (a `;` followed by more SQL) also count as writes.
+  `--read-only` makes the default explicit (and conflicts with
+  `--allow-writes`). Replay against a disposable target when using
   `--allow-writes`.
 - `--db-override <db>` replays everything against one database instead of
   the captured per-session databases; captured `USE` statements are then
   skipped (and counted as skipped) so sessions stay pinned to the override.
 - `run.json` carries run metadata (target server version, flags, wall
   clock, QPS, saturation) plus per-fingerprint stats (count, errors with a
-  first-error sample, skipped, p50/p95/p99/max/mean latency in µs); stdout
+  first-error sample, skipped/not-run counts, p50/p95/p99/max/mean latency
+  in µs); stdout
   gets a top-N slowest-fingerprints table (`--top`, default 10).
 
 ### Building & testing
