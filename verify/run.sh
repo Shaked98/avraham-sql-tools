@@ -45,19 +45,22 @@ DATASET_URL=https://github.com/datacharmer/test_db/releases/download/v1.0.7/test
 DATASET_SHA256=c44c140f352f35d47fdb65df60f52b779ef552822fad6c4efcfa7b134c3faf84
 
 # Session roles and per-session class volumes (see verify/workload.sh:
-# GB_SESSIONS heavy-aggregate-only sessions, the rest fast-class sessions).
+# planted classes get dedicated SLEEP-gated sessions so the control
+# classes run on a quiet box; the rest are fast control sessions).
 GB_SESSIONS=4
-FAST_SESSIONS=$((SESSIONS - GB_SESSIONS))
-PK_PER_SESSION=80 HIRE_PER_SESSION=45 GB_PER_SESSION=50 INS_PER_SESSION=60
+HIRE_SESSIONS=4
+HEAVY_SESSIONS=$((GB_SESSIONS + HIRE_SESSIONS))
+FAST_SESSIONS=$((SESSIONS - HEAVY_SESSIONS))
+PK_PER_SESSION=160 HIRE_PER_SESSION=90 GB_PER_SESSION=50 INS_PER_SESSION=120
 TOTAL_PK=$((PK_PER_SESSION * FAST_SESSIONS))
-TOTAL_HIRE=$((HIRE_PER_SESSION * FAST_SESSIONS))
+TOTAL_HIRE=$((HIRE_PER_SESSION * HIRE_SESSIONS))
 TOTAL_GB=$((GB_PER_SESSION * GB_SESSIONS))
 TOTAL_INS=$((INS_PER_SESSION * FAST_SESSIONS))
 TOTAL_EVENTS=$((TOTAL_PK + TOTAL_HIRE + TOTAL_GB + TOTAL_INS))
-# The mysql client sends `select @@version_comment limit 1` on every
-# connection (batch mode included), so each session contributes exactly one
-# extra captured event beyond the generated statements.
-TOTAL_EXECUTED=$((TOTAL_EVENTS + SESSIONS))
+# Beyond the generated statements, every session's mysql client sends
+# `select @@version_comment limit 1` on connect (batch mode included), and
+# every heavy session opens with its SELECT SLEEP gate event.
+TOTAL_EXECUTED=$((TOTAL_EVENTS + SESSIONS + HEAVY_SESSIONS))
 
 # The workload classes as sql-replay fingerprints (normalized text, matched
 # exactly against compare's report.json). Must stay in sync with the SQL
@@ -66,9 +69,11 @@ FP_PK='select emp_no, first_name, last_name, gender from employees where emp_no 
 FP_HIRE='select count(*), min(emp_no), max(emp_no) from employees where hire_date = ?'
 FP_GB='select e.first_name, e.last_name, count(*) as cnt, avg(s.salary) as avg_sal from employees e join salaries s on s.emp_no = e.emp_no where e.emp_no between ? and ? group by e.first_name, e.last_name order by avg_sal desc limit ?'
 FP_INS='insert into verify_audit (actor, action, note) values (?+)'
-# The mysql client's own startup query; deliberately below --min-count so
-# it lands in the report's low_sample bucket, never the ranking.
+# Incidental fingerprints, both deliberately below --min-count so they
+# land in the report's low_sample bucket, never the ranking: the mysql
+# client's own startup query and the heavy sessions' SLEEP gate.
 FP_VER='select @@version_comment limit ?'
+FP_SLEEP='select sleep(?)'
 
 # ---------------------------------------------------------------- helpers
 stage() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -277,7 +282,7 @@ SET GLOBAL log_slow_admin_statements = ON;
 SET GLOBAL long_query_time = 0;
 SET GLOBAL slow_query_log = ON;"
 WORKLOAD_OUT="$OUT" WORKLOAD_SEED="$SEED" WORKLOAD_SESSIONS="$SESSIONS" \
-  WORKLOAD_GB_SESSIONS="$GB_SESSIONS" \
+  WORKLOAD_GB_SESSIONS="$GB_SESSIONS" WORKLOAD_HIRE_SESSIONS="$HIRE_SESSIONS" \
   WORKLOAD_PK="$PK_PER_SESSION" WORKLOAD_HIRE="$HIRE_PER_SESSION" \
   WORKLOAD_GB="$GB_PER_SESSION" WORKLOAD_INS="$INS_PER_SESSION" \
   WORKLOAD_CONTAINER="$C57" verify/workload.sh all
@@ -315,7 +320,7 @@ assert_run() { # assert_run <run.json>
     die "$1: expected $SESSIONS sessions, got $(jq '.totals.sessions' "$1")"
   local fp want
   for spec in "$FP_PK|$TOTAL_PK" "$FP_HIRE|$TOTAL_HIRE" "$FP_GB|$TOTAL_GB" \
-    "$FP_INS|$TOTAL_INS" "$FP_VER|$SESSIONS"; do
+    "$FP_INS|$TOTAL_INS" "$FP_VER|$SESSIONS" "$FP_SLEEP|$HEAVY_SESSIONS"; do
     fp=${spec%|*} want=${spec##*|}
     jq -e --arg fp "$fp" --argjson want "$want" \
       '[.fingerprints[] | select(.fingerprint == $fp) | .count] == [$want]' "$1" >/dev/null ||
@@ -374,8 +379,9 @@ check "control pk-lookup class present with a full sample (stable or improved)" 
   '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_PK"
 check "control insert class present with a full sample (stable or improved)" \
   '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_INS"
-check "low-sample bucket holds only the mysql client's startup query" \
-  '[.low_sample[].fingerprint] == [$fp]' --arg fp "$FP_VER"
+check "low-sample bucket holds only the client startup query and the SLEEP gate" \
+  '([.low_sample[].fingerprint] | sort) == ([$fpver, $fpsleep] | sort)' \
+  --arg fpver "$FP_VER" --arg fpsleep "$FP_SLEEP"
 check "no fingerprints exclusive to one run" \
   '(.only_in_baseline | length == 0) and (.only_in_candidate | length == 0)'
 check "no executed-count mismatches" '.count_mismatches == 0'

@@ -18,13 +18,17 @@
 #                    the candidate server so it spills to disk
 #   ins   control  : short INSERT stream into an audit-style table
 #
-# Sessions have roles: the first GB_SESSIONS run ONLY the heavy gb class;
-# the rest interleave the three fast classes. Mixing gb into every session
-# proved hostile to the control group in practice: 12 concurrent
-# multi-second aggregates on a 4-core runner inflate the sub-ms classes'
-# p95 via pure CPU contention, and the inflation is worse on the
-# (deliberately slower) candidate side — a false-positive machine. Capping
-# gb concurrency at GB_SESSIONS keeps the contention symmetric and small.
+# Sessions have roles: GB_SESSIONS run only the heavy gb class,
+# HIRE_SESSIONS run only the hire class (both planted), and the rest — the
+# fast sessions — interleave the two control classes (pk, ins). Every
+# heavy session opens with SELECT SLEEP(GATE_SECS): at replay --speed max
+# that first event parks the heavy sessions on both servers (near-zero
+# CPU, identical cost) while the control sessions complete their entire
+# run on an otherwise idle box. Without the gate the planted classes'
+# CPU burn inflates the sub-ms controls' p95 through scheduler contention
+# — measurably worse on the deliberately slower candidate, i.e. a
+# false-positive machine (run 2 of the rig measured the pk control at
+# +127% p95 from contention alone).
 #
 # Usage: workload.sh gen|run|all   (env-driven; see the variables below)
 set -euo pipefail
@@ -33,13 +37,15 @@ OUT_DIR=${WORKLOAD_OUT:?set WORKLOAD_OUT to the output directory}
 SEED=${WORKLOAD_SEED:-42}
 SESSIONS=${WORKLOAD_SESSIONS:-12}
 GB_SESSIONS=${WORKLOAD_GB_SESSIONS:-4}
-# Executions per session per class (fast classes x (SESSIONS-GB_SESSIONS),
-# gb x GB_SESSIONS = per-fingerprint sample size; keep every class >= ~200
-# total for stable p95s).
-PK_PER_SESSION=${WORKLOAD_PK:-80}
-HIRE_PER_SESSION=${WORKLOAD_HIRE:-45}
+HIRE_SESSIONS=${WORKLOAD_HIRE_SESSIONS:-4}
+GATE_SECS=${WORKLOAD_GATE_SECS:-12}
+# Executions per session per class (x that role's session count = the
+# per-fingerprint sample size; keep every class >= ~200 total for stable
+# p95s).
+PK_PER_SESSION=${WORKLOAD_PK:-160}
+HIRE_PER_SESSION=${WORKLOAD_HIRE:-90}
 GB_PER_SESSION=${WORKLOAD_GB:-50}
-INS_PER_SESSION=${WORKLOAD_INS:-60}
+INS_PER_SESSION=${WORKLOAD_INS:-120}
 # Only needed for `run`:
 CONTAINER=${WORKLOAD_CONTAINER:-}
 MYSQL_USER=${WORKLOAD_MYSQL_USER:-verify}
@@ -102,16 +108,20 @@ gen_ins() {
 
 generate() {
   mkdir -p "$OUT_DIR/sessions"
-  local s i j t total=0
+  local s i j t gate total=0
   for ((s = 1; s <= SESSIONS; s++)); do
     # Build the session's class mix by role, then Fisher-Yates shuffle so
     # classes interleave within the session (still fully seeded).
     local mix=()
+    gate=0
     if ((s <= GB_SESSIONS)); then
+      gate=1
       for ((i = 0; i < GB_PER_SESSION; i++)); do mix+=(gb); done
+    elif ((s <= GB_SESSIONS + HIRE_SESSIONS)); then
+      gate=1
+      for ((i = 0; i < HIRE_PER_SESSION; i++)); do mix+=(hire); done
     else
       for ((i = 0; i < PK_PER_SESSION; i++)); do mix+=(pk); done
-      for ((i = 0; i < HIRE_PER_SESSION; i++)); do mix+=(hire); done
       for ((i = 0; i < INS_PER_SESSION; i++)); do mix+=(ins); done
     fi
     for ((i = ${#mix[@]} - 1; i > 0; i--)); do
@@ -121,10 +131,11 @@ generate() {
       mix[i]=${mix[j]}
       mix[j]=$t
     done
-    total=$((total + ${#mix[@]}))
+    total=$((total + ${#mix[@]} + gate))
     local file
     file=$(printf '%s/sessions/session-%02d.sql' "$OUT_DIR" "$s")
     {
+      ((gate == 0)) || echo "SELECT SLEEP(${GATE_SECS});"
       for c in "${mix[@]}"; do "gen_$c"; done
     } >"$file"
   done

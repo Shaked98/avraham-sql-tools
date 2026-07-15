@@ -51,7 +51,14 @@ workload and fixed dataset (bit-identical runs), 512 MiB buffer pools so
 data stays cached, `innodb_flush_log_at_trx_commit=2` on both servers and
 binlog off on 8.0 (fsync noise would poison the INSERT control), a warmup
 pass before measuring, medians over 3 passes, planted effects sized 10x+,
-and a 100% p95 threshold. Before the long replay, cheap probe batches
+and a 100% p95 threshold. The planted classes run in dedicated sessions
+that open with a `SELECT SLEEP(...)` gate: at `--speed max` that parks
+the heavy sessions (identical near-zero cost on both servers) while the
+control sessions finish on a quiet box — without it, the planted classes'
+CPU burn inflates the sub-ms controls' p95 through scheduler contention,
+measurably worse on the deliberately slower candidate (a false-positive
+machine; run 2 of this rig measured the PK control at +127% p95 from
+contention alone). Before the long replay, cheap probe batches
 verify each plant actually bites (index gone from
 `information_schema.statistics`, probe timing ratios) so a misconfigured
 plant fails fast with a clear message instead of a mysterious compare
