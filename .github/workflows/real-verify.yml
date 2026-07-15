@@ -13,6 +13,11 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  # TEMPORARY while the rig branch iterates: workflow_dispatch cannot
+  # target a workflow that is not yet on the default branch, so run on
+  # pushes to the rig branch itself. Remove before merge.
+  push:
+    branches: [fm/sqlt-rig]
 
 permissions:
   contents: read
