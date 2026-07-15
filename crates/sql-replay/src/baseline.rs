@@ -112,6 +112,7 @@ pub fn build_baseline(capture_path: &Path, filters: &Filters) -> Result<RunRepor
             p99_us: agg.hist.value_at_quantile(0.99),
             max_us: agg.hist.max(),
             mean_us: agg.hist.mean(),
+            checksum: None,
         })
         .collect();
     fingerprints.sort_by(|a, b| b.p95_us.cmp(&a.p95_us).then(b.count.cmp(&a.count)));
@@ -131,6 +132,7 @@ pub fn build_baseline(capture_path: &Path, filters: &Filters) -> Result<RunRepor
         aborted: false,
         aggregation: None,
         flags: ReportFlags {
+            checksum: false,
             max_connections: 0,
             allow_writes: false,
             read_only: false,

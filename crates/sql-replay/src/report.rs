@@ -88,6 +88,11 @@ pub struct ReportFlags {
     pub read_only: bool,
     pub db_override: Option<String>,
     pub speed: String,
+    /// Result-set checksums were recorded (`--checksum`, 0.3.0). Latencies
+    /// of a checksummed run include reading every result row and are not
+    /// comparable to a non-checksummed run's.
+    #[serde(default)]
+    pub checksum: bool,
     /// Sessions multiplexed over a bounded connection pool of this size
     /// instead of one dedicated connection per session (M3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,6 +148,45 @@ pub struct FingerprintReport {
     pub p99_us: u64,
     pub max_us: u64,
     pub mean_us: f64,
+    /// Result-set checksum aggregate, present when the run used
+    /// `--checksum` and this fingerprint executed read statements
+    /// (0.3.0; serde default keeps older reports loading).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<ChecksumReport>,
+}
+
+/// Per-fingerprint result-set checksum aggregate (`replay --checksum`).
+///
+/// Per-event checksums would bloat run.json (a fingerprint can have
+/// millions of events), so events collapse into one order-insensitive
+/// digest: per-event result digests are combined with commutative
+/// operations (wrapping sum + xor + count), making the aggregate a
+/// multiset hash of the event checksums. Two runs over the same capture
+/// and identical data produce the same multiset — regardless of session
+/// interleaving — so equal digests mean no observed divergence, and any
+/// changed result set changes the digest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChecksumReport {
+    /// Executed statements whose result set was checksummed.
+    pub events: u64,
+    /// Executed checksummed statements that returned no result set (OK
+    /// packet only, e.g. SET) — nothing to diff.
+    pub no_result: u64,
+    /// Total rows read across all checksummed events.
+    pub rows_total: u64,
+    /// Combined order-insensitive digest (16 hex chars) over the
+    /// per-event result checksums.
+    pub digest: String,
+    /// Column names of the first checksummed result set.
+    pub columns: Vec<String>,
+    /// Column names/count varied between events of this fingerprint.
+    pub shape_varied: bool,
+    /// The query looks nondeterministic (volatile functions, LIMIT
+    /// without ORDER BY, server-state reads — see
+    /// `classify::is_nondeterministic`), or its digest empirically varied
+    /// across `--repeat` passes: checksum diffs are advisory, not hard
+    /// mismatches.
+    pub nondeterministic: bool,
 }
 
 impl RunReport {

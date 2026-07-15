@@ -116,6 +116,11 @@ enum Cmd {
         /// keep replay memory bounded
         #[arg(long)]
         spool_dir: Option<PathBuf>,
+        /// Record an order-insensitive result-set checksum per fingerprint
+        /// (result-correctness diffing via `compare`). Reads every result
+        /// row, so latencies are only comparable to another --checksum run
+        #[arg(long)]
+        checksum: bool,
     },
     /// Build a baseline run report from a capture's RECORDED production
     /// latencies (the slow log's Query_time values) instead of replaying —
@@ -270,6 +275,7 @@ fn main() -> Result<()> {
             time_window,
             pool,
             spool_dir,
+            checksum,
         } => {
             let options = ReplayOptions {
                 url,
@@ -287,6 +293,7 @@ fn main() -> Result<()> {
                     window: time_window,
                 },
                 spool_dir,
+                checksum,
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -369,6 +376,18 @@ fn main() -> Result<()> {
                 std::fs::write(&path, sql_replay::compare_html::render_html(&report))?;
                 eprintln!("wrote HTML report to {}", path.display());
             }
+            if report.correctness_failed {
+                eprintln!(
+                    "FAIL: {} fingerprint(s) returned different data (result checksum \
+                     mismatch; exit code {})",
+                    report
+                        .correctness
+                        .as_ref()
+                        .map(|c| c.mismatches.len())
+                        .unwrap_or(0),
+                    sql_replay::compare::EXIT_REGRESSED,
+                );
+            }
             if report.regressed {
                 eprintln!(
                     "FAIL: {} fingerprint(s) regressed >= {}% on p95 (exit code {})",
@@ -376,6 +395,8 @@ fn main() -> Result<()> {
                     threshold_pct,
                     sql_replay::compare::EXIT_REGRESSED,
                 );
+            }
+            if report.regressed || report.correctness_failed {
                 std::process::exit(sql_replay::compare::EXIT_REGRESSED);
             }
         }

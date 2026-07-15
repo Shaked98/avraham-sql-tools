@@ -64,6 +64,18 @@ pub fn aggregate_median(passes: &[RunReport]) -> RunReport {
             let mu = |f: &dyn Fn(&FingerprintReport) -> u64| {
                 median_u64(fps.iter().map(|fp| f(fp)).collect())
             };
+            // Checksums are identities, not metrics: take the first pass's
+            // aggregate. If passes disagree on the digest, the query's
+            // results empirically vary between identical passes — record
+            // that as nondeterministic so compare treats diffs as advisory.
+            let checksum = fps[0].checksum.clone().map(|mut c| {
+                let disagree = fps
+                    .iter()
+                    .filter_map(|f| f.checksum.as_ref())
+                    .any(|other| other.digest != c.digest);
+                c.nondeterministic |= disagree;
+                c
+            });
             FingerprintReport {
                 id,
                 fingerprint: fps[0].fingerprint.clone(),
@@ -77,6 +89,7 @@ pub fn aggregate_median(passes: &[RunReport]) -> RunReport {
                 p99_us: mu(&|f| f.p99_us),
                 max_us: mu(&|f| f.max_us),
                 mean_us: median_f64(fps.iter().map(|f| f.mean_us).collect()),
+                checksum,
             }
         })
         .collect();
@@ -165,6 +178,7 @@ mod tests {
             p99_us: p95_us + 10,
             max_us: p95_us + 20,
             mean_us: p95_us as f64 / 2.0,
+            checksum: None,
         }
     }
 
@@ -183,6 +197,7 @@ mod tests {
             aborted: false,
             aggregation: None,
             flags: ReportFlags {
+                checksum: false,
                 max_connections: 50,
                 allow_writes: false,
                 read_only: false,

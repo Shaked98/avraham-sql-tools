@@ -29,11 +29,12 @@ use tokio::sync::{watch, Semaphore};
 use crate::aggregate::aggregate_median;
 use crate::classify::{is_use_statement, should_execute};
 use crate::format::Event;
+use crate::report::ChecksumReport;
 use crate::report::{
     redact_url, FingerprintReport, PacingReport, ReportFlags, RunReport, SaturationReport, Totals,
 };
 use crate::spool::{Filters, Spool, SpoolCursor};
-use crate::target::{MySqlTarget, Target, TargetConn};
+use crate::target::{MySqlTarget, ResultChecksum, Target, TargetConn};
 
 /// Replay pacing mode: `max` (each session fires its next query as soon as
 /// the previous one completes) or a positive speed factor honoring the
@@ -203,6 +204,10 @@ pub struct ReplayOptions {
     pub filters: Filters,
     /// Directory for the replay spool file (default: the system temp dir).
     pub spool_dir: Option<PathBuf>,
+    /// Checksum the result set of every executed read statement
+    /// (`--checksum`): reads every row, so latencies are only comparable
+    /// to another `--checksum` run.
+    pub checksum: bool,
 }
 
 impl ReplayOptions {
@@ -219,6 +224,7 @@ impl ReplayOptions {
             repeat: 1,
             filters: Filters::default(),
             spool_dir: None,
+            checksum: false,
         }
     }
 
@@ -297,6 +303,67 @@ struct FpAgg {
     first_error: Option<String>,
     skipped: u64,
     not_run: u64,
+    /// Present when the run checksums results and this fingerprint
+    /// executed at least one checksummed statement.
+    checksum: Option<FpChecksumAgg>,
+}
+
+/// Order-insensitive aggregate of per-event result checksums (see
+/// `report::ChecksumReport` for the multiset-hash rationale).
+#[derive(Default)]
+struct FpChecksumAgg {
+    events: u64,
+    no_result: u64,
+    rows_total: u64,
+    sum: u64,
+    xor: u64,
+    columns: Vec<String>,
+    shape_varied: bool,
+}
+
+impl FpChecksumAgg {
+    fn add(&mut self, outcome: ChecksumOutcome) {
+        match outcome {
+            ChecksumOutcome::Off => {}
+            ChecksumOutcome::NoResult => self.no_result += 1,
+            ChecksumOutcome::Set(cs) => {
+                self.events += 1;
+                self.rows_total += cs.row_count;
+                self.sum = self.sum.wrapping_add(cs.digest);
+                self.xor ^= cs.digest;
+                if self.columns.is_empty() && self.events == 1 {
+                    self.columns = cs.columns;
+                } else if self.columns != cs.columns {
+                    self.shape_varied = true;
+                }
+            }
+        }
+    }
+
+    fn report(&self, nondeterministic: bool) -> ChecksumReport {
+        let mut h = xxhash_rust::xxh3::Xxh3::new();
+        h.update(&self.sum.to_le_bytes());
+        h.update(&self.xor.to_le_bytes());
+        h.update(&self.events.to_le_bytes());
+        ChecksumReport {
+            events: self.events,
+            no_result: self.no_result,
+            rows_total: self.rows_total,
+            digest: format!("{:016x}", h.digest()),
+            columns: self.columns.clone(),
+            shape_varied: self.shape_varied,
+            nondeterministic,
+        }
+    }
+}
+
+/// What executing one event produced checksum-wise.
+enum ChecksumOutcome {
+    /// Checksumming off for this statement (not requested, or a write).
+    Off,
+    /// Statement succeeded but returned no result set (nothing to diff).
+    NoResult,
+    Set(ResultChecksum),
 }
 
 impl FpAgg {
@@ -309,6 +376,7 @@ impl FpAgg {
             first_error: None,
             skipped: 0,
             not_run: 0,
+            checksum: None,
         }
     }
 }
@@ -329,11 +397,16 @@ impl Metrics {
         f(map.entry(fp).or_insert_with(FpAgg::new));
     }
 
-    fn record_ok(&self, fp: u32, micros: u64) {
+    fn record_ok(&self, fp: u32, micros: u64, checksum: ChecksumOutcome) {
         self.executed.fetch_add(1, Ordering::Relaxed);
         self.with_fp(fp, |agg| {
             agg.executed += 1;
             agg.hist.saturating_record(micros.max(1));
+            if !matches!(checksum, ChecksumOutcome::Off) {
+                agg.checksum
+                    .get_or_insert_with(Default::default)
+                    .add(checksum);
+            }
         });
     }
 
@@ -498,8 +571,27 @@ struct PassCtx<T: Target> {
     pacer: Pacer,
     allow_writes: bool,
     use_event_db: bool,
+    checksum: bool,
     pool: Option<ConnPool<T>>,
     shutdown: watch::Receiver<bool>,
+}
+
+/// Execute one event on a connection, checksumming read results when the
+/// pass runs with `--checksum` (writes execute plainly — their "result" is
+/// a state change, not a result set).
+async fn execute_event<C: TargetConn>(
+    conn: &mut C,
+    query: &str,
+    checksum: bool,
+) -> Result<ChecksumOutcome, crate::target::TargetError> {
+    if checksum && should_execute(query, false) {
+        conn.query_checksum(query).await.map(|cs| match cs {
+            Some(cs) => ChecksumOutcome::Set(cs),
+            None => ChecksumOutcome::NoResult,
+        })
+    } else {
+        conn.query(query).await.map(|()| ChecksumOutcome::Off)
+    }
 }
 
 enum DrainAs {
@@ -667,10 +759,10 @@ async fn run_session_dedicated<T: Target, S: EventStream>(
         }
 
         let t0 = Instant::now();
-        match conn.query(&ev.query).await {
-            Ok(()) => ctx
+        match execute_event(&mut conn, &ev.query, ctx.checksum).await {
+            Ok(cs) => ctx
                 .metrics
-                .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64),
+                .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64, cs),
             Err(e) => {
                 ctx.metrics.record_err(ev.fingerprint_id, &e.message);
                 if e.fatal {
@@ -781,10 +873,10 @@ async fn run_session_pooled<T: Target, S: EventStream>(
         }
 
         let t0 = Instant::now();
-        match pc.conn.query(&ev.query).await {
-            Ok(()) => {
+        match execute_event(&mut pc.conn, &ev.query, ctx.checksum).await {
+            Ok(cs) => {
                 ctx.metrics
-                    .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64);
+                    .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64, cs);
                 pool.checkin(pc);
             }
             Err(e) => {
@@ -832,6 +924,7 @@ async fn run_pass<T: Target, S: EventStream>(
         pacer: Pacer::new(options.speed, cap.base_ts_micros),
         allow_writes: options.allow_writes,
         use_event_db,
+        checksum: options.checksum,
         pool: options.pool.map(|_| ConnPool::new(default_db)),
         shutdown: shutdown.clone(),
     });
@@ -897,23 +990,31 @@ async fn run_pass<T: Target, S: EventStream>(
     let per_fp = std::mem::take(&mut *metrics.per_fp.lock().expect("metrics lock"));
     let mut fingerprints: Vec<FingerprintReport> = per_fp
         .into_iter()
-        .map(|(id, agg)| FingerprintReport {
-            id,
-            fingerprint: cap
+        .map(|(id, agg)| {
+            let fingerprint = cap
                 .fp_texts
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| format!("<unknown fingerprint {id}>")),
-            count: agg.executed,
-            errors: agg.errors,
-            first_error: agg.first_error,
-            skipped: agg.skipped,
-            not_run: agg.not_run,
-            p50_us: agg.hist.value_at_quantile(0.50),
-            p95_us: agg.hist.value_at_quantile(0.95),
-            p99_us: agg.hist.value_at_quantile(0.99),
-            max_us: agg.hist.max(),
-            mean_us: agg.hist.mean(),
+                .unwrap_or_else(|| format!("<unknown fingerprint {id}>"));
+            let checksum = agg
+                .checksum
+                .as_ref()
+                .map(|c| c.report(crate::classify::is_nondeterministic(&fingerprint)));
+            FingerprintReport {
+                id,
+                fingerprint,
+                count: agg.executed,
+                errors: agg.errors,
+                first_error: agg.first_error,
+                skipped: agg.skipped,
+                not_run: agg.not_run,
+                p50_us: agg.hist.value_at_quantile(0.50),
+                p95_us: agg.hist.value_at_quantile(0.95),
+                p99_us: agg.hist.value_at_quantile(0.99),
+                max_us: agg.hist.max(),
+                mean_us: agg.hist.mean(),
+                checksum,
+            }
         })
         .collect();
     fingerprints.sort_by(|a, b| b.p95_us.cmp(&a.p95_us).then(b.count.cmp(&a.count)));
@@ -938,6 +1039,7 @@ async fn run_pass<T: Target, S: EventStream>(
             read_only: options.read_only,
             db_override: options.db_override.clone(),
             speed: options.speed.label(),
+            checksum: options.checksum,
             pool: options.pool,
             warmup: options.warmup,
             filter_db: options.filters.db.clone(),
