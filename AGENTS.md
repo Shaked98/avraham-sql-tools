@@ -183,6 +183,28 @@ the static binary and rpmbuilds the spec on every PR so neither rots.
 Keep the dep tree free of OpenSSL/system libs or the static build breaks
 (zstd-sys is the one C dependency, compiled by musl-gcc in CI).
 
+## Real-data verification rig (`verify/`)
+
+`verify/run.sh` + `verify/workload.sh` + `.github/workflows/real-verify.yml`
+(docs: `verify/README.md`): ground-truth detection-quality check on the
+real employees dataset against mysql:5.7/8.0 containers — plants two big
+regressions on the 8.0 side, asserts `compare` flags exactly those and
+neither control class. Manual/weekly CI job, deliberately not per-PR.
+Gotchas baked into it (relearn them from its comments before changing it):
+
+- The mysql client sends `select @@version_comment limit 1` on EVERY
+  connection, batch mode included — one extra captured event per session.
+- Sub-millisecond control queries' p95 is scheduler noise when heavy
+  queries run concurrently on a small runner, and the noise is worse on
+  the deliberately slower candidate — a false-positive machine. The rig
+  parks planted-class sessions behind a `SELECT SLEEP(n)` first event so
+  controls run on a quiet box; keep that property when adding classes.
+- `workflow_dispatch` cannot target a workflow file that is not yet on
+  the default branch; iterate on a rig branch with a temporary
+  `push:` trigger instead.
+- Replay-side `--filter-user` on a dedicated workload MySQL user is how
+  the rig keeps its own admin statements out of the replayed event set.
+
 ## Maintaining this file
 
 Keep this file current as the project evolves; it is the shared memory
