@@ -1,0 +1,51 @@
+# Time: 2023-09-01T12:00:01.000000Z
+# User@Host: smoke[smoke] @ localhost []  Id:    1
+# Query_time: 0.000100 Lock_time: 0.000000 Rows_sent: 1 Rows_examined: 1
+SET timestamp=1693569601;
+SELECT 1;
+# User@Host: smoke[smoke] @ localhost []  Id:    2
+# Query_time: 0.000100 Lock_time: 0.000000 Rows_sent: 0 Rows_examined: 0
+SET timestamp=1693569601;
+SET @marker = 42;
+# User@Host: smoke[smoke] @ localhost []  Id:    3
+# Query_time: 0.000200 Lock_time: 0.000000 Rows_sent: 1 Rows_examined: 1
+SET timestamp=1693569601;
+EXPLAIN SELECT 1;
+# User@Host: smoke[smoke] @ localhost []  Id:    1
+# Query_time: 0.050000 Lock_time: 0.000000 Rows_sent: 1 Rows_examined: 1
+SET timestamp=1693569602;
+SELECT SLEEP(0.05);
+# User@Host: smoke[smoke] @ localhost []  Id:    2
+# Query_time: 0.000100 Lock_time: 0.000000 Rows_sent: 1 Rows_examined: 1
+SET timestamp=1693569602;
+SELECT @marker + 1;
+# User@Host: smoke[smoke] @ localhost []  Id:    3
+# Query_time: 0.000400 Lock_time: 0.000000 Rows_sent: 2 Rows_examined: 2
+SET timestamp=1693569602;
+SELECT collation_name FROM information_schema.collations WHERE collation_name IN ('utf8mb4_general_ci', 'latin1_swedish_ci') ORDER BY collation_name;
+# User@Host: smoke[smoke] @ localhost []  Id:    1
+# Query_time: 0.001000 Lock_time: 0.000100 Rows_sent: 5 Rows_examined: 40
+SET timestamp=1693569603;
+SELECT table_name FROM information_schema.tables WHERE table_schema = 'mysql' ORDER BY table_name LIMIT 5;
+# User@Host: smoke[smoke] @ localhost []  Id:    2
+# Query_time: 0.002000 Lock_time: 0.000000 Rows_sent: 8 Rows_examined: 8
+SET timestamp=1693569603;
+SHOW VARIABLES LIKE 'version%';
+# User@Host: smoke[smoke] @ localhost []  Id:    3
+# Query_time: 0.010000 Lock_time: 0.000500 Rows_sent: 0 Rows_examined: 0
+SET timestamp=1693569603;
+DROP TABLE IF EXISTS t_skip_me;
+# User@Host: smoke[smoke] @ localhost []  Id:    1
+# Query_time: 0.000300 Lock_time: 0.000000 Rows_sent: 1 Rows_examined: 1
+SET timestamp=1693569604;
+SELECT 'text with # hash
+# User@Host: not a real header
+end of string' AS c;
+# User@Host: smoke[smoke] @ localhost []  Id:    2
+# Query_time: 0.005000 Lock_time: 0.000200 Rows_sent: 0 Rows_examined: 0
+SET timestamp=1693569604;
+INSERT INTO t_skip_me VALUES (1, 'never runs');
+# User@Host: smoke[smoke] @ localhost []  Id:    3
+# Query_time: 0.000100 Lock_time: 0.000000 Rows_sent: 0 Rows_examined: 0
+SET timestamp=1693569604;
+use information_schema;

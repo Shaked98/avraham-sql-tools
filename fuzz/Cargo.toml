@@ -1,0 +1,60 @@
+[package]
+name = "sql-replay-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+zstd = "0.13.3"
+
+[dependencies.sql-replay]
+path = "../crates/sql-replay"
+
+# Standalone workspace: the fuzz crate is nightly-only tooling and must not
+# join the stable root workspace (CI builds it separately).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "slowlog_parse"
+path = "fuzz_targets/slowlog_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slowlog_structured"
+path = "fuzz_targets/slowlog_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fingerprint"
+path = "fuzz_targets/fingerprint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "classify"
+path = "fuzz_targets/classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capture_reader"
+path = "fuzz_targets/capture_reader.rs"
+test = false
+doc = false
+bench = false

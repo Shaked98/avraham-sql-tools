@@ -1,0 +1,1 @@
+WITH q AS (SELECT 1) SELECT * FROM q INTO OUTFILE '/tmp/x'
