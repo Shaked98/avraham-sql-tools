@@ -5,13 +5,39 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// [`RunReport::latency_source`] for reports produced by `replay`:
+/// latencies are client-side wall times measured by this tool.
+pub const LATENCY_SOURCE_REPLAYED: &str = "replayed";
+/// [`RunReport::latency_source`] for reports produced by `baseline`:
+/// latencies are server-side `Query_time` values recorded in the
+/// production slow log.
+pub const LATENCY_SOURCE_RECORDED: &str = "recorded-slow-log";
+
+pub(crate) fn default_latency_source() -> String {
+    LATENCY_SOURCE_REPLAYED.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunReport {
     pub tool: String,
     pub tool_version: String,
     pub capture_file: String,
     pub capture_dialect: String,
+    /// Where the per-fingerprint latencies were measured:
+    /// [`LATENCY_SOURCE_REPLAYED`] (client-side wall time observed by
+    /// `sql-replay replay`) or [`LATENCY_SOURCE_RECORDED`] (server-side
+    /// `Query_time` parsed from the production slow log by
+    /// `sql-replay baseline`). Absent in pre-0.2.0 reports, which are all
+    /// replayed (serde default).
+    #[serde(default = "default_latency_source")]
+    pub latency_source: String,
+    /// Empty (and omitted from JSON) for recorded baselines, which have no
+    /// target server.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_url: String,
+    /// Empty (and omitted from JSON) for recorded baselines — the slow log
+    /// does not know the server version string.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_server_version: String,
     pub started_at: String,
     pub ended_at: String,
@@ -124,6 +150,12 @@ impl RunReport {
     /// than by the target server.
     pub const SATURATION_WARN_PCT: f64 = 20.0;
 
+    /// True for reports whose latencies were recorded in the production
+    /// slow log (`sql-replay baseline`) rather than measured by a replay.
+    pub fn is_recorded(&self) -> bool {
+        self.latency_source == LATENCY_SOURCE_RECORDED
+    }
+
     pub fn saturation_warning(&self) -> Option<String> {
         if self.saturation.saturated_pct >= Self::SATURATION_WARN_PCT {
             let (flag, cap) = match self.flags.pool {
@@ -158,8 +190,13 @@ impl RunReport {
                 agg.method, agg.passes
             ));
         }
+        let verb = if self.is_recorded() {
+            "Recorded"
+        } else {
+            "Replayed"
+        };
         out.push_str(&format!(
-            "Replayed {} events across {} sessions in {:.2}s — {:.1} QPS\n",
+            "{verb} {} events across {} sessions in {:.2}s — {:.1} QPS\n",
             t.events, t.sessions, self.wall_secs, t.qps
         ));
         out.push_str(&format!(
@@ -172,10 +209,18 @@ impl RunReport {
                 t.filtered
             ));
         }
-        out.push_str(&format!(
-            "Target: {} ({})\n",
-            self.target_server_version, self.target_url
-        ));
+        if self.is_recorded() {
+            out.push_str(
+                "Latencies: server-side Query_time recorded in the production slow log \
+                 (no replay target; the log carries no error information, so errors are \
+                 0 by definition)\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "Target: {} ({})\n",
+                self.target_server_version, self.target_url
+            ));
+        }
         if let Some(p) = &self.pacing {
             out.push_str(&format!(
                 "Pacing: speed {}x over {} events — max lag {:.1} ms, mean lag {:.1} ms\n",

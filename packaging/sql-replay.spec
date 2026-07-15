@@ -6,11 +6,11 @@
 #
 #   rpmbuild -bb packaging/sql-replay.spec \
 #     --define "_sourcedir $PWD/dist" \
-#     --define "version 0.1.0"
+#     --define "version 0.2.0"
 #
 # where dist/ holds sql-replay-<version>-x86_64-unknown-linux-musl.tar.gz.
 
-%{!?version: %global version 0.1.0}
+%{!?version: %global version 0.2.0}
 
 # The binary is prebuilt and static: no debuginfo to extract, no build-id
 # links, and no automatic library dependencies to scan for.
@@ -33,7 +33,9 @@ sql-replay captures MySQL slow query logs (long_query_time=0) into a
 compressed replay file, replays them against a target server at the
 original concurrency — optionally honoring the capture's original timing —
 and compares two run reports to gate 5.7 -> 8.0 migrations on per-query
-latency regressions.
+latency regressions. When the source server cannot be replayed against
+because it is live production, the baseline report can instead be built
+from the capture's recorded slow-log latencies (sql-replay baseline).
 
 The binary is statically linked (musl); it has no runtime dependencies.
 
@@ -53,5 +55,10 @@ install -Dm644 README.md %{buildroot}%{_docdir}/sql-replay/README.md
 %license LICENSE-MIT LICENSE-APACHE
 
 %changelog
+* Wed Jul 15 2026 avraham-sql-tools contributors - 0.2.0-1
+- `baseline` subcommand: build a compare-ready baseline report from a
+  capture's recorded production slow-log latencies (no replay target
+  needed); `compare` warns when a recorded side meets a replayed one.
+
 * Tue Jul 14 2026 avraham-sql-tools contributors - 0.1.0-1
 - Initial RPM packaging (M3): static musl binary, no runtime dependencies.

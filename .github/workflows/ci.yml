@@ -301,6 +301,56 @@ jobs:
           # the HTML report must be self-contained (no external requests)
           test -s report.html
           ! grep -qE 'https?://' report.html
+      - name: build a recorded baseline from the smoke fixture capture
+        run: |
+          ./target/release/sql-replay capture \
+            --input crates/sql-replay/tests/fixtures/replay_smoke.log \
+            --out capture.jsonl.zst
+          ./target/release/sql-replay baseline \
+            --capture capture.jsonl.zst \
+            --out baseline.json
+          jq . baseline.json
+          jq -e '.latency_source == "recorded-slow-log"' baseline.json
+          # no replay target: url/version/settings are absent, not blank
+          jq -e 'has("target_url") | not' baseline.json
+          jq -e 'has("target_server_version") | not' baseline.json
+          jq -e 'has("target_settings") | not' baseline.json
+          # every logged event ran on production; the log records no errors
+          jq -e '.totals.events == 12 and .totals.executed == 12' baseline.json
+          jq -e '.totals.errors == 0 and .totals.skipped == 0' baseline.json
+          jq -e '.totals.sessions == 3' baseline.json
+          # the capture's own timeline: 1693569601..1693569604
+          jq -e '.started_at == "2023-09-01T12:00:01Z"' baseline.json
+          jq -e '.wall_secs == 3' baseline.json
+          jq -e '.totals.qps == 4' baseline.json
+          jq -e '.fingerprints | length == 12' baseline.json
+          # the recorded SELECT SLEEP(0.05) Query_time lands per-fingerprint
+          jq -e '[.fingerprints[] | select(.p95_us >= 49000 and .p95_us <= 51000)] | length == 1' baseline.json
+      - name: compare the recorded baseline against the real 8.0 replay run
+        # Same determinism trick as above: --min-count 2 keeps the
+        # count-1 fingerprints out of the headline ranking, so exit code 0.
+        run: |
+          ./target/release/sql-replay compare \
+            --baseline baseline.json \
+            --candidate run-8.0/run.json \
+            --min-count 2 \
+            --json recorded-report.json \
+            --out recorded-report.html | tee recorded-compare.txt
+          jq . recorded-report.json
+          jq -e '.baseline.latency_source == "recorded-slow-log"' recorded-report.json
+          jq -e '.candidate.latency_source == "replayed"' recorded-report.json
+          jq -e '.regressed == false' recorded-report.json
+          # the recorded-vs-replayed measurement-plane warning is present
+          jq -e '[.comparability_warnings[] | select(contains("MEASUREMENT PLANES DIFFER"))] | length == 1' recorded-report.json
+          grep -q 'MEASUREMENT PLANES DIFFER' recorded-compare.txt
+          # settings diff skipped gracefully; version slot shows provenance
+          jq -e '.settings_diff | length == 0' recorded-report.json
+          jq -e '.settings_note | contains("recorded from the slow log")' recorded-report.json
+          grep -q 'recorded (slow log)' recorded-compare.txt
+          grep -q 'recorded (slow log)' recorded-report.html
+          grep -q 'settings diff skipped' recorded-report.html
+          # still self-contained HTML
+          ! grep -qE 'https?://' recorded-report.html
       - name: exit code 2 on the known-regression fixture pair
         run: |
           set +e

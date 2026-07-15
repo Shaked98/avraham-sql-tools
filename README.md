@@ -18,7 +18,10 @@ M1 shipped `capture` and `replay`; M2 added faithful-timing pacing
 M3 made replay production-scale (bounded memory independent of capture
 size, thousands of concurrent sessions, warmup/repeat/filter/abort
 controls, an optional connection pool) and deployable on RHEL 8 (static
-musl binary, RPM spec, release workflow). Planned next: pcap capture (M4).
+musl binary, RPM spec, release workflow). 0.2.0 added `baseline`: build
+the baseline report from the capture's *recorded* production latencies
+when the source server cannot be replayed against. Planned next: pcap
+capture (M4).
 
 ### Capturing load on the source server
 
@@ -157,7 +160,8 @@ $ sql-replay replay --capture capture.jsonl.zst --url mysql://... \
 ### Comparing runs (5.7 vs 8.0 regression gate)
 
 Replay the same capture against both servers, then diff the two run
-reports:
+reports (either side may instead be a recorded production baseline from
+`sql-replay baseline` — see the next section):
 
 ```console
 $ sql-replay compare \
@@ -197,6 +201,54 @@ $ sql-replay compare \
   # non-zero exit fails the job when p95 regressions >= 25% exist
 ```
 
+### No 5.7 replay target? Use the production-recorded baseline
+
+The classic workflow above replays the same capture against *both*
+servers. Often the 5.7 side can't be replayed against at all — it **is**
+production — and only the 8.0 twin host is replayable. `sql-replay
+baseline` covers that: the slow log already recorded every statement's
+server-side execution time (`Query_time`), and `capture` stores it per
+event, so the production baseline can be built from the capture alone:
+
+```console
+$ # 1. capture on production (slow log with long_query_time=0)
+$ sql-replay capture --input slow.log --out capture.jsonl.zst
+$ # 2. baseline from the RECORDED production latencies — no replay, no target
+$ sql-replay baseline --capture capture.jsonl.zst --out baseline.json
+$ # 3. replay the 8.0 twin at the original pace
+$ sql-replay replay --capture capture.jsonl.zst \
+    --url mysql://bench@twin-80:3306/ --speed 1.0 --out run-8.0.json
+$ # 4. gate
+$ sql-replay compare --baseline baseline.json --candidate run-8.0.json \
+    --threshold-pct 50 --min-count 10 --json report.json --out report.html
+```
+
+- The baseline report has the same shape as a replay `run.json` (same
+  per-fingerprint count/p50/p95/p99/max/mean; stdout gets the same top-N
+  slowest-fingerprints table, `--top`), with
+  `latency_source: "recorded-slow-log"` marking its provenance (replayed
+  reports say `"replayed"`). Its timeline is the capture's own:
+  `started_at`/`ended_at` are the first/last event timestamps and QPS
+  derives from them. It carries no `target_url`, server version, or
+  target settings — the slow log doesn't know them; `compare` shows
+  "recorded (slow log)" in the version slot and skips the settings diff
+  with a note.
+- `--filter-db`/`--filter-user`/`--time-window` work exactly as in
+  `replay`, so the baseline can cover the same slice you replay.
+- **Measurement planes differ — compare generously.** Recorded latencies
+  are server-side `Query_time` under live production load (they include
+  lock waits and contention from concurrent traffic); replayed latencies
+  are client-side wall times measured from the test host (they include
+  network round-trip and driver overhead). `compare` prints a loud
+  warning for recorded-vs-replayed pairs; use a generous
+  `--threshold-pct` (e.g. 50) and treat small deltas as noise. Replay the
+  twin with `--speed 1.0` so it sees the original concurrency and think
+  of the twin as ideally **identical hardware** to production — a weaker
+  test host shifts every delta.
+- **Errors are 0 by definition** in a recorded baseline: the slow log
+  records no statement errors. A zero there says nothing about how many
+  errors production actually had — only replayed runs measure errors.
+
 ### Deploying on RHEL 8
 
 The release artifact is a **fully static** `x86_64-unknown-linux-musl`
@@ -235,7 +287,9 @@ mock target and, in release mode, the million-event bounded-memory scale
 test) plus a live replay of a fixture capture against `mysql:5.7` and
 `mysql:8.0` service containers (max-speed, `--db-override`, paced
 `--speed 20`, `--warmup --repeat 3`, filtered, and `--pool` runs), then
-feeds run reports through `sql-replay compare` and asserts the report
-shape and gate exit codes. A dedicated job builds the static musl binary,
+feeds run reports through `sql-replay compare` — including a recorded
+`baseline` built from the fixture capture compared against the live 8.0
+run — and asserts the report shape, the recorded-vs-replayed warning,
+and gate exit codes. A dedicated job builds the static musl binary,
 verifies it is statically linked, and smoke-builds the RPM from
 `packaging/sql-replay.spec`.

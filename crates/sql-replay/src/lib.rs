@@ -1,7 +1,9 @@
 //! sql-replay: capture MySQL slow query logs, replay them against a
-//! target server, and compare run reports to find performance regressions.
+//! target server (or build a baseline report from the capture's recorded
+//! latencies), and compare run reports to find performance regressions.
 
 pub mod aggregate;
+pub mod baseline;
 pub mod capture;
 pub mod classify;
 pub mod compare;
