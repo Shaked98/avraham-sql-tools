@@ -31,7 +31,9 @@ Rust is installed user-level via rustup, and linking + `cc`-built crates
 (zstd-sys) work through a `zig cc` wrapper:
 
 - `~/.local/opt/zig/` — zig toolchain; `~/.local/bin/zigcc` — wrapper that
-  rewrites `--target=x86_64-unknown-linux-gnu` to zig's triple spelling.
+  rewrites `--target=x86_64-unknown-linux-gnu` to zig's triple spelling
+  (`zigcxx` is the same for `zig c++`, needed as `CXX` by cargo-fuzz's
+  libFuzzer runtime).
 - `~/.cargo/config.toml` sets `linker = "zigcc"` for the gnu target and
   `CC=zigcc`. This is host config, deliberately NOT committed; CI uses
   plain gcc on ubuntu-latest.
@@ -223,6 +225,21 @@ Gotchas baked into it (relearn them from its comments before changing it):
   `push:` trigger instead.
 - Replay-side `--filter-user` on a dedicated workload MySQL user is how
   the rig keeps its own admin statements out of the replayed event set.
+
+## Fuzzing (`fuzz/`)
+
+`fuzz/README.md` is the authoritative doc. cargo-fuzz targets (nightly,
+standalone workspace — deliberately outside the stable root workspace)
+cover every external-input surface: slow-log parser (raw bytes +
+structured mutations), fingerprint normalizer, classify write gate
+(with gate invariants asserted, e.g. appended top-level `;DROP …` must
+classify Write), and the zstd-JSONL capture reader.
+`crates/sql-replay/tests/corpus/` holds the committed nasty-log corpus;
+every file there is pinned by `tests/corpus_test.rs` (exact event counts —
+no panics, no silently dropped entries) and doubles as fuzz seeds.
+`.github/workflows/fuzz-smoke.yml` runs 60 s/target weekly/manual.
+Before shipping parser changes, run a longer local campaign per
+`fuzz/README.md` (on this host: `CXX=zigcxx`).
 
 ## Maintaining this file
 
