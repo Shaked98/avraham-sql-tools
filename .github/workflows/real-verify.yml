@@ -1,0 +1,45 @@
+# Real-data detection-quality verification for sql-replay: loads the real
+# employees dataset into mysql:5.7 and mysql:8.0, plants two large
+# regressions on the 8.0 side only, and asserts that
+# capture -> replay -> compare flags exactly those and neither control
+# class. See verify/README.md.
+#
+# Deliberately NOT per-PR: it downloads a ~35 MB dataset and runs minutes
+# of load. Trigger manually (workflow_dispatch) or let the weekly schedule
+# catch drift.
+name: real-data verification
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  real-verify:
+    name: planted-regression detection on the employees dataset
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build sql-replay
+        run: cargo build --release -p sql-replay
+      - name: run the verification rig
+        run: verify/run.sh
+      - name: upload reports and run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-verify-artifacts
+          path: |
+            verify/out/report.html
+            verify/out/report.json
+            verify/out/run-*.json
+            verify/out/capture-summary.txt
+            verify/out/compare-stdout.txt
+            verify/out/capture.jsonl.zst
+          if-no-files-found: warn

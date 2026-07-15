@@ -293,3 +293,17 @@ run — and asserts the report shape, the recorded-vs-replayed warning,
 and gate exit codes. A dedicated job builds the static musl binary,
 verifies it is statically linked, and smoke-builds the RPM from
 `packaging/sql-replay.spec`.
+
+### Real-data verification rig
+
+Beyond the unit/CI suites, `verify/run.sh` is a single-command,
+end-to-end **detection-quality** check on real data: it loads the
+canonical [employees dataset](https://github.com/datacharmer/test_db)
+into real `mysql:5.7` and `mysql:8.0` containers, plants two large
+regressions on the 8.0 side only (a dropped secondary index and a
+temp-table-to-disk spill via `temptable_max_ram`), runs a seeded
+concurrent workload through the full capture → replay → compare loop, and
+asserts that `compare` flags exactly the two planted classes while the
+untouched control classes stay clean. Runs locally on any docker-equipped
+Linux machine (~15–25 min) or in CI via the manually-triggered / weekly
+`real-verify` workflow. See [`verify/README.md`](verify/README.md).

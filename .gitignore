@@ -1,3 +1,5 @@
 /target
 *.jsonl.zst
 run.json
+/verify/out
+/verify/.cache
