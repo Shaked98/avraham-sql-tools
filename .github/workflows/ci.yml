@@ -81,6 +81,42 @@ jobs:
           jq -e '[.fingerprints[] | select(.skipped > 0)] | length == 2' run.json
           jq -e '[.fingerprints[] | select(.skipped > 0) | .count] | all(. == 0)' run.json
           jq -e '.flags.allow_writes == false' run.json
+          # target settings are recorded on both 5.7 and 8.0 (name of the
+          # isolation variable differs across versions; both map to the
+          # canonical key)
+          jq -e '.target_settings.sql_mode | type == "string"' run.json
+          jq -e '.target_settings.character_set_server | type == "string"' run.json
+          jq -e '.target_settings.collation_server | type == "string"' run.json
+          jq -e '.target_settings.innodb_buffer_pool_size | type == "string"' run.json
+          jq -e '.target_settings.transaction_isolation | type == "string"' run.json
+          # --speed max has no pacing schedule, so no pacing block
+          jq -e 'has("pacing") | not' run.json
+      - name: paced replay (--speed 20) against MySQL ${{ matrix.mysql }}
+        run: |
+          ./target/release/sql-replay replay \
+            --capture capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --max-connections 8 \
+            --speed 20 \
+            --out run-paced.json
+      - name: assert run-paced.json pacing metrics
+        run: |
+          jq . run-paced.json
+          jq -e '.totals.executed == 10' run-paced.json
+          jq -e '.flags.speed == "20"' run-paced.json
+          jq -e '.pacing.speed == 20' run-paced.json
+          # all 12 events are paced (skipped writes still hold their slot in
+          # the timeline); 10 execute
+          jq -e '.pacing.paced_events == 12' run-paced.json
+          jq -e '.pacing.max_lag_us >= 0' run-paced.json
+          jq -e '.pacing.mean_lag_us >= 0' run-paced.json
+          # capture spans 3s -> at 20x the paced run takes >= ~150ms
+          jq -e '.wall_secs >= 0.14' run-paced.json
+      - name: upload run.json for the compare job
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-${{ matrix.mysql }}
+          path: run.json
       - name: replay with --db-override against MySQL ${{ matrix.mysql }}
         run: |
           ./target/release/sql-replay replay \
@@ -102,3 +138,68 @@ jobs:
         run: cargo test -p sql-replay --test replay_integration
         env:
           SQL_REPLAY_TEST_URL: mysql://root@127.0.0.1:3306/sqlreplay
+
+  compare:
+    name: compare 5.7 vs 8.0 runs
+    runs-on: ubuntu-latest
+    needs: integration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --release -p sql-replay
+      - uses: actions/download-artifact@v4
+        with:
+          name: run-5.7
+          path: run-5.7
+      - uses: actions/download-artifact@v4
+        with:
+          name: run-8.0
+          path: run-8.0
+      - name: compare the real 5.7 run against the 8.0 run
+        # The smoke fixture executes each fingerprint once, so --min-count 2
+        # keeps every fingerprint out of the headline ranking: exit code 0
+        # is deterministic while the report still carries the full deltas.
+        run: |
+          ./target/release/sql-replay compare \
+            --baseline run-5.7/run.json \
+            --candidate run-8.0/run.json \
+            --min-count 2 \
+            --json report.json \
+            --out report.html
+      - name: assert compare report shape
+        run: |
+          jq . report.json
+          jq -e '.baseline.target_server_version | startswith("5.7")' report.json
+          jq -e '.candidate.target_server_version | startswith("8.0")' report.json
+          jq -e '.regressed == false' report.json
+          jq -e '.regressions | length == 0' report.json
+          jq -e '.low_sample | length >= 10' report.json
+          jq -e '.only_in_baseline | length == 0' report.json
+          jq -e '.only_in_candidate | length == 0' report.json
+          jq -e '.count_mismatches == 0' report.json
+          jq -e '.totals.baseline_qps > 0 and .totals.candidate_qps > 0' report.json
+          # 5.7 and 8.0 defaults differ (sql_mode, charset/collation), so the
+          # settings diff and its comparability warning must be present
+          jq -e '.settings_diff | length >= 1' report.json
+          jq -e '[.settings_diff[].name] | index("character_set_server") != null' report.json
+          jq -e '.comparability_warnings | length >= 1' report.json
+          # the HTML report must be self-contained (no external requests)
+          test -s report.html
+          ! grep -qE 'https?://' report.html
+      - name: exit code 2 on the known-regression fixture pair
+        run: |
+          set +e
+          ./target/release/sql-replay compare \
+            --baseline crates/sql-replay/tests/fixtures/run-baseline.json \
+            --candidate crates/sql-replay/tests/fixtures/run-candidate.json \
+            > /dev/null
+          code=$?
+          set -e
+          test "$code" -eq 2
+      - name: upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: compare-report
+          path: report.html

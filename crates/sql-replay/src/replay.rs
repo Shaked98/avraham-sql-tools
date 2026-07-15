@@ -21,40 +21,152 @@ use tokio::sync::Semaphore;
 use crate::classify::{is_use_statement, should_execute};
 use crate::format::{read_capture, Event};
 use crate::report::{
-    redact_url, FingerprintReport, ReportFlags, RunReport, SaturationReport, Totals,
+    redact_url, FingerprintReport, PacingReport, ReportFlags, RunReport, SaturationReport, Totals,
 };
 
-/// Replay pacing mode. M1 only implements `max` (each session fires its next
-/// query as soon as the previous one completes); faithful-timing pacing is a
-/// planned M2 addition that slots into [`Pacer::pace`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+/// Replay pacing mode: `max` (each session fires its next query as soon as
+/// the previous one completes) or a positive speed factor honoring the
+/// capture's original timeline (1.0 = real time, 2.0 = twice as fast).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Speed {
     Max,
+    Factor(f64),
 }
 
 impl Speed {
-    pub fn as_str(self) -> &'static str {
+    pub fn parse(s: &str) -> Result<Speed, String> {
+        if s.eq_ignore_ascii_case("max") {
+            return Ok(Speed::Max);
+        }
+        let f: f64 = s
+            .parse()
+            .map_err(|_| format!("expected `max` or a positive number, got `{s}`"))?;
+        if !f.is_finite() || f <= 0.0 {
+            return Err(format!("speed factor must be a positive number, got `{s}`"));
+        }
+        Ok(Speed::Factor(f))
+    }
+
+    pub fn label(self) -> String {
         match self {
-            Speed::Max => "max",
+            Speed::Max => "max".to_string(),
+            // Trim a trailing `.0` so `--speed 2` round-trips as "2".
+            Speed::Factor(f) => {
+                let s = format!("{f}");
+                s.strip_suffix(".0").unwrap_or(&s).to_string()
+            }
+        }
+    }
+}
+
+/// Pure schedule math: micros after replay start at which an event with
+/// capture timestamp `ev_ts_micros` is due, given the capture-clock origin
+/// (the earliest event timestamp) and the speed factor. Inter-event gaps
+/// shrink by `speed`; timestamps at or before the origin are due at once.
+fn due_offset_micros(ev_ts_micros: i64, base_ts_micros: i64, speed: f64) -> u64 {
+    let gap = ev_ts_micros.saturating_sub(base_ts_micros).max(0) as f64;
+    (gap / speed).round() as u64
+}
+
+/// Pacing-fidelity accumulator: how far behind its schedule each paced
+/// event fired. A saturated target shows up here as growing lag instead of
+/// silently reshaping the workload.
+#[derive(Default)]
+struct LagAgg {
+    paced_events: AtomicU64,
+    max_lag_us: AtomicU64,
+    sum_lag_us: AtomicU64,
+}
+
+impl LagAgg {
+    fn record(&self, lag: Duration) {
+        let us = lag.as_micros() as u64;
+        self.paced_events.fetch_add(1, Ordering::Relaxed);
+        self.max_lag_us.fetch_max(us, Ordering::Relaxed);
+        self.sum_lag_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    fn report(&self, speed: f64) -> PacingReport {
+        let n = self.paced_events.load(Ordering::Relaxed);
+        let sum = self.sum_lag_us.load(Ordering::Relaxed);
+        PacingReport {
+            speed,
+            paced_events: n,
+            max_lag_us: self.max_lag_us.load(Ordering::Relaxed),
+            mean_lag_us: if n > 0 { sum as f64 / n as f64 } else { 0.0 },
         }
     }
 }
 
 enum Pacer {
     Max,
+    Paced {
+        speed: f64,
+        base_ts_micros: i64,
+        start: tokio::time::Instant,
+        lag: LagAgg,
+    },
 }
 
 impl Pacer {
-    fn new(speed: Speed) -> Self {
+    /// `base_ts_micros` is the capture-clock origin (earliest event
+    /// timestamp); the pacer's own clock starts at construction time.
+    fn new(speed: Speed, base_ts_micros: i64) -> Self {
         match speed {
             Speed::Max => Pacer::Max,
+            Speed::Factor(f) => Pacer::Paced {
+                speed: f,
+                base_ts_micros,
+                start: tokio::time::Instant::now(),
+                lag: LagAgg::default(),
+            },
         }
     }
 
-    /// Wait until `event` is due. `Speed::Max` never waits.
-    async fn pace(&self, _event: &Event) {
+    fn due(&self, event: &Event) -> Option<tokio::time::Instant> {
         match self {
-            Pacer::Max => {}
+            Pacer::Max => None,
+            Pacer::Paced {
+                speed,
+                base_ts_micros,
+                start,
+                ..
+            } => Some(
+                *start
+                    + Duration::from_micros(due_offset_micros(
+                        event.ts_micros,
+                        *base_ts_micros,
+                        *speed,
+                    )),
+            ),
+        }
+    }
+
+    /// Wait until `event` is due, then record how far behind schedule it
+    /// fired (an event whose predecessor overran fires immediately; the
+    /// lateness is what the lag metrics capture). `Speed::Max` never waits.
+    async fn pace(&self, event: &Event) {
+        let Some(due) = self.due(event) else { return };
+        tokio::time::sleep_until(due).await;
+        if let Pacer::Paced { lag, .. } = self {
+            lag.record(tokio::time::Instant::now().saturating_duration_since(due));
+        }
+    }
+
+    /// Wait until `event` is due without recording lag — used before a
+    /// session claims its connection permit, so late-starting sessions don't
+    /// pin idle connections (or skew lag stats when the same event is paced
+    /// again inside the session loop).
+    async fn wait_until_due(&self, event: &Event) {
+        if let Some(due) = self.due(event) {
+            tokio::time::sleep_until(due).await;
+        }
+    }
+
+    fn report(&self) -> Option<PacingReport> {
+        match self {
+            Pacer::Max => None,
+            Pacer::Paced { speed, lag, .. } => Some(lag.report(*speed)),
         }
     }
 }
@@ -198,6 +310,13 @@ async fn run_session(
         return;
     }
 
+    // Don't claim a connection permit until the session's first event is
+    // due — a session that starts late in the capture would otherwise pin
+    // an idle connection for the whole lead-in.
+    if let Some(first) = events.first() {
+        pacer.wait_until_due(first).await;
+    }
+
     waiters.fetch_add(1, Ordering::SeqCst);
     let permit = sem
         .clone()
@@ -289,7 +408,8 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
             .into();
     }
 
-    // Probe: validates connectivity and grabs the server version up front.
+    // Probe: validates connectivity and grabs the server version plus the
+    // comparability-relevant settings up front.
     let mut probe = Conn::new(conn_opts.clone())
         .await
         .with_context(|| format!("cannot connect to target {}", redact_url(&options.url)))?;
@@ -297,7 +417,11 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
         .query_first("SELECT VERSION()")
         .await?
         .unwrap_or_default();
+    let target_settings = collect_target_settings(&mut probe).await;
     probe.disconnect().await?;
+
+    // The capture-clock origin for pacing: the earliest event timestamp.
+    let base_ts_micros = cap.events.iter().map(|e| e.ts_micros).min().unwrap_or(0);
 
     let sessions = group_sessions(cap.events);
     let session_count = sessions.len() as u64;
@@ -306,7 +430,7 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
     let sem = Arc::new(Semaphore::new(options.max_connections.max(1)));
     let waiters = Arc::new(AtomicU64::new(0));
     let metrics = Arc::new(Metrics::default());
-    let pacer = Arc::new(Pacer::new(options.speed));
+    let pacer = Arc::new(Pacer::new(options.speed, base_ts_micros));
 
     // Saturation sampler: counts intervals in which every permit was taken
     // while at least one session was waiting for one.
@@ -414,7 +538,7 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
             allow_writes: options.allow_writes,
             read_only: options.read_only,
             db_override: options.db_override.clone(),
-            speed: options.speed.as_str().to_string(),
+            speed: options.speed.label(),
         },
         totals: Totals {
             events: event_count,
@@ -435,8 +559,54 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
             saturated_samples: hits,
             saturated_pct,
         },
+        pacing: pacer.report(),
+        target_settings,
         fingerprints,
     })
+}
+
+/// Comparability-relevant target variables recorded into the run report so
+/// `compare` can flag runs taken against differently-configured servers.
+/// Read-only and tolerant of variables missing on either version
+/// (`transaction_isolation` replaced `tx_isolation` across 5.7 → 8.0).
+async fn collect_target_settings(conn: &mut Conn) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let names = [
+        "sql_mode",
+        "character_set_server",
+        "collation_server",
+        "innodb_buffer_pool_size",
+    ];
+    for name in names {
+        if let Some(v) = show_variable(conn, name).await {
+            out.insert(name.to_string(), v);
+        }
+    }
+    // Canonicalize the isolation level under one key: MySQL 8.0 only has
+    // transaction_isolation, pre-5.7.20 only tx_isolation, 5.7.20+ has both.
+    for name in ["transaction_isolation", "tx_isolation"] {
+        if let Some(v) = show_variable(conn, name).await {
+            out.insert("transaction_isolation".to_string(), v);
+            break;
+        }
+    }
+    out
+}
+
+async fn show_variable(conn: &mut Conn, name: &str) -> Option<String> {
+    // SHOW VARIABLES LIKE returns no row (rather than an error) for
+    // variables the server doesn't have, and always returns strings.
+    let row: Option<(String, String)> = match conn
+        .query_first(format!("SHOW VARIABLES LIKE '{name}'"))
+        .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::warn!(variable = name, error = %e, "failed to read target variable");
+            None
+        }
+    };
+    row.map(|(_, v)| v)
 }
 
 fn format_rfc3339(t: time::OffsetDateTime) -> String {
@@ -488,5 +658,92 @@ mod tests {
         assert_eq!(truncate("abc", 10), "abc");
         let t = truncate("aé日本語 long error text", 5);
         assert!(t.chars().count() <= 6);
+    }
+
+    #[test]
+    fn speed_parses_max_and_factors() {
+        assert_eq!(Speed::parse("max").unwrap(), Speed::Max);
+        assert_eq!(Speed::parse("MAX").unwrap(), Speed::Max);
+        assert_eq!(Speed::parse("1.0").unwrap(), Speed::Factor(1.0));
+        assert_eq!(Speed::parse("0.5").unwrap(), Speed::Factor(0.5));
+        assert_eq!(Speed::parse("2").unwrap(), Speed::Factor(2.0));
+        assert!(Speed::parse("0").is_err());
+        assert!(Speed::parse("-1").is_err());
+        assert!(Speed::parse("inf").is_err());
+        assert!(Speed::parse("nan").is_err());
+        assert!(Speed::parse("fast").is_err());
+        assert_eq!(Speed::Max.label(), "max");
+        assert_eq!(Speed::Factor(1.0).label(), "1");
+        assert_eq!(Speed::Factor(2.5).label(), "2.5");
+    }
+
+    #[test]
+    fn due_offset_scales_gaps_by_speed() {
+        let base = 1_000_000;
+        // At speed 1.0 the offset is the raw gap from the capture origin.
+        assert_eq!(due_offset_micros(base, base, 1.0), 0);
+        assert_eq!(due_offset_micros(base + 3_000_000, base, 1.0), 3_000_000);
+        // Speed 2.0 halves every gap; 0.5 doubles it.
+        assert_eq!(due_offset_micros(base + 3_000_000, base, 2.0), 1_500_000);
+        assert_eq!(due_offset_micros(base + 3_000_000, base, 0.5), 6_000_000);
+        // Timestamps at or before the origin are due immediately.
+        assert_eq!(due_offset_micros(base - 500, base, 1.0), 0);
+    }
+
+    fn paced_ev(ts_micros: i64) -> Event {
+        Event {
+            ts_micros,
+            ..ev(1, "SELECT 1")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pacer_sleeps_until_scheduled_offset() {
+        let pacer = Pacer::new(Speed::Factor(2.0), 1_000_000);
+        let t0 = tokio::time::Instant::now();
+        // Due at +100ms of capture time -> +50ms of replay time at 2x.
+        pacer.pace(&paced_ev(1_100_000)).await;
+        assert_eq!((tokio::time::Instant::now() - t0).as_millis(), 50);
+        let report = pacer.report().unwrap();
+        assert_eq!(report.paced_events, 1);
+        assert_eq!(report.max_lag_us, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pacer_never_fires_early_and_records_lag_when_behind() {
+        let pacer = Pacer::new(Speed::Factor(1.0), 0);
+        let t0 = tokio::time::Instant::now();
+        pacer.pace(&paced_ev(10_000)).await; // on time at +10ms
+        assert_eq!((tokio::time::Instant::now() - t0).as_millis(), 10);
+
+        // Simulate the predecessor overrunning by 40ms past the next event's
+        // +20ms due time: the event fires immediately (order preserved, no
+        // extra wait) and the 40ms lateness lands in the lag metrics.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let before = tokio::time::Instant::now();
+        pacer.pace(&paced_ev(20_000)).await;
+        assert_eq!(tokio::time::Instant::now(), before);
+
+        let report = pacer.report().unwrap();
+        assert_eq!(report.paced_events, 2);
+        assert_eq!(report.max_lag_us, 40_000);
+        assert_eq!(report.mean_lag_us, 20_000.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_pacer_never_waits_and_reports_no_pacing() {
+        let pacer = Pacer::new(Speed::Max, 0);
+        let t0 = tokio::time::Instant::now();
+        pacer.pace(&paced_ev(60_000_000)).await;
+        assert_eq!(tokio::time::Instant::now(), t0);
+        assert!(pacer.report().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_until_due_does_not_record_lag() {
+        let pacer = Pacer::new(Speed::Factor(1.0), 0);
+        pacer.wait_until_due(&paced_ev(30_000)).await;
+        let report = pacer.report().unwrap();
+        assert_eq!(report.paced_events, 0);
     }
 }

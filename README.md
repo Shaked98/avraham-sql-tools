@@ -11,12 +11,11 @@ Modern SQL tooling.
 Replay real production load captured on MySQL 5.7 against MySQL 8.0 (or any
 other target) to find performance regressions before cutover.
 
-### M1 scope
+### Scope
 
-This milestone ships `capture` and `replay` with `--speed max` pacing
-(each session fires its next query as soon as the previous one completes).
-Planned next: faithful-timing pacing (M2), a `compare` subcommand for
-run-to-run regression diffs, and static packaging for RHEL 8 (M3).
+M1 shipped `capture` and `replay`; M2 added faithful-timing pacing
+(`--speed`) and the `compare` subcommand for run-to-run regression diffs.
+Planned next: static packaging for RHEL 8 (M3) and pcap capture (M4).
 
 ### Capturing load on the source server
 
@@ -81,7 +80,77 @@ $ sql-replay replay \
   clock, QPS, saturation) plus per-fingerprint stats (count, errors with a
   first-error sample, skipped/not-run counts, p50/p95/p99/max/mean latency
   in µs); stdout
-  gets a top-N slowest-fingerprints table (`--top`, default 10).
+  gets a top-N slowest-fingerprints table (`--top`, default 10). It also
+  records comparability-relevant target settings (`sql_mode`,
+  `character_set_server`, `collation_server`, `innodb_buffer_pool_size`,
+  and the transaction isolation level — read via `SHOW VARIABLES`, tolerant
+  of the 5.7/8.0 `tx_isolation`/`transaction_isolation` rename) so
+  `compare` can flag differently-configured targets.
+
+### Pacing (`--speed`)
+
+By default (`--speed max`) each session fires its next query as soon as the
+previous one completes — maximum pressure, original per-session ordering.
+`--speed <factor>` honors the capture's original timeline instead:
+
+```console
+$ sql-replay replay --capture capture.jsonl.zst --url mysql://... \
+    --speed 1.0 --out run.json
+```
+
+- Every event is scheduled at its captured timestamp offset from replay
+  start (one global capture clock), with all inter-event gaps divided by
+  the factor: `1.0` = real time, `2.0` = twice as fast, `0.5` = half speed.
+- An event never fires *before* its scheduled offset. Within a session,
+  order is still strict: if a query overruns its successor's slot, the
+  successor fires as soon as the query completes — late, and that lateness
+  is recorded rather than silently reshaping the workload.
+- Pacing fidelity lands in `run.json` (`pacing.max_lag_us`,
+  `pacing.mean_lag_us`, `pacing.paced_events`) and on stdout, so a target
+  that can't keep up with the captured timeline is visible.
+
+### Comparing runs (5.7 vs 8.0 regression gate)
+
+Replay the same capture against both servers, then diff the two run
+reports:
+
+```console
+$ sql-replay compare \
+    --baseline run-5.7.json \
+    --candidate run-8.0.json \
+    --json report.json \
+    --out report.html
+```
+
+- Fingerprints are matched across the runs by normalized query text;
+  per-fingerprint deltas cover p50/p95/p99/mean (absolute µs and %) plus
+  error-count changes. Executed-count mismatches are flagged — those
+  latency populations may not be comparable.
+- Ranking: regressions (worst p95 first) and improvements are listed
+  separately. `--threshold-pct` (default 20) splits regressed/improved
+  from noise; `--min-count` (default 5) keeps low-sample fingerprints out
+  of the headline ranking (they are still listed below the fold).
+- Outputs: a stdout summary (top regressions/improvements — capped per
+  section by `--top`, default 10 — QPS/wall-clock deltas, error deltas,
+  fingerprints only in one run), `--json` for
+  machines, and `--out` for a self-contained HTML report (inline CSS/JS,
+  renders offline with zero network requests) with a sortable table and
+  both runs' metadata side by side.
+- Comparability preflight: if the runs differ in capture file, capture
+  dialect, replay flags, fingerprint-table shape, executed counts, or
+  target settings, a
+  loud warning block tops every output; both `target_server_version`s are
+  always shown prominently, and a settings-diff section lists changed
+  variables (e.g. `character_set_server: latin1 -> utf8mb4`).
+- **Exit code**: `0` when no regression reaches the threshold, `2` when at
+  least one fingerprint regressed at/beyond it (`1` = tool error), so CI
+  can gate a migration:
+
+```yaml
+- run: sql-replay compare --baseline run-5.7.json --candidate run-8.0.json \
+        --threshold-pct 25 --min-count 10 --json report.json
+  # non-zero exit fails the job when p95 regressions >= 25% exist
+```
 
 ### Building & testing
 
@@ -92,4 +161,6 @@ $ SQL_REPLAY_TEST_URL=mysql://root@127.0.0.1:3306/test cargo test -p sql-replay 
 ```
 
 CI runs fmt/clippy/tests plus a live replay of a fixture capture against
-`mysql:5.7` and `mysql:8.0` service containers.
+`mysql:5.7` and `mysql:8.0` service containers (max-speed, `--db-override`,
+and paced `--speed 20` runs), then feeds both run reports through
+`sql-replay compare` and asserts the report shape and gate exit codes.

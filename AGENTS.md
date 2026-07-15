@@ -1,8 +1,9 @@
 # avraham-sql-tools — agent notes
 
 Cargo workspace of SQL tooling. First (and so far only) crate:
-`crates/sql-replay`, a MySQL slow-log capture + replay benchmarking tool.
-See `README.md` for user-facing usage and the M1 scope.
+`crates/sql-replay`, a MySQL slow-log capture + replay benchmarking tool
+with a `compare` regression gate. See `README.md` for user-facing usage
+and milestone scope (M1 capture/replay, M2 pacing + compare).
 
 ## Build / test
 
@@ -84,6 +85,34 @@ is a write (plain `EXPLAIN`/`DESCRIBE` stay reads); `SELECT ... INTO
 OUTFILE`/`DUMPFILE` writes files on the server; `WITH` is classified by the
 first top-level verb after the CTEs; multi-statement text (a top-level `;`
 followed by more content) is always a write.
+
+## Pacing (`--speed`)
+
+`crates/sql-replay/src/replay.rs`, `Pacer` (tests are the spec). Schedule =
+capture-clock offset from the earliest event timestamp, gaps divided by the
+factor; events never fire early, an overrun predecessor just makes the
+successor late and the lateness lands in `run.json` `pacing` lag metrics
+(`--speed max` ⇒ no `pacing` block). Skipped events are still paced, so
+`paced_events` counts every event that reached a session loop, not just
+executed ones. Sessions wait for their first event's due time *before*
+claiming a `--max-connections` permit (late sessions must not pin idle
+connections). Pacing tests use `#[tokio::test(start_paused = true)]` —
+that's why tokio's `test-util` feature is a dev-dependency.
+
+## compare subcommand
+
+`crates/sql-replay/src/compare.rs` (logic; its tests + fixture pair
+`tests/fixtures/run-{baseline,candidate}.json` are the spec) and
+`compare_html.rs` (self-contained HTML — inline CSS/JS only, no external
+refs; the fixture test greps for `http://` etc. to enforce it).
+Fingerprints match by normalized *text*, not id (ids are capture-local).
+Exit codes: 0 no regression, 2 regression ≥ threshold (`EXIT_REGRESSED`),
+1 tool error — CI gates on this. M1 run.json files (no `pacing`/
+`target_settings`) still load: the new `RunReport` fields are
+`#[serde(default)]`, keep them that way. Target settings are read with
+`SHOW VARIABLES LIKE` (returns no row instead of erroring on unknown
+variables); the 5.7 `tx_isolation` / 8.0 `transaction_isolation` rename is
+canonicalized to `transaction_isolation`.
 
 ## Capture format
 
