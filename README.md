@@ -15,7 +15,10 @@ other target) to find performance regressions before cutover.
 
 M1 shipped `capture` and `replay`; M2 added faithful-timing pacing
 (`--speed`) and the `compare` subcommand for run-to-run regression diffs.
-Planned next: static packaging for RHEL 8 (M3) and pcap capture (M4).
+M3 made replay production-scale (bounded memory independent of capture
+size, thousands of concurrent sessions, warmup/repeat/filter/abort
+controls, an optional connection pool) and deployable on RHEL 8 (static
+musl binary, RPM spec, release workflow). Planned next: pcap capture (M4).
 
 ### Capturing load on the source server
 
@@ -63,6 +66,18 @@ $ sql-replay replay \
   per-session query order; `--max-connections` caps concurrency with
   backpressure. If the cap is saturated for a significant share of the run,
   a warning is printed (results would reflect the cap, not the server).
+- **Memory is bounded and independent of capture size.** Replay never
+  materializes the capture: it is streamed twice into an on-disk *spool*
+  (one contiguous region per session, unlinked temp file, roughly the
+  uncompressed capture size — `--spool-dir` picks where), and each session
+  reads its own events one at a time. A 5M-event / 20k-session replay peaks
+  around ~35 MiB of RSS; memory scales with session count, not event count.
+  Note the default spool location is the system temp dir, which is tmpfs
+  (RAM-backed) on some distros — point `--spool-dir` at real disk there,
+  or the spool itself occupies memory.
+- If the connection cap cannot fit under the process's open-files limit,
+  replay fails up front with the `ulimit -n` / systemd `LimitNOFILE=` value
+  to raise.
 - **Safety:** non-read statements (anything but SELECT / SHOW / EXPLAIN /
   DESCRIBE / HELP / session-level SET / USE) are skipped and counted unless
   you explicitly pass `--allow-writes`.
@@ -109,6 +124,36 @@ $ sql-replay replay --capture capture.jsonl.zst --url mysql://... \
   `pacing.mean_lag_us`, `pacing.paced_events`) and on stdout, so a target
   that can't keep up with the captured timeline is visible.
 
+### Operational controls (M3)
+
+- `--warmup` runs the whole capture once, unrecorded (buffer pool / cache
+  warm-up), before the measured pass(es).
+- `--repeat N` runs N measured passes: each pass's report is written as
+  `<out>.passK.json` and `--out` itself receives the median-aggregated
+  report (every numeric metric is the per-field median across passes; the
+  report carries `aggregation: {passes, method: "median"}`).
+- **Filters** re-slice a capture at replay time (captures stay complete,
+  reusable artifacts; filtering happens while building the spool):
+  `--filter-db <db>` and `--filter-user <user>` match the captured
+  metadata (events without that metadata are excluded);
+  `--time-window <start>..<end>` takes RFC 3339 timestamps or unix epoch
+  seconds, start-inclusive / end-exclusive, either side optional. Excluded
+  events are counted in `totals.filtered`; the pacing origin becomes the
+  earliest *included* timestamp. Filtering everything is an error.
+- **Graceful abort:** on Ctrl-C or SIGTERM (what systemd sends on stop),
+  in-flight queries finish, everything not yet attempted is counted as
+  `not_run`, and the partial `run.json` is still written with
+  `"aborted": true` (exit code 130; a second Ctrl-C or SIGTERM exits
+  immediately). `compare` warns when fed an aborted run.
+- `--pool N` multiplexes sessions over a bounded pool of N connections,
+  checked out per query, for captures whose session counts exceed
+  practical connection counts (conflicts with `--max-connections`). This
+  **trades connection fidelity for feasibility**: sessions no longer hold
+  a dedicated connection, so session state (temp tables, session
+  variables, transactions) does not carry across a session's queries, and
+  captured `USE` statements are skipped — the per-event database metadata
+  drives `USE` reconciliation on checkout instead. Off by default.
+
 ### Comparing runs (5.7 vs 8.0 regression gate)
 
 Replay the same capture against both servers, then diff the two run
@@ -152,15 +197,45 @@ $ sql-replay compare \
   # non-zero exit fails the job when p95 regressions >= 25% exist
 ```
 
+### Deploying on RHEL 8
+
+The release artifact is a **fully static** `x86_64-unknown-linux-musl`
+binary: no glibc, OpenSSL, or any other runtime dependency, so the same
+file runs on RHEL 8 (and Rocky/Alma/Oracle 8+) database hosts as-is.
+
+- Grab `sql-replay-<version>-x86_64-unknown-linux-musl.tar.gz` (or the
+  prebuilt `.rpm`) plus `SHA256SUMS` from the GitHub release; the tarball
+  contains the binary, README, and licenses — `install -m755 sql-replay
+  /usr/local/bin/` is a complete install.
+- To build the RPM yourself on a RHEL 8 host:
+  `rpmbuild -bb packaging/sql-replay.spec --define "_sourcedir <dir with
+  the tarball>" --define "version <version>"`.
+- Releases are cut by pushing a `v*` tag: `.github/workflows/release.yml`
+  runs the test suite, builds the musl binary, verifies it is static,
+  packages tarball + RPM, and attaches them with checksums.
+- Operationally: the spool needs disk roughly the uncompressed capture
+  size — use `--spool-dir` to place it, especially where the default
+  system temp dir is tmpfs (RAM-backed) — and the connection cap must fit
+  under `ulimit -n` (replay checks and tells you the value to raise it
+  to). Under systemd, stopping the unit (SIGTERM) aborts gracefully and
+  still writes the partial `run.json`.
+
 ### Building & testing
 
 ```console
 $ cargo build --release          # binary at target/release/sql-replay
 $ cargo test                     # unit + fixture tests, no database needed
 $ SQL_REPLAY_TEST_URL=mysql://root@127.0.0.1:3306/test cargo test -p sql-replay --test replay_integration
+$ cargo test --release -p sql-replay --test scale -- --ignored  # 1M-event memory-bound evidence
+$ cargo build --release --target x86_64-unknown-linux-musl -p sql-replay  # static binary (needs musl-gcc)
 ```
 
-CI runs fmt/clippy/tests plus a live replay of a fixture capture against
-`mysql:5.7` and `mysql:8.0` service containers (max-speed, `--db-override`,
-and paced `--speed 20` runs), then feeds both run reports through
-`sql-replay compare` and asserts the report shape and gate exit codes.
+CI runs fmt/clippy/tests (including 10k-session scheduling tests against a
+mock target and, in release mode, the million-event bounded-memory scale
+test) plus a live replay of a fixture capture against `mysql:5.7` and
+`mysql:8.0` service containers (max-speed, `--db-override`, paced
+`--speed 20`, `--warmup --repeat 3`, filtered, and `--pool` runs), then
+feeds run reports through `sql-replay compare` and asserts the report
+shape and gate exit codes. A dedicated job builds the static musl binary,
+verifies it is statically linked, and smoke-builds the RPM from
+`packaging/sql-replay.spec`.

@@ -27,20 +27,20 @@ fn replay_smoke_against_live_mysql() {
     assert_eq!(summary.event_count, 12);
 
     let options = ReplayOptions {
-        url: url.clone(),
         max_connections: 4,
-        allow_writes: false,
-        read_only: false,
-        db_override: None,
         speed: Speed::Max,
+        ..ReplayOptions::new(url.clone())
     };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let report = rt
+    let outcome = rt
         .block_on(run_replay(&capture_path, options))
         .expect("replay succeeds");
+    assert!(outcome.aggregated.is_none(), "single pass -> no aggregate");
+    assert!(!outcome.aborted());
+    let report = outcome.primary();
 
     assert!(
         !report.target_server_version.is_empty(),
@@ -99,17 +99,16 @@ fn replay_smoke_against_live_mysql() {
         return;
     };
     let options = ReplayOptions {
-        url: url.clone(),
         max_connections: 4,
-        allow_writes: false,
-        read_only: false,
         db_override: Some(db.to_string()),
         speed: Speed::Max,
+        ..ReplayOptions::new(url.clone())
     };
-    let report = rt
+    let outcome = rt
         .block_on(run_replay(&capture_path, options))
         .expect("db-override replay succeeds");
     std::fs::remove_file(&capture_path).ok();
+    let report = outcome.primary();
 
     let t = &report.totals;
     assert_eq!(t.events, 12);
