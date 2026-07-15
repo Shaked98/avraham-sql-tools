@@ -16,6 +16,13 @@ pub struct RunReport {
     pub started_at: String,
     pub ended_at: String,
     pub wall_secs: f64,
+    /// True when the run was interrupted (Ctrl-C): the report is partial —
+    /// events that never got to run are counted under `not_run`.
+    #[serde(default)]
+    pub aborted: bool,
+    /// Present on the median-aggregated report of a `--repeat N` run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation: Option<AggregationInfo>,
     pub flags: ReportFlags,
     pub totals: Totals,
     pub saturation: SaturationReport,
@@ -41,6 +48,13 @@ pub struct PacingReport {
     pub mean_lag_us: f64,
 }
 
+/// How a multi-pass (`--repeat N`) report was aggregated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregationInfo {
+    pub passes: u64,
+    pub method: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportFlags {
     pub max_connections: usize,
@@ -48,6 +62,19 @@ pub struct ReportFlags {
     pub read_only: bool,
     pub db_override: Option<String>,
     pub speed: String,
+    /// Sessions multiplexed over a bounded connection pool of this size
+    /// instead of one dedicated connection per session (M3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<usize>,
+    /// An unrecorded warmup pass ran before the measured pass(es) (M3).
+    #[serde(default)]
+    pub warmup: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_db: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_window: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +88,10 @@ pub struct Totals {
     pub not_run: u64,
     pub connect_failures: u64,
     pub qps: f64,
+    /// Events excluded up front by --filter-db/--filter-user/--time-window
+    /// (not part of `events`). Absent (0) in pre-M3 reports.
+    #[serde(default)]
+    pub filtered: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,15 +125,20 @@ impl RunReport {
 
     pub fn saturation_warning(&self) -> Option<String> {
         if self.saturation.saturated_pct >= Self::SATURATION_WARN_PCT {
+            let (flag, cap) = match self.flags.pool {
+                Some(n) => ("--pool", n),
+                None => ("--max-connections", self.flags.max_connections),
+            };
             Some(format!(
                 "WARNING: the connection cap was saturated for {:.0}% of the run \
                  ({} of {} samples had all {} permits taken with sessions waiting). \
-                 Latency and QPS results may be limited by --max-connections \
+                 Latency and QPS results may be limited by {} \
                  rather than by the target server.",
                 self.saturation.saturated_pct,
                 self.saturation.saturated_samples,
                 self.saturation.samples,
-                self.flags.max_connections,
+                cap,
+                flag,
             ))
         } else {
             None
@@ -112,6 +148,15 @@ impl RunReport {
     pub fn render_table(&self, top: usize) -> String {
         let mut out = String::new();
         let t = &self.totals;
+        if self.aborted {
+            out.push_str("*** ABORTED: partial results — the run was interrupted ***\n");
+        }
+        if let Some(agg) = &self.aggregation {
+            out.push_str(&format!(
+                "Aggregated ({}) over {} measured passes\n",
+                agg.method, agg.passes
+            ));
+        }
         out.push_str(&format!(
             "Replayed {} events across {} sessions in {:.2}s — {:.1} QPS\n",
             t.events, t.sessions, self.wall_secs, t.qps
@@ -120,6 +165,12 @@ impl RunReport {
             "  executed: {}  skipped: {}  errors: {}  not run: {}  connect failures: {}\n",
             t.executed, t.skipped, t.errors, t.not_run, t.connect_failures
         ));
+        if t.filtered > 0 {
+            out.push_str(&format!(
+                "  filtered out before replay: {} events\n",
+                t.filtered
+            ));
+        }
         out.push_str(&format!(
             "Target: {} ({})\n",
             self.target_server_version, self.target_url

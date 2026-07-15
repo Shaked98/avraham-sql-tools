@@ -2,27 +2,38 @@
 //!
 //! Concurrency model: one lightweight tokio task per original session
 //! (connection thread id). Each session executes its own queries strictly
-//! in capture order on a dedicated connection; sessions run concurrently,
-//! capped by a `--max-connections` semaphore (a permit is held for the
-//! session's lifetime, mirroring one real client connection each).
+//! in capture order, reading them one at a time from the on-disk spool
+//! (see `spool.rs` — peak memory is independent of capture size). By
+//! default each session runs on a dedicated connection; sessions run
+//! concurrently, capped by a `--max-connections` semaphore (a permit is
+//! held for the session's lifetime, mirroring one real client connection
+//! each). With `--pool N`, sessions instead check a connection out of a
+//! bounded pool per query — connection fidelity is traded away so captures
+//! with more sessions than practical connections stay replayable.
+//!
+//! The execution layer is generic over [`Target`] so scheduling behavior
+//! (pacing, permits, abort, 10k-session scale) is testable without MySQL.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use hdrhistogram::Histogram;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn, Opts, OptsBuilder};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 
+use crate::aggregate::aggregate_median;
 use crate::classify::{is_use_statement, should_execute};
-use crate::format::{read_capture, Event};
+use crate::format::Event;
 use crate::report::{
     redact_url, FingerprintReport, PacingReport, ReportFlags, RunReport, SaturationReport, Totals,
 };
+use crate::spool::{Filters, Spool, SpoolCursor};
+use crate::target::{MySqlTarget, Target, TargetConn};
 
 /// Replay pacing mode: `max` (each session fires its next query as soon as
 /// the previous one completes) or a positive speed factor honoring the
@@ -179,6 +190,104 @@ pub struct ReplayOptions {
     pub read_only: bool,
     pub db_override: Option<String>,
     pub speed: Speed,
+    /// Multiplex sessions over a bounded pool of this many connections
+    /// (per-query checkout) instead of one dedicated connection per
+    /// session. Trades connection fidelity for feasibility.
+    pub pool: Option<usize>,
+    /// Run one unrecorded pass before the measured pass(es).
+    pub warmup: bool,
+    /// Number of measured passes (>= 1). With N > 1 the outcome carries a
+    /// median-aggregated report alongside the per-pass reports.
+    pub repeat: usize,
+    /// Replay-side event filters, applied while spooling.
+    pub filters: Filters,
+    /// Directory for the replay spool file (default: the system temp dir).
+    pub spool_dir: Option<PathBuf>,
+}
+
+impl ReplayOptions {
+    pub fn new(url: impl Into<String>) -> Self {
+        ReplayOptions {
+            url: url.into(),
+            max_connections: 50,
+            allow_writes: false,
+            read_only: false,
+            db_override: None,
+            speed: Speed::Max,
+            pool: None,
+            warmup: false,
+            repeat: 1,
+            filters: Filters::default(),
+            spool_dir: None,
+        }
+    }
+
+    /// Connections the run can hold open at once.
+    fn connection_cap(&self) -> usize {
+        self.pool.unwrap_or(self.max_connections).max(1)
+    }
+}
+
+/// Target identity recorded into each run report; probed from MySQL by
+/// [`run_replay`], supplied by hand when driving a test target.
+#[derive(Clone, Debug, Default)]
+pub struct TargetInfo {
+    pub server_version: String,
+    pub settings: std::collections::BTreeMap<String, String>,
+}
+
+/// What a replay produced: one report per measured pass, plus the
+/// median-aggregated report when `--repeat N > 1`.
+#[derive(Debug)]
+pub struct ReplayOutcome {
+    pub passes: Vec<RunReport>,
+    pub aggregated: Option<RunReport>,
+}
+
+impl ReplayOutcome {
+    /// The headline report: the aggregate when present, else the single
+    /// (or last partial) pass.
+    pub fn primary(&self) -> &RunReport {
+        self.aggregated
+            .as_ref()
+            .or_else(|| self.passes.last())
+            .expect("a replay outcome always has at least one report")
+    }
+
+    pub fn aborted(&self) -> bool {
+        self.passes.iter().any(|p| p.aborted)
+    }
+}
+
+/// A session's events, delivered one at a time in capture order. The
+/// production implementation is the spool cursor; a Vec-backed one exists
+/// as the in-memory reference for equivalence tests.
+pub trait EventStream: Send + 'static {
+    fn next_event(&mut self) -> Result<Option<Event>>;
+}
+
+impl EventStream for SpoolCursor {
+    fn next_event(&mut self) -> Result<Option<Event>> {
+        SpoolCursor::next_event(self)
+    }
+}
+
+/// In-memory event stream (reference path for equivalence testing).
+pub struct VecEvents(std::vec::IntoIter<Event>);
+
+impl EventStream for VecEvents {
+    fn next_event(&mut self) -> Result<Option<Event>> {
+        Ok(self.0.next())
+    }
+}
+
+/// Per-session scheduling metadata precomputed at spool-build time.
+#[derive(Clone, Debug)]
+pub struct SessionMeta {
+    pub session_id: u64,
+    /// Whether any event passes the write gate; a session with none never
+    /// paces or connects — its events are all recorded as skipped.
+    pub has_executable: bool,
 }
 
 struct FpAgg {
@@ -262,7 +371,8 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Group events into per-session vectors, preserving capture order within
-/// each session and first-appearance order between sessions.
+/// each session and first-appearance order between sessions (the in-memory
+/// reference for what the spool does on disk).
 fn group_sessions(events: Vec<Event>) -> Vec<Vec<Event>> {
     let mut order: Vec<u64> = Vec::new();
     let mut map: HashMap<u64, Vec<Event>> = HashMap::new();
@@ -282,92 +392,269 @@ fn group_sessions(events: Vec<Event>) -> Vec<Vec<Event>> {
         .collect()
 }
 
-fn is_fatal(e: &mysql_async::Error) -> bool {
-    matches!(e, mysql_async::Error::Io(_) | mysql_async::Error::Driver(_))
+/// Resolves when the shutdown flag flips to true; pends forever if the
+/// sender is gone (no abort will ever come).
+async fn wait_aborted(shutdown: &mut watch::Receiver<bool>) {
+    if shutdown.wait_for(|aborted| *aborted).await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_session(
-    events: Vec<Event>,
-    opts: Opts,
+/// If a connect error looks like file-descriptor exhaustion, log an
+/// actionable hint once.
+fn hint_if_fd_exhausted(msg: &str) {
+    if msg.contains("Too many open files") || msg.contains("os error 24") {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::error!(
+                "the process ran out of file descriptors mid-run: raise the open-files \
+                 limit (`ulimit -n`, or LimitNOFILE= under systemd) or lower \
+                 --max-connections/--pool"
+            );
+        });
+    }
+}
+
+/// Fail fast, with an actionable message, when the requested connection cap
+/// cannot fit under the process's open-files limit.
+pub fn check_fd_headroom(connections: usize, soft_limit: u64) -> Result<()> {
+    // stdio + spool + tokio epoll/eventfd + a little slack for teardown.
+    const MARGIN: u64 = 32;
+    let needed = connections as u64 + MARGIN;
+    if needed > soft_limit {
+        bail!(
+            "the requested connection cap ({connections}) needs ~{needed} file \
+             descriptors but the open-files limit is {soft_limit}. Raise it \
+             (`ulimit -n {suggest}` in this shell, or LimitNOFILE={suggest} in the \
+             systemd unit) or lower --max-connections/--pool.",
+            suggest = needed.div_ceil(1024) * 1024,
+        );
+    }
+    Ok(())
+}
+
+fn nofile_soft_limit() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into the struct we hand it; no other state.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    (rc == 0).then_some(lim.rlim_cur)
+}
+
+/// Bounded connection pool for `--pool`: sessions check a connection out
+/// per query. Capacity is enforced by the pass's semaphore (a checkout
+/// happens only under a held permit), so `idle` is just the reuse shelf.
+struct ConnPool<T: Target> {
+    idle: Mutex<Vec<IdleConn<T>>>,
+    /// The database new/idle connections start in (from the URL or
+    /// --db-override), for per-query `USE` reconciliation.
+    default_db: Option<String>,
+}
+
+struct IdleConn<T: Target> {
+    conn: T::Conn,
+    db: Option<String>,
+}
+
+impl<T: Target> ConnPool<T> {
+    fn new(default_db: Option<String>) -> Self {
+        ConnPool {
+            idle: Mutex::new(Vec::new()),
+            default_db,
+        }
+    }
+
+    async fn checkout(&self, target: &T) -> Result<IdleConn<T>, crate::target::TargetError> {
+        if let Some(idle) = self.idle.lock().expect("pool lock").pop() {
+            return Ok(idle);
+        }
+        let conn = target.connect().await?;
+        Ok(IdleConn {
+            conn,
+            db: self.default_db.clone(),
+        })
+    }
+
+    fn checkin(&self, conn: IdleConn<T>) {
+        self.idle.lock().expect("pool lock").push(conn);
+    }
+
+    async fn drain(&self) {
+        let conns = std::mem::take(&mut *self.idle.lock().expect("pool lock"));
+        for c in conns {
+            c.conn.disconnect().await;
+        }
+    }
+}
+
+/// Everything a session task needs, shared across one pass.
+struct PassCtx<T: Target> {
+    target: T,
     sem: Arc<Semaphore>,
-    waiters: Arc<AtomicU64>,
-    metrics: Arc<Metrics>,
+    waiters: AtomicU64,
+    metrics: Metrics,
+    pacer: Pacer,
     allow_writes: bool,
     use_event_db: bool,
-    pacer: Arc<Pacer>,
-) {
-    // SAFETY GATE: without --allow-writes, non-read statements are skipped
-    // (and counted) before they can ever reach the wire.
-    let session_id = events.first().map(|e| e.session_id).unwrap_or(0);
-    if !events
-        .iter()
-        .any(|e| should_execute(&e.query, allow_writes))
-    {
-        for e in &events {
-            metrics.record_skip(e.fingerprint_id);
+    pool: Option<ConnPool<T>>,
+    shutdown: watch::Receiver<bool>,
+}
+
+enum DrainAs {
+    Skipped,
+    NotRun,
+}
+
+/// Record every remaining event of a stream as skipped or not-run.
+fn drain_recording(events: &mut impl EventStream, metrics: &Metrics, how: DrainAs) {
+    loop {
+        match events.next_event() {
+            Ok(Some(e)) => match how {
+                DrainAs::Skipped => metrics.record_skip(e.fingerprint_id),
+                DrainAs::NotRun => metrics.record_not_run(e.fingerprint_id),
+            },
+            Ok(None) => return,
+            Err(err) => {
+                tracing::error!(error = %err, "spool read failed while draining a session");
+                return;
+            }
         }
+    }
+}
+
+async fn run_session<T: Target, S: EventStream>(
+    meta: SessionMeta,
+    mut events: S,
+    ctx: Arc<PassCtx<T>>,
+) {
+    // SAFETY GATE: without --allow-writes, a session whose statements are
+    // all non-read never paces or connects — everything is skipped and
+    // counted before it can ever reach the wire.
+    if !meta.has_executable {
+        drain_recording(&mut events, &ctx.metrics, DrainAs::Skipped);
         return;
     }
+    if ctx.pool.is_some() {
+        run_session_pooled(meta, events, ctx).await
+    } else {
+        run_session_dedicated(meta, events, ctx).await
+    }
+}
+
+async fn run_session_dedicated<T: Target, S: EventStream>(
+    meta: SessionMeta,
+    mut events: S,
+    ctx: Arc<PassCtx<T>>,
+) {
+    let session_id = meta.session_id;
+    let mut shutdown = ctx.shutdown.clone();
+
+    let first = match events.next_event() {
+        Ok(Some(e)) => e,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::error!(session_id, error = %err, "spool read failed");
+            return;
+        }
+    };
 
     // Don't claim a connection permit until the session's first event is
     // due — a session that starts late in the capture would otherwise pin
     // an idle connection for the whole lead-in.
-    if let Some(first) = events.first() {
-        pacer.wait_until_due(first).await;
+    tokio::select! {
+        biased;
+        _ = wait_aborted(&mut shutdown) => {
+            ctx.metrics.record_not_run(first.fingerprint_id);
+            drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
+            return;
+        }
+        _ = ctx.pacer.wait_until_due(&first) => {}
     }
 
-    waiters.fetch_add(1, Ordering::SeqCst);
-    let permit = sem
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("replay semaphore is never closed");
-    waiters.fetch_sub(1, Ordering::SeqCst);
+    ctx.waiters.fetch_add(1, Ordering::SeqCst);
+    let permit = tokio::select! {
+        biased;
+        _ = wait_aborted(&mut shutdown) => {
+            ctx.waiters.fetch_sub(1, Ordering::SeqCst);
+            ctx.metrics.record_not_run(first.fingerprint_id);
+            drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
+            return;
+        }
+        permit = ctx.sem.clone().acquire_owned() => {
+            permit.expect("replay semaphore is never closed")
+        }
+    };
+    ctx.waiters.fetch_sub(1, Ordering::SeqCst);
     let _permit = permit;
 
-    let mut conn = match Conn::new(opts).await {
+    let mut conn = match ctx.target.connect().await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(session_id, error = %e, "session connect failed");
-            metrics.connect_failures.fetch_add(1, Ordering::Relaxed);
-            for e in &events {
-                metrics.record_not_run(e.fingerprint_id);
-            }
+            hint_if_fd_exhausted(&e.message);
+            ctx.metrics.connect_failures.fetch_add(1, Ordering::Relaxed);
+            ctx.metrics.record_not_run(first.fingerprint_id);
+            drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
             return;
         }
     };
 
     let mut current_db: Option<String> = None;
-    let mut it = events.into_iter();
-    while let Some(ev) = it.next() {
-        pacer.pace(&ev).await;
+    let mut pending = Some(first);
+    loop {
+        let ev = match pending.take() {
+            Some(e) => e,
+            None => match events.next_event() {
+                Ok(Some(e)) => e,
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::error!(session_id, error = %err, "spool read failed");
+                    break;
+                }
+            },
+        };
 
-        if !should_execute(&ev.query, allow_writes) {
-            metrics.record_skip(ev.fingerprint_id);
+        if *shutdown.borrow() {
+            ctx.metrics.record_not_run(ev.fingerprint_id);
+            drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
+            break;
+        }
+        tokio::select! {
+            biased;
+            _ = wait_aborted(&mut shutdown) => {
+                ctx.metrics.record_not_run(ev.fingerprint_id);
+                drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
+                break;
+            }
+            _ = ctx.pacer.pace(&ev) => {}
+        }
+
+        if !should_execute(&ev.query, ctx.allow_writes) {
+            ctx.metrics.record_skip(ev.fingerprint_id);
             continue;
         }
 
         // With --db-override every session is pinned to the override
         // database; a captured USE statement would silently unpin it, so
         // skip (and count) those instead of executing them.
-        if !use_event_db && is_use_statement(&ev.query) {
-            metrics.record_skip(ev.fingerprint_id);
+        if !ctx.use_event_db && is_use_statement(&ev.query) {
+            ctx.metrics.record_skip(ev.fingerprint_id);
             continue;
         }
 
-        if use_event_db {
+        if ctx.use_event_db {
             if let Some(db) = ev.db.as_deref() {
                 if current_db.as_deref() != Some(db) {
                     let stmt = format!("USE `{}`", db.replace('`', "``"));
-                    match conn.query_drop(stmt).await {
+                    match conn.query(&stmt).await {
                         Ok(()) => current_db = Some(db.to_string()),
                         Err(e) => {
-                            metrics.record_err(ev.fingerprint_id, &format!("USE `{db}`: {e}"));
-                            if is_fatal(&e) {
-                                for rest in it.by_ref() {
-                                    metrics.record_not_run(rest.fingerprint_id);
-                                }
+                            ctx.metrics
+                                .record_err(ev.fingerprint_id, &format!("USE `{db}`: {e}"));
+                            if e.fatal {
+                                drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
                                 return;
                             }
                             // Running the query against the wrong db would
@@ -380,57 +667,174 @@ async fn run_session(
         }
 
         let t0 = Instant::now();
-        match conn.query_drop(ev.query.as_str()).await {
-            Ok(()) => metrics.record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64),
+        match conn.query(&ev.query).await {
+            Ok(()) => ctx
+                .metrics
+                .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64),
             Err(e) => {
-                metrics.record_err(ev.fingerprint_id, &e.to_string());
-                if is_fatal(&e) {
+                ctx.metrics.record_err(ev.fingerprint_id, &e.message);
+                if e.fatal {
                     tracing::warn!(session_id, error = %e, "session connection lost");
-                    for rest in it.by_ref() {
-                        metrics.record_not_run(rest.fingerprint_id);
-                    }
+                    drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
                     return;
                 }
             }
         }
     }
-    let _ = conn.disconnect().await;
+    conn.disconnect().await;
 }
 
-pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<RunReport> {
-    let cap = read_capture(capture_path)?;
+async fn run_session_pooled<T: Target, S: EventStream>(
+    meta: SessionMeta,
+    mut events: S,
+    ctx: Arc<PassCtx<T>>,
+) {
+    let session_id = meta.session_id;
+    let mut shutdown = ctx.shutdown.clone();
+    let pool = ctx.pool.as_ref().expect("pooled session has a pool");
 
-    let mut conn_opts = Opts::from_url(&options.url).context("invalid --url")?;
-    let use_event_db = options.db_override.is_none();
-    if let Some(db) = &options.db_override {
-        conn_opts = OptsBuilder::from_opts(conn_opts)
-            .db_name(Some(db.clone()))
-            .into();
+    loop {
+        let ev = match events.next_event() {
+            Ok(Some(e)) => e,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::error!(session_id, error = %err, "spool read failed");
+                return;
+            }
+        };
+
+        if *shutdown.borrow() {
+            ctx.metrics.record_not_run(ev.fingerprint_id);
+            drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = wait_aborted(&mut shutdown) => {
+                ctx.metrics.record_not_run(ev.fingerprint_id);
+                drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
+                return;
+            }
+            _ = ctx.pacer.pace(&ev) => {}
+        }
+
+        if !should_execute(&ev.query, ctx.allow_writes) {
+            ctx.metrics.record_skip(ev.fingerprint_id);
+            continue;
+        }
+        // Pooled sessions have no sticky connection a USE could stick to;
+        // the per-event db metadata drives USE reconciliation instead.
+        if is_use_statement(&ev.query) {
+            ctx.metrics.record_skip(ev.fingerprint_id);
+            continue;
+        }
+
+        // One permit per query: the permit is the pool-capacity bound.
+        ctx.waiters.fetch_add(1, Ordering::SeqCst);
+        let permit = tokio::select! {
+            biased;
+            _ = wait_aborted(&mut shutdown) => {
+                ctx.waiters.fetch_sub(1, Ordering::SeqCst);
+                ctx.metrics.record_not_run(ev.fingerprint_id);
+                drain_recording(&mut events, &ctx.metrics, DrainAs::NotRun);
+                return;
+            }
+            permit = ctx.sem.clone().acquire_owned() => {
+                permit.expect("replay semaphore is never closed")
+            }
+        };
+        ctx.waiters.fetch_sub(1, Ordering::SeqCst);
+        let _permit = permit;
+
+        let mut pc = match pool.checkout(&ctx.target).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(session_id, error = %e, "pooled connect failed");
+                hint_if_fd_exhausted(&e.message);
+                ctx.metrics.connect_failures.fetch_add(1, Ordering::Relaxed);
+                ctx.metrics.record_not_run(ev.fingerprint_id);
+                continue;
+            }
+        };
+
+        // Reconcile the connection's current database with the event's.
+        if ctx.use_event_db {
+            if let Some(db) = ev.db.as_deref() {
+                if pc.db.as_deref() != Some(db) {
+                    let stmt = format!("USE `{}`", db.replace('`', "``"));
+                    match pc.conn.query(&stmt).await {
+                        Ok(()) => pc.db = Some(db.to_string()),
+                        Err(e) => {
+                            ctx.metrics
+                                .record_err(ev.fingerprint_id, &format!("USE `{db}`: {e}"));
+                            if !e.fatal {
+                                pool.checkin(pc);
+                            }
+                            // A dead pooled connection doesn't kill the
+                            // logical session; the next event gets a fresh
+                            // checkout.
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        let t0 = Instant::now();
+        match pc.conn.query(&ev.query).await {
+            Ok(()) => {
+                ctx.metrics
+                    .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64);
+                pool.checkin(pc);
+            }
+            Err(e) => {
+                ctx.metrics.record_err(ev.fingerprint_id, &e.message);
+                if !e.fatal {
+                    pool.checkin(pc);
+                }
+            }
+        }
     }
+}
 
-    // Probe: validates connectivity and grabs the server version plus the
-    // comparability-relevant settings up front.
-    let mut probe = Conn::new(conn_opts.clone())
-        .await
-        .with_context(|| format!("cannot connect to target {}", redact_url(&options.url)))?;
-    let target_server_version: String = probe
-        .query_first("SELECT VERSION()")
-        .await?
-        .unwrap_or_default();
-    let target_settings = collect_target_settings(&mut probe).await;
-    probe.disconnect().await?;
+/// Static, per-run capture facts shared by every pass's report.
+struct CaptureInfo {
+    file: String,
+    dialect: String,
+    fp_texts: HashMap<u32, String>,
+    /// Events included in the replay (post-filter).
+    events: u64,
+    filtered: u64,
+    sessions: u64,
+    base_ts_micros: i64,
+}
 
-    // The capture-clock origin for pacing: the earliest event timestamp.
-    let base_ts_micros = cap.events.iter().map(|e| e.ts_micros).min().unwrap_or(0);
+async fn run_pass<T: Target, S: EventStream>(
+    sessions: Vec<(SessionMeta, S)>,
+    cap: &CaptureInfo,
+    options: &ReplayOptions,
+    target: &T,
+    info: &TargetInfo,
+    shutdown: watch::Receiver<bool>,
+) -> Result<RunReport> {
+    let use_event_db = options.db_override.is_none();
+    let default_db = options.db_override.clone().or_else(|| {
+        Opts::from_url(&options.url)
+            .ok()
+            .and_then(|o| o.db_name().map(str::to_string))
+    });
 
-    let sessions = group_sessions(cap.events);
-    let session_count = sessions.len() as u64;
-    let event_count = cap.summary.event_count;
-
-    let sem = Arc::new(Semaphore::new(options.max_connections.max(1)));
-    let waiters = Arc::new(AtomicU64::new(0));
-    let metrics = Arc::new(Metrics::default());
-    let pacer = Arc::new(Pacer::new(options.speed, base_ts_micros));
+    let ctx = Arc::new(PassCtx {
+        target: target.clone(),
+        sem: Arc::new(Semaphore::new(options.connection_cap())),
+        waiters: AtomicU64::new(0),
+        metrics: Metrics::default(),
+        pacer: Pacer::new(options.speed, cap.base_ts_micros),
+        allow_writes: options.allow_writes,
+        use_event_db,
+        pool: options.pool.map(|_| ConnPool::new(default_db)),
+        shutdown: shutdown.clone(),
+    });
 
     // Saturation sampler: counts intervals in which every permit was taken
     // while at least one session was waiting for one.
@@ -438,8 +842,7 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
     let sat_hits = Arc::new(AtomicU64::new(0));
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let sampler = {
-        let sem = sem.clone();
-        let waiters = waiters.clone();
+        let ctx = ctx.clone();
         let sat_samples = sat_samples.clone();
         let sat_hits = sat_hits.clone();
         tokio::spawn(async move {
@@ -449,7 +852,9 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
                 tokio::select! {
                     _ = tick.tick() => {
                         sat_samples.fetch_add(1, Ordering::Relaxed);
-                        if sem.available_permits() == 0 && waiters.load(Ordering::SeqCst) > 0 {
+                        if ctx.sem.available_permits() == 0
+                            && ctx.waiters.load(Ordering::SeqCst) > 0
+                        {
                             sat_hits.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -463,20 +868,15 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
     let t0 = Instant::now();
 
     let mut tasks = tokio::task::JoinSet::new();
-    for events in sessions {
-        tasks.spawn(run_session(
-            events,
-            conn_opts.clone(),
-            sem.clone(),
-            waiters.clone(),
-            metrics.clone(),
-            options.allow_writes,
-            use_event_db,
-            pacer.clone(),
-        ));
+    for (meta, events) in sessions {
+        tasks.spawn(run_session(meta, events, ctx.clone()));
     }
     while let Some(res) = tasks.join_next().await {
         res.context("replay session task panicked")?;
+    }
+
+    if let Some(pool) = &ctx.pool {
+        pool.drain().await;
     }
 
     let wall = t0.elapsed();
@@ -492,21 +892,17 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
         0.0
     };
 
+    let metrics = &ctx.metrics;
     let executed = metrics.executed.load(Ordering::Relaxed);
-    let fp_texts: HashMap<u32, &str> = cap
-        .summary
-        .fingerprints
-        .iter()
-        .map(|e| (e.id, e.text.as_str()))
-        .collect();
     let per_fp = std::mem::take(&mut *metrics.per_fp.lock().expect("metrics lock"));
     let mut fingerprints: Vec<FingerprintReport> = per_fp
         .into_iter()
         .map(|(id, agg)| FingerprintReport {
             id,
-            fingerprint: fp_texts
+            fingerprint: cap
+                .fp_texts
                 .get(&id)
-                .map(|t| t.to_string())
+                .cloned()
                 .unwrap_or_else(|| format!("<unknown fingerprint {id}>")),
             count: agg.executed,
             errors: agg.errors,
@@ -526,23 +922,30 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
     Ok(RunReport {
         tool: "sql-replay".to_string(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        capture_file: capture_path.display().to_string(),
-        capture_dialect: cap.summary.source_dialect.clone(),
+        capture_file: cap.file.clone(),
+        capture_dialect: cap.dialect.clone(),
         target_url: redact_url(&options.url),
-        target_server_version,
+        target_server_version: info.server_version.clone(),
         started_at: format_rfc3339(started_at),
         ended_at: format_rfc3339(ended_at),
         wall_secs,
+        aborted: *shutdown.borrow(),
+        aggregation: None,
         flags: ReportFlags {
             max_connections: options.max_connections,
             allow_writes: options.allow_writes,
             read_only: options.read_only,
             db_override: options.db_override.clone(),
             speed: options.speed.label(),
+            pool: options.pool,
+            warmup: options.warmup,
+            filter_db: options.filters.db.clone(),
+            filter_user: options.filters.user.clone(),
+            time_window: options.filters.window.as_ref().map(|w| w.raw.clone()),
         },
         totals: Totals {
-            events: event_count,
-            sessions: session_count,
+            events: cap.events,
+            sessions: cap.sessions,
             executed,
             skipped: metrics.skipped.load(Ordering::Relaxed),
             errors: metrics.errors.load(Ordering::Relaxed),
@@ -553,16 +956,233 @@ pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<R
             } else {
                 0.0
             },
+            filtered: cap.filtered,
         },
         saturation: SaturationReport {
             samples,
             saturated_samples: hits,
             saturated_pct,
         },
-        pacing: pacer.report(),
-        target_settings,
+        pacing: ctx.pacer.report(),
+        target_settings: info.settings.clone(),
         fingerprints,
     })
+}
+
+/// Warmup + `--repeat N` pass loop over a session factory (each pass gets
+/// fresh event streams).
+async fn run_passes<T: Target, S: EventStream>(
+    mk_sessions: impl Fn() -> Vec<(SessionMeta, S)>,
+    cap: &CaptureInfo,
+    options: &ReplayOptions,
+    target: &T,
+    info: &TargetInfo,
+    shutdown: watch::Receiver<bool>,
+) -> Result<ReplayOutcome> {
+    let repeat = options.repeat.max(1);
+    let mut passes: Vec<RunReport> = Vec::with_capacity(repeat);
+
+    if options.warmup && !*shutdown.borrow() {
+        tracing::info!("warmup pass (results discarded)");
+        let report = run_pass(mk_sessions(), cap, options, target, info, shutdown.clone()).await?;
+        if report.aborted {
+            // Aborted during warmup: surface the partial warmup report
+            // rather than nothing.
+            return Ok(ReplayOutcome {
+                passes: vec![report],
+                aggregated: None,
+            });
+        }
+    }
+
+    for pass_no in 1..=repeat {
+        if *shutdown.borrow() && !passes.is_empty() {
+            break;
+        }
+        if repeat > 1 {
+            tracing::info!(pass = pass_no, of = repeat, "measured pass");
+        }
+        let report = run_pass(mk_sessions(), cap, options, target, info, shutdown.clone()).await?;
+        let aborted = report.aborted;
+        passes.push(report);
+        if aborted {
+            break;
+        }
+    }
+
+    let aggregated = (repeat > 1).then(|| aggregate_median(&passes));
+    Ok(ReplayOutcome { passes, aggregated })
+}
+
+/// Replay via the bounded-memory spool (the production path), against any
+/// [`Target`]. Public so scale/abort tests can drive it with a mock target.
+pub async fn run_replay_with_target<T: Target>(
+    capture_path: &Path,
+    options: &ReplayOptions,
+    target: T,
+    info: TargetInfo,
+    shutdown: watch::Receiver<bool>,
+) -> Result<ReplayOutcome> {
+    let spool = Spool::build(
+        capture_path,
+        options.spool_dir.as_deref(),
+        &options.filters,
+        options.allow_writes,
+    )?;
+    tracing::info!(
+        events = spool.event_count,
+        filtered = spool.filtered,
+        sessions = spool.sessions.len(),
+        spool_mb = spool.bytes / (1024 * 1024),
+        "capture spooled for replay"
+    );
+    let cap = CaptureInfo {
+        file: capture_path.display().to_string(),
+        dialect: spool.summary.source_dialect.clone(),
+        fp_texts: spool
+            .summary
+            .fingerprints
+            .iter()
+            .map(|e| (e.id, e.text.clone()))
+            .collect(),
+        events: spool.event_count,
+        filtered: spool.filtered,
+        sessions: spool.sessions.len() as u64,
+        base_ts_micros: spool.base_ts_micros,
+    };
+    let mk_sessions = || {
+        spool
+            .sessions
+            .iter()
+            .map(|s| {
+                (
+                    SessionMeta {
+                        session_id: s.session_id,
+                        has_executable: s.has_executable,
+                    },
+                    spool.cursor(s),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    run_passes(mk_sessions, &cap, options, &target, &info, shutdown).await
+}
+
+/// Replay with fully in-memory ingestion. This is the reference
+/// implementation the spool path is tested for equivalence against; the
+/// production entry points always stream via the spool.
+pub async fn run_replay_in_memory_with_target<T: Target>(
+    capture_path: &Path,
+    options: &ReplayOptions,
+    target: T,
+    info: TargetInfo,
+    shutdown: watch::Receiver<bool>,
+) -> Result<ReplayOutcome> {
+    let capture = crate::format::read_capture(capture_path)?;
+    let total = capture.events.len() as u64;
+    let events: Vec<Event> = capture
+        .events
+        .into_iter()
+        .filter(|e| options.filters.matches(e))
+        .collect();
+    let filtered = total - events.len() as u64;
+    if events.is_empty() && filtered > 0 {
+        bail!(
+            "filters excluded all {filtered} events of {} — nothing to replay",
+            capture_path.display()
+        );
+    }
+    let base_ts_micros = events.iter().map(|e| e.ts_micros).min().unwrap_or(0);
+    let grouped = group_sessions(events);
+    let cap = CaptureInfo {
+        file: capture_path.display().to_string(),
+        dialect: capture.summary.source_dialect.clone(),
+        fp_texts: capture
+            .summary
+            .fingerprints
+            .iter()
+            .map(|e| (e.id, e.text.clone()))
+            .collect(),
+        events: total - filtered,
+        filtered,
+        sessions: grouped.len() as u64,
+        base_ts_micros,
+    };
+    let mk_sessions = || {
+        grouped
+            .iter()
+            .map(|events| {
+                (
+                    SessionMeta {
+                        session_id: events.first().map(|e| e.session_id).unwrap_or(0),
+                        has_executable: events
+                            .iter()
+                            .any(|e| should_execute(&e.query, options.allow_writes)),
+                    },
+                    VecEvents(events.clone().into_iter()),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    run_passes(mk_sessions, &cap, options, &target, &info, shutdown).await
+}
+
+/// Replay against the MySQL target named by `options.url`, aborting
+/// gracefully (partial report, `aborted: true`) when `shutdown` flips.
+pub async fn run_replay_with_shutdown(
+    capture_path: &Path,
+    options: ReplayOptions,
+    shutdown: watch::Receiver<bool>,
+) -> Result<ReplayOutcome> {
+    if let Some(limit) = nofile_soft_limit() {
+        check_fd_headroom(options.connection_cap(), limit)?;
+    }
+
+    let mut conn_opts = Opts::from_url(&options.url).context("invalid --url")?;
+    if let Some(db) = &options.db_override {
+        conn_opts = OptsBuilder::from_opts(conn_opts)
+            .db_name(Some(db.clone()))
+            .into();
+    }
+
+    // Probe: validates connectivity and grabs the server version plus the
+    // comparability-relevant settings up front.
+    let mut probe = Conn::new(conn_opts.clone())
+        .await
+        .with_context(|| format!("cannot connect to target {}", redact_url(&options.url)))?;
+    let target_server_version: String = probe
+        .query_first("SELECT VERSION()")
+        .await?
+        .unwrap_or_default();
+    let settings = collect_target_settings(&mut probe).await;
+    probe.disconnect().await?;
+
+    let info = TargetInfo {
+        server_version: target_server_version,
+        settings,
+    };
+    let target = MySqlTarget::new(conn_opts);
+    run_replay_with_target(capture_path, &options, target, info, shutdown).await
+}
+
+/// Replay with Ctrl-C wired to a graceful abort: in-flight queries finish,
+/// everything else is recorded as not-run, and the (partial) report is
+/// still produced with `aborted: true`. A second Ctrl-C exits immediately.
+pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<ReplayOutcome> {
+    let (tx, rx) = watch::channel(false);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!(
+                "\nreceived Ctrl-C: finishing in-flight queries and writing a partial \
+                 report (press Ctrl-C again to exit immediately)"
+            );
+            let _ = tx.send(true);
+        }
+        if tokio::signal::ctrl_c().await.is_ok() {
+            std::process::exit(130);
+        }
+    });
+    run_replay_with_shutdown(capture_path, options, rx).await
 }
 
 /// Comparability-relevant target variables recorded into the run report so
@@ -745,5 +1365,24 @@ mod tests {
         pacer.wait_until_due(&paced_ev(30_000)).await;
         let report = pacer.report().unwrap();
         assert_eq!(report.paced_events, 0);
+    }
+
+    #[test]
+    fn fd_headroom_check_is_actionable() {
+        assert!(check_fd_headroom(50, 1024).is_ok());
+        assert!(check_fd_headroom(992, 1024).is_ok());
+        let err = check_fd_headroom(10_000, 1024).unwrap_err().to_string();
+        assert!(err.contains("10000"), "names the requested cap: {err}");
+        assert!(err.contains("1024"), "names the current limit: {err}");
+        assert!(err.contains("ulimit -n"), "suggests the fix: {err}");
+        assert!(err.contains("LimitNOFILE"), "mentions systemd: {err}");
+        // The suggested limit covers the need.
+        assert!(check_fd_headroom(10_000, 10_240).is_ok());
+    }
+
+    #[test]
+    fn nofile_soft_limit_is_readable() {
+        let limit = nofile_soft_limit().expect("getrlimit works on linux");
+        assert!(limit >= 64, "sane environment: {limit}");
     }
 }

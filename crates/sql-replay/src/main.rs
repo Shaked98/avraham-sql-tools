@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use sql_replay::replay::{ReplayOptions, Speed};
+use sql_replay::spool::{Filters, TimeWindow};
 
 #[derive(Parser)]
 #[command(
@@ -62,12 +63,47 @@ enum Cmd {
         /// speed); paced events never fire before their scheduled offset
         #[arg(long, default_value = "max", value_parser = Speed::parse)]
         speed: Speed,
-        /// Write a machine-readable run report to this path
+        /// Write a machine-readable run report to this path. With
+        /// --repeat N > 1, this receives the median-aggregated report and
+        /// each pass lands next to it as <out>.passK.json
         #[arg(long)]
         out: Option<PathBuf>,
         /// How many fingerprints to show in the stdout summary table
         #[arg(long, default_value_t = 10)]
         top: usize,
+        /// Run one unrecorded warmup pass (cache/buffer-pool warm-up)
+        /// before the measured pass(es)
+        #[arg(long)]
+        warmup: bool,
+        /// Number of measured passes; with N > 1 a median-aggregated
+        /// report is emitted alongside the per-pass reports
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repeat: u32,
+        /// Replay only events captured against this default database
+        /// (events without database metadata are excluded)
+        #[arg(long)]
+        filter_db: Option<String>,
+        /// Replay only events captured for this user (events without user
+        /// metadata are excluded)
+        #[arg(long)]
+        filter_user: Option<String>,
+        /// Replay only events inside <start>..<end> (start-inclusive,
+        /// end-exclusive; RFC 3339 timestamps or unix epoch seconds; either
+        /// side may be omitted)
+        #[arg(long, value_parser = TimeWindow::parse)]
+        time_window: Option<TimeWindow>,
+        /// Multiplex sessions over a bounded pool of this many connections
+        /// (checked out per query) instead of one dedicated connection per
+        /// session. Trades connection fidelity for feasibility when the
+        /// capture has more sessions than the target can hold connections;
+        /// captured USE statements are skipped (per-event db metadata
+        /// drives database selection instead)
+        #[arg(long, conflicts_with = "max_connections", value_parser = clap::value_parser!(u32).range(1..))]
+        pool: Option<u32>,
+        /// Directory for the replay spool file (roughly the uncompressed
+        /// capture size; default: the system temp dir)
+        #[arg(long)]
+        spool_dir: Option<PathBuf>,
     },
     /// Compare two `replay --out` run reports (baseline vs candidate) and
     /// rank per-fingerprint latency regressions. Exits 0 when no regression
@@ -99,6 +135,15 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         top: usize,
     },
+}
+
+/// `run.json` + pass 2 -> `run.pass2.json` (suffix lands before the
+/// extension so the files sort and glob together).
+fn pass_report_path(out: &std::path::Path, pass: usize) -> PathBuf {
+    match out.extension().and_then(|e| e.to_str()) {
+        Some(ext) => out.with_extension(format!("pass{pass}.{ext}")),
+        None => out.with_extension(format!("pass{pass}")),
+    }
 }
 
 fn main() -> Result<()> {
@@ -141,6 +186,13 @@ fn main() -> Result<()> {
             speed,
             out,
             top,
+            warmup,
+            repeat,
+            filter_db,
+            filter_user,
+            time_window,
+            pool,
+            spool_dir,
         } => {
             let options = ReplayOptions {
                 url,
@@ -149,18 +201,41 @@ fn main() -> Result<()> {
                 read_only,
                 db_override,
                 speed,
+                pool: pool.map(|n| n as usize),
+                warmup,
+                repeat: repeat as usize,
+                filters: Filters {
+                    db: filter_db,
+                    user: filter_user,
+                    window: time_window,
+                },
+                spool_dir,
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            let report = rt.block_on(sql_replay::replay::run_replay(&capture, options))?;
-            print!("{}", report.render_table(top));
-            if let Some(warning) = report.saturation_warning() {
+            let outcome = rt.block_on(sql_replay::replay::run_replay(&capture, options))?;
+            let primary = outcome.primary();
+            print!("{}", primary.render_table(top));
+            if let Some(warning) = primary.saturation_warning() {
                 eprintln!("\n{warning}");
             }
             if let Some(path) = out {
-                std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
+                // Multi-pass runs also write each pass next to the
+                // aggregated report.
+                if outcome.aggregated.is_some() {
+                    for (i, pass) in outcome.passes.iter().enumerate() {
+                        let p = pass_report_path(&path, i + 1);
+                        std::fs::write(&p, serde_json::to_string_pretty(pass)?)?;
+                        eprintln!("wrote pass {} report to {}", i + 1, p.display());
+                    }
+                }
+                std::fs::write(&path, serde_json::to_string_pretty(primary)?)?;
                 eprintln!("wrote run report to {}", path.display());
+            }
+            if outcome.aborted() {
+                eprintln!("replay aborted: the report(s) are partial");
+                std::process::exit(130);
             }
         }
         Cmd::Compare {

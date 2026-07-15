@@ -99,7 +99,14 @@ pub struct CaptureFile {
     pub summary: Summary,
 }
 
-pub fn read_capture(path: &Path) -> Result<CaptureFile> {
+/// Stream every event of a capture through `on_event` without materializing
+/// the file: peak memory is one record regardless of capture size. Returns
+/// the header and summary after validating the format version and that the
+/// summary's declared event count matches the events seen.
+pub fn stream_capture(
+    path: &Path,
+    mut on_event: impl FnMut(Event) -> Result<()>,
+) -> Result<(Header, Summary)> {
     let file =
         File::open(path).with_context(|| format!("cannot open capture file {}", path.display()))?;
     let dec = zstd::stream::read::Decoder::new(file)?;
@@ -107,7 +114,7 @@ pub fn read_capture(path: &Path) -> Result<CaptureFile> {
 
     let mut header: Option<Header> = None;
     let mut summary: Option<Summary> = None;
-    let mut events: Vec<Event> = Vec::new();
+    let mut event_count: u64 = 0;
 
     for (idx, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("capture line {}", idx + 1))?;
@@ -127,20 +134,34 @@ pub fn read_capture(path: &Path) -> Result<CaptureFile> {
                 }
                 header = Some(h);
             }
-            Record::Event(e) => events.push(e),
+            Record::Event(e) => {
+                event_count += 1;
+                on_event(e)?;
+            }
             Record::Summary(s) => summary = Some(s),
         }
     }
 
     let header = header.context("capture file has no header record")?;
     let summary = summary.context("capture file has no summary record (truncated capture?)")?;
-    if summary.event_count != events.len() as u64 {
+    if summary.event_count != event_count {
         bail!(
             "capture summary declares {} events but file contains {}",
             summary.event_count,
-            events.len()
+            event_count
         );
     }
+    Ok((header, summary))
+}
+
+/// Read a whole capture into memory. Kept for tests and small captures;
+/// replay streams via [`stream_capture`] so its memory stays bounded.
+pub fn read_capture(path: &Path) -> Result<CaptureFile> {
+    let mut events: Vec<Event> = Vec::new();
+    let (header, summary) = stream_capture(path, |e| {
+        events.push(e);
+        Ok(())
+    })?;
     Ok(CaptureFile {
         header,
         events,

@@ -205,6 +205,14 @@ pub fn compare_runs(
             "replay flag --{name} differs: {b} (baseline) vs {c} (candidate)"
         ));
     }
+    for (label, run) in [("baseline", baseline), ("candidate", candidate)] {
+        if run.aborted {
+            warnings.push(format!(
+                "the {label} run was aborted mid-replay — its latency populations are \
+                 partial and may not be comparable"
+            ));
+        }
+    }
 
     let settings_diff = settings_diff(&baseline.target_settings, &candidate.target_settings);
     if !settings_diff.is_empty() {
@@ -382,6 +390,26 @@ fn flag_diffs(b: &ReportFlags, c: &ReportFlags) -> Vec<(&'static str, String, St
     }
     if b.speed != c.speed {
         out.push(("speed", b.speed.clone(), c.speed.clone()));
+    }
+    let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "<none>".to_string());
+    if b.pool != c.pool {
+        let show = |v: &Option<usize>| {
+            v.map(|n| n.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        };
+        out.push(("pool", show(&b.pool), show(&c.pool)));
+    }
+    if b.warmup != c.warmup {
+        out.push(("warmup", b.warmup.to_string(), c.warmup.to_string()));
+    }
+    if b.filter_db != c.filter_db {
+        out.push(("filter-db", show(&b.filter_db), show(&c.filter_db)));
+    }
+    if b.filter_user != c.filter_user {
+        out.push(("filter-user", show(&b.filter_user), show(&c.filter_user)));
+    }
+    if b.time_window != c.time_window {
+        out.push(("time-window", show(&b.time_window), show(&c.time_window)));
     }
     out
 }
@@ -630,12 +658,19 @@ mod tests {
             started_at: String::new(),
             ended_at: String::new(),
             wall_secs: 10.0,
+            aborted: false,
+            aggregation: None,
             flags: ReportFlags {
                 max_connections: 8,
                 allow_writes: false,
                 read_only: false,
                 db_override: None,
                 speed: "max".to_string(),
+                pool: None,
+                warmup: false,
+                filter_db: None,
+                filter_user: None,
+                time_window: None,
             },
             totals: Totals {
                 events: executed,
@@ -646,6 +681,7 @@ mod tests {
                 not_run: 0,
                 connect_failures: 0,
                 qps: executed as f64 / 10.0,
+                filtered: 0,
             },
             saturation: SaturationReport {
                 samples: 0,
