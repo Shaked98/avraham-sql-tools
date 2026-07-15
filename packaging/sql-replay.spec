@@ -33,7 +33,9 @@ sql-replay captures MySQL slow query logs (long_query_time=0) into a
 compressed replay file, replays them against a target server at the
 original concurrency — optionally honoring the capture's original timing —
 and compares two run reports to gate 5.7 -> 8.0 migrations on per-query
-latency regressions.
+latency regressions. When the source server cannot be replayed against
+because it is live production, the baseline report can instead be built
+from the capture's recorded slow-log latencies (sql-replay baseline).
 
 The binary is statically linked (musl); it has no runtime dependencies.
 

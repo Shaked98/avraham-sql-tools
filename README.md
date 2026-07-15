@@ -224,7 +224,8 @@ $ sql-replay compare --baseline baseline.json --candidate run-8.0.json \
 ```
 
 - The baseline report has the same shape as a replay `run.json` (same
-  per-fingerprint count/p50/p95/p99/max/mean), with
+  per-fingerprint count/p50/p95/p99/max/mean; stdout gets the same top-N
+  slowest-fingerprints table, `--top`), with
   `latency_source: "recorded-slow-log"` marking its provenance (replayed
   reports say `"replayed"`). Its timeline is the capture's own:
   `started_at`/`ended_at` are the first/last event timestamps and QPS
