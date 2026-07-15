@@ -24,7 +24,9 @@ enum EndState {
 /// Independent (deliberately re-written) scan of MySQL lexical state at
 /// end-of-input: backslash escapes in '\'' and '"' but not '`', doubled
 /// quotes, non-nesting /* */ comments, `-- ` and `#` line comments ended
-/// by '\n'.
+/// by '\n'. Version-conditional /*! ... */ comments are NOT inert — MySQL
+/// executes their contents — so only their opener and version digits are
+/// skipped and the interior is scanned like ordinary SQL.
 fn end_state(s: &str) -> EndState {
     let b = s.as_bytes();
     let n = b.len();
@@ -52,6 +54,13 @@ fn end_state(s: &str) -> EndState {
                 }
             }
             b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                if i + 2 < n && b[i + 2] == b'!' {
+                    i += 3;
+                    while i < n && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    continue;
+                }
                 i += 2;
                 loop {
                     if i + 1 >= n {
@@ -100,7 +109,10 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Invariant 2: complete comment / whitespace prefixes are neutral.
-    for prefix in ["/*x*/ ", "  \t\n", "-- c\n", "# c\n"] {
+    // A /*! ... */ prefix with content is deliberately absent: MySQL
+    // executes conditional-comment contents, so it is not
+    // classification-invariant (only the empty "/*! */" is).
+    for prefix in ["/*x*/ ", "/* update */ ", "/*! */ ", "  \t\n", "-- c\n", "# c\n"] {
         let padded = format!("{prefix}{s}");
         assert_eq!(
             classify(&padded),
