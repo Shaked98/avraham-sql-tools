@@ -23,8 +23,8 @@
 # Requirements: docker, jq, curl, tar, and the sql-replay binary (built
 # from this checkout with `cargo build --release` if missing). Runtime on a
 # 4-core GitHub runner: ~15-25 minutes, most of it dataset load and the
-# deliberately slow candidate replay. Wipe verify/out/ between runs; the
-# ~35 MB dataset tarball is cached in verify/.cache/.
+# deliberately slow candidate replay. verify/out/ is wiped at the start of
+# each run; the ~35 MB dataset tarball is cached in verify/.cache/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

@@ -58,11 +58,13 @@ control sessions finish on a quiet box — without it, the planted classes'
 CPU burn inflates the sub-ms controls' p95 through scheduler contention,
 measurably worse on the deliberately slower candidate (a false-positive
 machine; run 2 of this rig measured the PK control at +127% p95 from
-contention alone). Before the long replay, cheap probe batches
+contention alone). Before the long replay, cheap probes
 verify each plant actually bites (index gone from
-`information_schema.statistics`, probe timing ratios) so a misconfigured
-plant fails fast with a clear message instead of a mysterious compare
-verdict. If a class ever proves noisy in practice, add executions
+`information_schema.statistics`, probe batch timing ratios, and
+`Created_tmp_disk_tables` deltas — the GROUP BY probe must spill on 8.0
+and must NOT spill on the 5.7 baseline) so a misconfigured plant fails
+fast with a clear message instead of a mysterious compare verdict. If a
+class ever proves noisy in practice, add executions
 (`WORKLOAD_*` volumes) rather than loosening assertions.
 
 ## Running it
@@ -78,13 +80,16 @@ $ verify/run.sh
 ```
 
 Requirements: a Linux host (the scripts use GNU `date +%s%N` and
-`sha256sum`, absent on stock macOS), `docker`, `jq`, `curl`, and either a
-prebuilt `target/release/sql-replay` or `cargo` to build one. Expected runtime:
+`sha256sum`, absent on stock macOS), `docker`, `jq`, `curl`, `tar`, and
+either a prebuilt `target/release/sql-replay` (point `SQL_REPLAY_BIN` at
+another binary) or `cargo` to build one. Expected runtime:
 **~15–25 minutes** (dataset load and the deliberately slow candidate
 replay dominate); ~35 MB download on first run (cached in
-`verify/.cache/`), ~2 GB of docker disk. Ports 13306/13307 must be free
+`verify/.cache/`, override with `VERIFY_CACHE`), ~2 GB of docker disk.
+Ports 13306/13307 must be free
 (override with `VERIFY_PORT_57` / `VERIFY_PORT_80`; `VERIFY_SEED`,
-`VERIFY_SESSIONS`, `VERIFY_REPEAT`, `VERIFY_THRESHOLD_PCT` are also
+`VERIFY_SESSIONS`, `VERIFY_REPEAT`, `VERIFY_THRESHOLD_PCT` and
+`VERIFY_MIN_COUNT` are also
 overridable). Set `KEEP_CONTAINERS=1` to leave the two MySQL servers up
 for post-mortem poking.
 
