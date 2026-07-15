@@ -1,6 +1,6 @@
 //! The `baseline` subcommand: turn a capture file's *recorded* production
-//! latencies (each event's slow-log `Query_time`) into a run report that
-//! `compare` accepts.
+//! latencies (each event's slow-log `Query_time`, or request→first-response
+//! wire time for pcap captures) into a run report that `compare` accepts.
 //!
 //! This exists for migrations where the source server can never be
 //! replayed against because it IS production (e.g. a live MySQL 5.7
@@ -9,16 +9,17 @@
 //! twin, compare.
 //!
 //! The report has the same shape as `replay --out run.json`, but:
-//! - `latency_source` is `"recorded-slow-log"`: latencies are server-side
-//!   `Query_time` under live production load (including lock waits and
+//! - `latency_source` is `"recorded-slow-log"` (the label also covers
+//!   pcap-sourced captures, kept for format compatibility): latencies were
+//!   measured under live production load (including lock waits and
 //!   contention), not client-side replay wall time. `compare` warns loudly
 //!   when one side is recorded and the other replayed.
 //! - There is no target: `target_url`, `target_server_version`, and
-//!   `target_settings` are absent — the slow log does not know them.
+//!   `target_settings` are absent — there was no replay to observe them.
 //! - The timeline is the capture's own: `started_at`/`ended_at` are the
 //!   first/last event timestamps, `wall_secs` their span, and QPS derives
 //!   from them.
-//! - `errors` is 0 by definition: the slow log records no statement
+//! - `errors` is 0 by definition: the capture records no statement
 //!   errors, so a zero says nothing about how production behaved.
 
 use std::collections::{HashMap, HashSet};

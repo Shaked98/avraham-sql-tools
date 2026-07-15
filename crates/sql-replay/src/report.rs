@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 /// latencies are client-side wall times measured by this tool.
 pub const LATENCY_SOURCE_REPLAYED: &str = "replayed";
 /// [`RunReport::latency_source`] for reports produced by `baseline`:
-/// latencies are server-side `Query_time` values recorded in the
-/// production slow log.
+/// latencies were recorded in the source capture (server-side `Query_time`
+/// for slow logs, request→first-response wire time for pcap captures —
+/// the value stays `recorded-slow-log` for format compatibility).
 pub const LATENCY_SOURCE_RECORDED: &str = "recorded-slow-log";
 
 pub(crate) fn default_latency_source() -> String {
@@ -25,18 +26,18 @@ pub struct RunReport {
     pub capture_dialect: String,
     /// Where the per-fingerprint latencies were measured:
     /// [`LATENCY_SOURCE_REPLAYED`] (client-side wall time observed by
-    /// `sql-replay replay`) or [`LATENCY_SOURCE_RECORDED`] (server-side
-    /// `Query_time` parsed from the production slow log by
-    /// `sql-replay baseline`). Absent in pre-0.2.0 reports, which are all
-    /// replayed (serde default).
+    /// `sql-replay replay`) or [`LATENCY_SOURCE_RECORDED`] (the capture's
+    /// recorded per-event latency aggregated by `sql-replay baseline`).
+    /// Absent in pre-0.2.0 reports, which are all replayed (serde
+    /// default).
     #[serde(default = "default_latency_source")]
     pub latency_source: String,
     /// Empty (and omitted from JSON) for recorded baselines, which have no
     /// target server.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_url: String,
-    /// Empty (and omitted from JSON) for recorded baselines — the slow log
-    /// does not know the server version string.
+    /// Empty (and omitted from JSON) for recorded baselines — there was no
+    /// replay to observe the server version string.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_server_version: String,
     pub started_at: String,
@@ -194,8 +195,8 @@ impl RunReport {
     /// than by the target server.
     pub const SATURATION_WARN_PCT: f64 = 20.0;
 
-    /// True for reports whose latencies were recorded in the production
-    /// slow log (`sql-replay baseline`) rather than measured by a replay.
+    /// True for reports whose latencies were recorded in the source
+    /// capture (`sql-replay baseline`) rather than measured by a replay.
     pub fn is_recorded(&self) -> bool {
         self.latency_source == LATENCY_SOURCE_RECORDED
     }

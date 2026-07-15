@@ -240,8 +240,11 @@ Fingerprints match by normalized *text*, not id (ids are capture-local).
 Exit codes: 0 no regression, 2 regression ≥ threshold (`EXIT_REGRESSED`),
 1 tool error — CI gates on this. Older run.json files still load: every
 field added after M1 (`pacing`, `target_settings`, the M3 `aborted`/
-`aggregation`/`filtered`/flag fields, and the 0.2.0 `latency_source`/
-`settings_note`) is `#[serde(default)]`, keep it that way. An aborted (Ctrl-C/SIGTERM) replay exits 130 after writing partial
+`aggregation`/`filtered`/flag fields, the 0.2.0 `latency_source`/
+`settings_note`, and the 0.3.0 checksum fields — `flags.checksum`,
+per-fingerprint `checksum`, compare's `correctness`/`correctness_failed` —
+plus the capture summary's `pcap` block) is `#[serde(default)]`, keep it
+that way. An aborted (Ctrl-C/SIGTERM) replay exits 130 after writing partial
 reports; `compare` warns when an input run is `aborted`. Target settings are read with
 `SHOW VARIABLES LIKE` (returns no row instead of erroring on unknown
 variables); the 5.7 `tx_isolation` / 8.0 `transaction_isolation` rename is

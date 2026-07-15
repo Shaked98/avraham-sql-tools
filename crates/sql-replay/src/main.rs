@@ -11,7 +11,7 @@ use sql_replay::spool::{Filters, TimeWindow};
 #[command(
     name = "sql-replay",
     version,
-    about = "Capture MySQL slow query logs and replay them against a target server"
+    about = "Capture MySQL load (slow query log or tcpdump pcap) and replay it against a target server"
 )]
 struct Cli {
     #[command(subcommand)]
