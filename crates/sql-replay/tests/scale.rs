@@ -55,10 +55,15 @@ async fn million_event_replay_memory_is_bounded() {
     };
     let (_tx, rx) = no_shutdown();
     let t0 = std::time::Instant::now();
-    let outcome =
-        run_replay_with_target(&capture, &options, target.clone(), TargetInfo::default(), rx)
-            .await
-            .expect("replay");
+    let outcome = run_replay_with_target(
+        &capture,
+        &options,
+        target.clone(),
+        TargetInfo::default(),
+        rx,
+    )
+    .await
+    .expect("replay");
     let replay_secs = t0.elapsed().as_secs_f64();
     std::fs::remove_file(&capture).ok();
 

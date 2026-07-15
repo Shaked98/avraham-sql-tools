@@ -1,0 +1,111 @@
+# Release: on a v* tag, run the full test suite, build the static musl
+# binary (the RHEL 8 deployment artifact), package it as a tarball + RPM,
+# and attach everything with checksums to a GitHub release.
+#
+# Tags are created by a human; nothing in the repo or CI creates them.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  MUSL_TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  test:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: unit and fixture tests
+        run: cargo test --workspace
+      - name: scale tests (streaming-memory bound, 10k sessions)
+        run: cargo test --release -p sql-replay --test scale -- --ignored --nocapture
+
+  release:
+    name: static musl build + GitHub release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-release
+      - name: install musl-gcc and rpmbuild
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools rpm
+      - name: check the tag matches the crate version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"$VERSION\"$" crates/sql-replay/Cargo.toml || {
+            echo "tag $GITHUB_REF_NAME does not match crates/sql-replay/Cargo.toml version"
+            exit 1
+          }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: build static musl binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target "$MUSL_TARGET" -p sql-replay
+      - name: verify the binary is fully static
+        run: |
+          BIN="target/$MUSL_TARGET/release/sql-replay"
+          file "$BIN" | grep -q 'statically linked'
+          if ldd "$BIN" 2>&1 | grep -vq 'not a dynamic executable'; then
+            echo "binary is not static:"; ldd "$BIN"; exit 1
+          fi
+          "$BIN" --version
+      - name: smoke-run the binary
+        run: |
+          BIN="target/$MUSL_TARGET/release/sql-replay"
+          "$BIN" capture \
+            --input crates/sql-replay/tests/fixtures/replay_smoke.log \
+            --out smoke.jsonl.zst
+          "$BIN" replay --help > /dev/null
+      - name: package release tarball
+        run: |
+          PKG="sql-replay-$VERSION-$MUSL_TARGET"
+          mkdir -p "dist/$PKG"
+          cp "target/$MUSL_TARGET/release/sql-replay" README.md \
+             LICENSE-MIT LICENSE-APACHE "dist/$PKG/"
+          tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
+          rm -r "dist/$PKG"
+      - name: build the RHEL 8 RPM from the tarball
+        run: |
+          rpmbuild -bb packaging/sql-replay.spec \
+            --define "_sourcedir $PWD/dist" \
+            --define "_rpmdir $PWD/dist" \
+            --define "version $VERSION"
+          mv dist/x86_64/*.rpm dist/
+          rmdir dist/x86_64
+          rpm -qpil dist/sql-replay-*.rpm
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: create GitHub release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.rpm
+            dist/SHA256SUMS
+          generate_release_notes: true

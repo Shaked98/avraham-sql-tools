@@ -72,7 +72,10 @@ fn deterministic(r: &RunReport) -> Deterministic {
     }
 }
 
-async fn run_both(capture: &std::path::Path, options: &ReplayOptions) -> (ReplayOutcome, ReplayOutcome) {
+async fn run_both(
+    capture: &std::path::Path,
+    options: &ReplayOptions,
+) -> (ReplayOutcome, ReplayOutcome) {
     let (_tx1, rx1) = no_shutdown();
     let (_tx2, rx2) = no_shutdown();
     let spool = run_replay_with_target(
@@ -201,10 +204,15 @@ async fn repeat_runs_n_passes_and_aggregates_the_median() {
         ..ReplayOptions::new("mysql://mock/")
     };
     let (_tx, rx) = no_shutdown();
-    let outcome =
-        run_replay_with_target(&capture, &options, target.clone(), TargetInfo::default(), rx)
-            .await
-            .expect("replay");
+    let outcome = run_replay_with_target(
+        &capture,
+        &options,
+        target.clone(),
+        TargetInfo::default(),
+        rx,
+    )
+    .await
+    .expect("replay");
     assert_eq!(outcome.passes.len(), 3);
     for pass in &outcome.passes {
         assert_eq!(pass.totals.executed, 10);
@@ -231,10 +239,15 @@ async fn warmup_runs_an_extra_unrecorded_pass() {
         ..ReplayOptions::new("mysql://mock/")
     };
     let (_tx, rx) = no_shutdown();
-    let outcome =
-        run_replay_with_target(&capture, &options, target.clone(), TargetInfo::default(), rx)
-            .await
-            .expect("replay");
+    let outcome = run_replay_with_target(
+        &capture,
+        &options,
+        target.clone(),
+        TargetInfo::default(),
+        rx,
+    )
+    .await
+    .expect("replay");
     // One recorded pass, but two full executions happened.
     assert_eq!(outcome.passes.len(), 1);
     assert!(outcome.aggregated.is_none());
@@ -258,10 +271,15 @@ async fn pool_mode_bounds_connections_and_skips_captured_use() {
         ..ReplayOptions::new("mysql://mock/")
     };
     let (_tx, rx) = no_shutdown();
-    let outcome =
-        run_replay_with_target(&capture, &options, target.clone(), TargetInfo::default(), rx)
-            .await
-            .expect("replay");
+    let outcome = run_replay_with_target(
+        &capture,
+        &options,
+        target.clone(),
+        TargetInfo::default(),
+        rx,
+    )
+    .await
+    .expect("replay");
     let r = outcome.primary();
     assert_eq!(r.totals.executed, 9, "captured USE is skipped in pool mode");
     assert_eq!(r.totals.skipped, 3, "2 write-gated + 1 USE");

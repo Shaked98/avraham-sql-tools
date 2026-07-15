@@ -26,6 +26,66 @@ jobs:
         run: cargo test --workspace
       - name: release build
         run: cargo build --release -p sql-replay
+      - name: scale tests (1M-event streaming memory bound; release mode)
+        run: cargo test --release -p sql-replay --test scale -- --ignored --nocapture
+
+  musl:
+    # The RHEL 8 deployment artifact is the static musl binary; build it on
+    # every PR so it cannot rot between releases, and smoke the RPM spec.
+    name: static musl build + rpm spec
+    runs-on: ubuntu-latest
+    env:
+      MUSL_TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+      - name: install musl-gcc and rpmbuild
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools rpm
+      - name: build static musl binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target "$MUSL_TARGET" -p sql-replay
+      - name: verify the binary is fully static
+        run: |
+          BIN="target/$MUSL_TARGET/release/sql-replay"
+          file "$BIN" | grep -q 'statically linked'
+          if ldd "$BIN" 2>&1 | grep -vq 'not a dynamic executable'; then
+            echo "binary is not static:"; ldd "$BIN"; exit 1
+          fi
+      - name: smoke-run the static binary
+        run: |
+          BIN="target/$MUSL_TARGET/release/sql-replay"
+          "$BIN" --version
+          "$BIN" capture \
+            --input crates/sql-replay/tests/fixtures/replay_smoke.log \
+            --out smoke.jsonl.zst
+      - name: rpm spec version matches the crate
+        run: |
+          VERSION=$(grep '^version = ' crates/sql-replay/Cargo.toml | cut -d'"' -f2)
+          grep -q "%global version $VERSION" packaging/sql-replay.spec || {
+            echo "packaging/sql-replay.spec default version != crate version $VERSION"
+            exit 1
+          }
+      - name: build the RPM from the spec (structure smoke)
+        run: |
+          VERSION=$(grep '^version = ' crates/sql-replay/Cargo.toml | cut -d'"' -f2)
+          PKG="sql-replay-$VERSION-$MUSL_TARGET"
+          mkdir -p "dist/$PKG"
+          cp "target/$MUSL_TARGET/release/sql-replay" README.md \
+             LICENSE-MIT LICENSE-APACHE "dist/$PKG/"
+          tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
+          rpmbuild -bb packaging/sql-replay.spec \
+            --define "_sourcedir $PWD/dist" \
+            --define "_rpmdir $PWD/dist" \
+            --define "version $VERSION"
+          rpm -qpil dist/x86_64/sql-replay-*.rpm
 
   integration:
     name: replay vs MySQL ${{ matrix.mysql }}
@@ -112,6 +172,57 @@ jobs:
           jq -e '.pacing.mean_lag_us >= 0' run-paced.json
           # capture spans 3s -> at 20x the paced run takes >= ~150ms
           jq -e '.wall_secs >= 0.14' run-paced.json
+      - name: warmup + repeated replay (--warmup --repeat 3) against MySQL ${{ matrix.mysql }}
+        run: |
+          ./target/release/sql-replay replay \
+            --capture capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --max-connections 8 \
+            --warmup \
+            --repeat 3 \
+            --out run-repeat.json
+      - name: assert per-pass reports and the median aggregate
+        run: |
+          jq . run-repeat.json
+          for i in 1 2 3; do
+            jq -e '.totals.executed == 10' "run-repeat.pass$i.json"
+            jq -e 'has("aggregation") | not' "run-repeat.pass$i.json"
+            jq -e '.aborted == false' "run-repeat.pass$i.json"
+          done
+          jq -e '.aggregation.passes == 3' run-repeat.json
+          jq -e '.aggregation.method == "median"' run-repeat.json
+          jq -e '.totals.executed == 10' run-repeat.json
+          jq -e '.flags.warmup == true' run-repeat.json
+          jq -e '.aborted == false' run-repeat.json
+      - name: filtered replay (--filter-user + --time-window) against MySQL ${{ matrix.mysql }}
+        # The fixture spans 1693569601..1693569604 for user `smoke`; the
+        # window keeps the middle 6 events.
+        run: |
+          ./target/release/sql-replay replay \
+            --capture capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --max-connections 8 \
+            --filter-user smoke \
+            --time-window 1693569602..1693569604 \
+            --out run-filtered.json
+          jq . run-filtered.json
+          jq -e '.totals.events == 6' run-filtered.json
+          jq -e '.totals.filtered == 6' run-filtered.json
+          jq -e '.totals.errors == 0' run-filtered.json
+          jq -e '.flags.filter_user == "smoke"' run-filtered.json
+          jq -e '.flags.time_window == "1693569602..1693569604"' run-filtered.json
+      - name: pooled replay (--pool 2) against MySQL ${{ matrix.mysql }}
+        run: |
+          ./target/release/sql-replay replay \
+            --capture capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --pool 2 \
+            --out run-pool.json
+          jq . run-pool.json
+          jq -e '.totals.executed == 9' run-pool.json
+          jq -e '.totals.skipped == 3' run-pool.json
+          jq -e '.totals.errors == 0' run-pool.json
+          jq -e '.flags.pool == 2' run-pool.json
       - name: upload run.json for the compare job
         uses: actions/upload-artifact@v4
         with:

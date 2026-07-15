@@ -102,14 +102,9 @@ impl TimeWindow {
             }
             time::OffsetDateTime::parse(b, &time::format_description::well_known::Rfc3339)
                 .map(|t| {
-                    Some(
-                        t.unix_timestamp().saturating_mul(1_000_000)
-                            + i64::from(t.microsecond()),
-                    )
+                    Some(t.unix_timestamp().saturating_mul(1_000_000) + i64::from(t.microsecond()))
                 })
-                .map_err(|_| {
-                    format!("`{b}` is not an RFC 3339 timestamp or unix epoch seconds")
-                })
+                .map_err(|_| format!("`{b}` is not an RFC 3339 timestamp or unix epoch seconds"))
         };
         let win = TimeWindow {
             raw: s.to_string(),
@@ -197,18 +192,16 @@ impl Spool {
             included += 1;
             base_ts_micros = base_ts_micros.min(event.ts_micros);
             let record_len = record_size(&event)?;
-            let s = sessions
-                .entry(event.session_id)
-                .or_insert_with(|| {
-                    order.push(event.session_id);
-                    SessionBuild {
-                        session_id: event.session_id,
-                        bytes: 0,
-                        event_count: 0,
-                        has_executable: false,
-                        write_pos: 0,
-                    }
-                });
+            let s = sessions.entry(event.session_id).or_insert_with(|| {
+                order.push(event.session_id);
+                SessionBuild {
+                    session_id: event.session_id,
+                    bytes: 0,
+                    event_count: 0,
+                    has_executable: false,
+                    write_pos: 0,
+                }
+            });
             s.bytes += record_len;
             s.event_count += 1;
             s.has_executable |= should_execute(&event.query, allow_writes);

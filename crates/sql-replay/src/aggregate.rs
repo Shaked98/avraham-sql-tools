@@ -41,7 +41,10 @@ fn median_f64(mut v: Vec<f64>) -> f64 {
 
 /// Aggregate `passes` (at least one) into a median report.
 pub fn aggregate_median(passes: &[RunReport]) -> RunReport {
-    assert!(!passes.is_empty(), "aggregate_median needs at least one pass");
+    assert!(
+        !passes.is_empty(),
+        "aggregate_median needs at least one pass"
+    );
 
     let u = |f: &dyn Fn(&RunReport) -> u64| median_u64(passes.iter().map(f).collect());
     let fl = |f: &dyn Fn(&RunReport) -> f64| median_f64(passes.iter().map(f).collect());
@@ -81,7 +84,12 @@ pub fn aggregate_median(passes: &[RunReport]) -> RunReport {
 
     let pacing = if passes.iter().all(|p| p.pacing.is_some()) {
         let pu = |f: &dyn Fn(&PacingReport) -> u64| {
-            median_u64(passes.iter().map(|p| f(p.pacing.as_ref().unwrap())).collect())
+            median_u64(
+                passes
+                    .iter()
+                    .map(|p| f(p.pacing.as_ref().unwrap()))
+                    .collect(),
+            )
         };
         Some(PacingReport {
             speed: passes[0].pacing.as_ref().unwrap().speed,

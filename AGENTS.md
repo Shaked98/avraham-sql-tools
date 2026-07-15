@@ -3,7 +3,8 @@
 Cargo workspace of SQL tooling. First (and so far only) crate:
 `crates/sql-replay`, a MySQL slow-log capture + replay benchmarking tool
 with a `compare` regression gate. See `README.md` for user-facing usage
-and milestone scope (M1 capture/replay, M2 pacing + compare).
+and milestone scope (M1 capture/replay, M2 pacing + compare, M3 scale
+hardening + RHEL 8 packaging).
 
 ## Build / test
 
@@ -14,10 +15,14 @@ cargo test                # unit + fixture tests; no database required
 cargo build --release
 # live replay test (CI runs it against mysql:5.7 and mysql:8.0 services):
 SQL_REPLAY_TEST_URL=mysql://root@127.0.0.1:3306/test cargo test -p sql-replay --test replay_integration
+# heavy 1M-event bounded-memory test (CI runs it in the check job):
+cargo test --release -p sql-replay --test scale -- --ignored --nocapture
 ```
 
 CI (`.github/workflows/ci.yml`) is the authoritative home of the MySQL
-integration job — don't expect docker locally.
+integration job — don't expect docker locally. `release.yml` cuts GitHub
+releases from `v*` tags (musl tarball + RPM + checksums); never create
+tags/releases from an agent session.
 
 ## This dev host has no C toolchain
 
@@ -33,6 +38,18 @@ Rust is installed user-level via rustup, and linking + `cc`-built crates
 
 If a build fails with `linker \`cc\` not found`, that setup is missing —
 recreate it rather than adding repo-level workarounds.
+
+To smoke the static musl build locally (CI's musl job uses musl-gcc and is
+authoritative): `~/.local/bin/zigcc-musl` pins zig to the musl triple
+(rustc invokes the linker without `--target`), and rustc's self-contained
+crt objects must be disabled or they collide with zig's:
+
+```sh
+RUSTFLAGS="-C link-self-contained=no" \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=zigcc-musl \
+CC_x86_64_unknown_linux_musl=zigcc-musl \
+cargo build --release --target x86_64-unknown-linux-musl -p sql-replay
+```
 
 ## Dependency constraints
 
@@ -86,6 +103,36 @@ OUTFILE`/`DUMPFILE` writes files on the server; `WITH` is classified by the
 first top-level verb after the CTEs; multi-statement text (a top-level `;`
 followed by more content) is always a write.
 
+## Replay ingestion is streamed — keep it that way (M3)
+
+`crates/sql-replay/src/spool.rs` (module docs + tests are the spec):
+replay never materializes the capture. Two streaming passes build an
+unlinked on-disk spool with one contiguous byte region per session; each
+session task reads its events via positioned reads. Peak memory is
+O(sessions), independent of event count (~35 MiB at 5M events / 20k
+sessions — `tests/scale.rs` asserts a 192 MiB bound and is the evidence
+run; it must stay alone in its binary because VmHWM is process-wide).
+The contiguous-region design exists because per-session queues fed by a
+live dispatcher can deadlock: with all permits held by sessions idling for
+their next event and the dispatcher blocked on a full queue of a
+permit-waiting session, nothing progresses. Pre-building the spool gives
+every session an independent cursor and removes cross-session coupling.
+`replay.rs` keeps an in-memory reference path
+(`run_replay_in_memory_with_target`) purely so
+`tests/streaming_equivalence.rs` can prove the spool path yields identical
+run.json results — don't ship features that exist in only one path.
+
+The execution layer is generic over `target::Target` (mysql impl +
+`tests/common/mod.rs` mock), which is how abort/pool/10k-session behavior
+is tested without a database. Replay-side filters (`--filter-db/user`,
+`--time-window`) are applied at spool build — deliberately not at capture,
+so captures stay complete reusable artifacts. `--pool N` checks
+connections out per query (session state fidelity is documented as lost;
+captured USE is skipped, per-event db metadata reconciles instead).
+Graceful abort is a `watch::Receiver<bool>` threaded through sessions;
+`--warmup`/`--repeat` rerun passes over the same spool and
+`aggregate.rs` does the median math.
+
 ## Pacing (`--speed`)
 
 `crates/sql-replay/src/replay.rs`, `Pacer` (tests are the spec). Schedule =
@@ -107,9 +154,11 @@ that's why tokio's `test-util` feature is a dev-dependency.
 refs; the fixture test greps for `http://` etc. to enforce it).
 Fingerprints match by normalized *text*, not id (ids are capture-local).
 Exit codes: 0 no regression, 2 regression ≥ threshold (`EXIT_REGRESSED`),
-1 tool error — CI gates on this. M1 run.json files (no `pacing`/
-`target_settings`) still load: the new `RunReport` fields are
-`#[serde(default)]`, keep them that way. Target settings are read with
+1 tool error — CI gates on this. Older run.json files still load: every
+field added after M1 (`pacing`, `target_settings`, and the M3 `aborted`/
+`aggregation`/`filtered`/flag fields) is `#[serde(default)]`, keep it
+that way. An aborted (Ctrl-C) replay exits 130 after writing partial
+reports; `compare` warns when an input run is `aborted`. Target settings are read with
 `SHOW VARIABLES LIKE` (returns no row instead of erroring on unknown
 variables); the 5.7 `tx_isolation` / 8.0 `transaction_isolation` rename is
 canonicalized to `transaction_isolation`.
@@ -120,6 +169,18 @@ zstd JSONL: header record, event records, summary record (dialect, counts,
 fingerprint table as `[{id, text}]`). Note: the fingerprint table is a
 *list*, not a JSON map — integer-keyed maps don't round-trip through
 serde's internally-tagged enums.
+
+## Packaging (M3)
+
+`packaging/sql-replay.spec` builds the RHEL 8 RPM from the release tarball
+of the static musl binary (AutoReqProv off, debuginfo/build-id disabled —
+the binary is prebuilt and static). Its `%global version` default must
+match the crate version (CI's musl job asserts this). `release.yml`
+publishes tarball + RPM + SHA256SUMS on `v*` tags after the full test
+suite; the tag must equal the crate version. CI's musl job also rebuilds
+the static binary and rpmbuilds the spec on every PR so neither rots.
+Keep the dep tree free of OpenSSL/system libs or the static build breaks
+(zstd-sys is the one C dependency, compiled by musl-gcc in CI).
 
 ## Maintaining this file
 

@@ -22,10 +22,15 @@ async fn ten_thousand_sessions_respect_a_64_connection_cap() {
         ..ReplayOptions::new("mysql://mock/")
     };
     let (_tx, rx) = no_shutdown();
-    let outcome =
-        run_replay_with_target(&capture, &options, target.clone(), TargetInfo::default(), rx)
-            .await
-            .expect("replay");
+    let outcome = run_replay_with_target(
+        &capture,
+        &options,
+        target.clone(),
+        TargetInfo::default(),
+        rx,
+    )
+    .await
+    .expect("replay");
     std::fs::remove_file(&capture).ok();
 
     let t = &outcome.primary().totals;
@@ -58,10 +63,15 @@ async fn ten_thousand_sessions_multiplex_over_a_16_connection_pool() {
         ..ReplayOptions::new("mysql://mock/")
     };
     let (_tx, rx) = no_shutdown();
-    let outcome =
-        run_replay_with_target(&capture, &options, target.clone(), TargetInfo::default(), rx)
-            .await
-            .expect("replay");
+    let outcome = run_replay_with_target(
+        &capture,
+        &options,
+        target.clone(),
+        TargetInfo::default(),
+        rx,
+    )
+    .await
+    .expect("replay");
     std::fs::remove_file(&capture).ok();
 
     let t = &outcome.primary().totals;

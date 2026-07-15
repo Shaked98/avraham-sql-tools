@@ -72,10 +72,15 @@ async fn abort_before_start_runs_nothing_but_reports_everything() {
     tx.send(true).expect("receiver alive");
 
     let options = ReplayOptions::new("mysql://mock/");
-    let outcome =
-        run_replay_with_target(&capture, &options, target.clone(), TargetInfo::default(), rx)
-            .await
-            .expect("report produced");
+    let outcome = run_replay_with_target(
+        &capture,
+        &options,
+        target.clone(),
+        TargetInfo::default(),
+        rx,
+    )
+    .await
+    .expect("report produced");
     std::fs::remove_file(&capture).ok();
 
     let r = outcome.primary();
@@ -114,6 +119,9 @@ async fn abort_during_repeat_stops_the_pass_loop() {
     assert!(outcome.passes[1].aborted);
     assert_eq!(outcome.passes[1].totals.executed, 2);
     assert_eq!(outcome.passes[1].totals.not_run, 8);
-    let agg = outcome.aggregated.as_ref().expect("aggregate still emitted");
+    let agg = outcome
+        .aggregated
+        .as_ref()
+        .expect("aggregate still emitted");
     assert!(agg.aborted, "aggregate is marked partial");
 }

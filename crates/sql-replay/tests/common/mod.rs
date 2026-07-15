@@ -139,12 +139,7 @@ pub fn write_capture(path: &Path, events: &[Event]) {
 /// Stream a large synthetic capture to disk without materializing it:
 /// `sessions` round-robin sessions, `events_per_session` events each,
 /// timestamps advancing 1ms per event, `fp_count` fingerprint classes.
-pub fn generate_capture(
-    path: &Path,
-    sessions: u64,
-    events_per_session: u64,
-    fp_count: u32,
-) -> u64 {
+pub fn generate_capture(path: &Path, sessions: u64, events_per_session: u64, fp_count: u32) -> u64 {
     let total = sessions * events_per_session;
     let mut w = CaptureWriter::create(path).expect("create capture");
     w.write(&Record::Header(Header {
@@ -161,9 +156,7 @@ pub fn generate_capture(
             session_id,
             user: Some("load".to_string()),
             db: Some("bench".to_string()),
-            query: format!(
-                "SELECT c1, c2, c3 FROM lineitem_{fp} WHERE order_id = {i} LIMIT 10"
-            ),
+            query: format!("SELECT c1, c2, c3 FROM lineitem_{fp} WHERE order_id = {i} LIMIT 10"),
             orig_query_time_s: 0.0001,
             fingerprint_id: fp,
         }))
