@@ -61,6 +61,16 @@ TOTAL_EVENTS=$((TOTAL_PK + TOTAL_HIRE + TOTAL_GB + TOTAL_INS))
 # `select @@version_comment limit 1` on connect (batch mode included), and
 # every heavy session opens with its SELECT SLEEP gate event.
 TOTAL_EXECUTED=$((TOTAL_EVENTS + SESSIONS + HEAVY_SESSIONS))
+((FAST_SESSIONS >= 1)) || {
+  printf '\nFAIL: VERIFY_SESSIONS=%s leaves no control sessions: the %s heavy planted-class sessions are fixed, so it must be at least %s\n' \
+    "$SESSIONS" "$HEAVY_SESSIONS" "$((HEAVY_SESSIONS + 1))" >&2
+  exit 1
+}
+((SESSIONS < MIN_COUNT)) || {
+  printf '\nFAIL: VERIFY_SESSIONS=%s must stay below VERIFY_MIN_COUNT=%s, or the per-session client startup query reaches --min-count and breaks the low-sample exact-set assertion\n' \
+    "$SESSIONS" "$MIN_COUNT" >&2
+  exit 1
+}
 
 # The workload classes as sql-replay fingerprints (normalized text, matched
 # exactly against compare's report.json). Must stay in sync with the SQL
@@ -153,11 +163,11 @@ docker rm -f "$C57" "$C80" >/dev/null 2>&1 || true
 # dataset stays cached (stable latencies); binlog off on 8.0 to match
 # 5.7's default (sync_binlog=1 would otherwise slow every replayed INSERT
 # on the candidate and poison the control group).
-docker run -d --name "$C57" -p "$PORT57:3306" \
+docker run -d --name "$C57" -p "127.0.0.1:$PORT57:3306" \
   -e MYSQL_ALLOW_EMPTY_PASSWORD=yes \
   -v "$DATASET_DIR:/test_db:ro" \
   mysql:5.7 --innodb-buffer-pool-size=512M >/dev/null
-docker run -d --name "$C80" -p "$PORT80:3306" \
+docker run -d --name "$C80" -p "127.0.0.1:$PORT80:3306" \
   -e MYSQL_ALLOW_EMPTY_PASSWORD=yes \
   -v "$DATASET_DIR:/test_db:ro" \
   mysql:8.0 --innodb-buffer-pool-size=512M --disable-log-bin >/dev/null

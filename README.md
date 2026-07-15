@@ -251,5 +251,5 @@ temp-table-to-disk spill via `temptable_max_ram`), runs a seeded
 concurrent workload through the full capture → replay → compare loop, and
 asserts that `compare` flags exactly the two planted classes while the
 untouched control classes stay clean. Runs locally on any docker-equipped
-machine (~15–25 min) or in CI via the manually-triggered / weekly
+Linux machine (~15–25 min) or in CI via the manually-triggered / weekly
 `real-verify` workflow. See [`verify/README.md`](verify/README.md).

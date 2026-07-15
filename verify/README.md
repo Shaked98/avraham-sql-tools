@@ -71,14 +71,15 @@ In CI: manually via
 `gh workflow run real-verify.yml` (plus a weekly scheduled run); reports
 are uploaded as artifacts. It is deliberately not a per-PR job.
 
-Locally, on any docker-equipped machine:
+Locally, on any docker-equipped Linux machine:
 
 ```console
 $ verify/run.sh
 ```
 
-Requirements: `docker`, `jq`, `curl`, and either a prebuilt
-`target/release/sql-replay` or `cargo` to build one. Expected runtime:
+Requirements: a Linux host (the scripts use GNU `date +%s%N` and
+`sha256sum`, absent on stock macOS), `docker`, `jq`, `curl`, and either a
+prebuilt `target/release/sql-replay` or `cargo` to build one. Expected runtime:
 **~15–25 minutes** (dataset load and the deliberately slow candidate
 replay dominate); ~35 MB download on first run (cached in
 `verify/.cache/`), ~2 GB of docker disk. Ports 13306/13307 must be free
