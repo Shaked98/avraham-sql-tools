@@ -107,12 +107,43 @@ enum Cmd {
         #[arg(long)]
         spool_dir: Option<PathBuf>,
     },
-    /// Compare two `replay --out` run reports (baseline vs candidate) and
-    /// rank per-fingerprint latency regressions. Exits 0 when no regression
-    /// reaches the threshold, 2 when at least one does (1 = tool error), so
-    /// CI can gate on it.
+    /// Build a baseline run report from a capture's RECORDED production
+    /// latencies (the slow log's Query_time values) instead of replaying —
+    /// for migrations where the source server cannot be replayed against
+    /// because it IS production. The report has the same shape as
+    /// `replay --out` and feeds `compare` directly.
+    Baseline {
+        /// Capture file produced by `sql-replay capture`
+        #[arg(long)]
+        capture: PathBuf,
+        /// Write the baseline run report (JSON) to this path
+        #[arg(long)]
+        out: PathBuf,
+        /// Include only events captured against this default database
+        /// (events without database metadata are excluded)
+        #[arg(long)]
+        filter_db: Option<String>,
+        /// Include only events captured for this user (events without user
+        /// metadata are excluded)
+        #[arg(long)]
+        filter_user: Option<String>,
+        /// Include only events inside <start>..<end> (start-inclusive,
+        /// end-exclusive; RFC 3339 timestamps or unix epoch seconds; either
+        /// side may be omitted)
+        #[arg(long, value_parser = TimeWindow::parse)]
+        time_window: Option<TimeWindow>,
+        /// How many fingerprints to show in the stdout summary table
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+    },
+    /// Compare two run reports (baseline vs candidate; either side may come
+    /// from `replay --out` or from `baseline`) and rank per-fingerprint
+    /// latency regressions. Exits 0 when no regression reaches the
+    /// threshold, 2 when at least one does (1 = tool error), so CI can gate
+    /// on it.
     Compare {
-        /// Baseline run report (e.g. the MySQL 5.7 run.json)
+        /// Baseline run report (e.g. the MySQL 5.7 run.json, or a recorded
+        /// baseline from `sql-replay baseline`)
         #[arg(long)]
         baseline: PathBuf,
         /// Candidate run report (e.g. the MySQL 8.0 run.json)
@@ -239,6 +270,24 @@ fn main() -> Result<()> {
                 eprintln!("replay aborted: the report(s) are partial");
                 std::process::exit(130);
             }
+        }
+        Cmd::Baseline {
+            capture,
+            out,
+            filter_db,
+            filter_user,
+            time_window,
+            top,
+        } => {
+            let filters = Filters {
+                db: filter_db,
+                user: filter_user,
+                window: time_window,
+            };
+            let report = sql_replay::baseline::build_baseline(&capture, &filters)?;
+            print!("{}", report.render_table(top));
+            std::fs::write(&out, serde_json::to_string_pretty(&report)?)?;
+            eprintln!("wrote baseline report to {}", out.display());
         }
         Cmd::Compare {
             baseline,

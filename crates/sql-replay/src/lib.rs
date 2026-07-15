@@ -2,6 +2,7 @@
 //! target server, and compare run reports to find performance regressions.
 
 pub mod aggregate;
+pub mod baseline;
 pub mod capture;
 pub mod classify;
 pub mod compare;

@@ -147,6 +147,25 @@ claiming a `--max-connections` permit (late sessions must not pin idle
 connections). Pacing tests use `#[tokio::test(start_paused = true)]` —
 that's why tokio's `test-util` feature is a dev-dependency.
 
+## baseline subcommand (0.2.0)
+
+`crates/sql-replay/src/baseline.rs` (module docs + tests are the spec;
+`tests/baseline_test.rs` is the capture→baseline→compare E2E): streams a
+capture and aggregates each event's recorded slow-log `Query_time`
+(`orig_query_time_s`) into a `RunReport`-shaped baseline — for the case
+where the 5.7 side IS production and can't be replayed against.
+Provenance is `RunReport::latency_source` (`"recorded-slow-log"` vs
+`"replayed"`, serde-defaulted to replayed so pre-0.2.0 run.json loads);
+recorded reports have empty `target_url`/`target_server_version`
+(skip-serialized) and no settings. `compare` handles mixed pairs: a loud
+MEASUREMENT PLANES DIFFER warning (server-side Query_time under live load
+vs client-side replay wall time), replay-knob flag diffs suppressed
+(filter flags still compared — they change the workload slice), settings
+diff skipped with `settings_note`, "recorded (slow log)" in the version
+slot. Baseline errors are 0 by definition (the slow log records none) —
+documented in the README so nobody reads it as "production had no
+errors".
+
 ## compare subcommand
 
 `crates/sql-replay/src/compare.rs` (logic; its tests + fixture pair
@@ -156,9 +175,9 @@ refs; the fixture test greps for `http://` etc. to enforce it).
 Fingerprints match by normalized *text*, not id (ids are capture-local).
 Exit codes: 0 no regression, 2 regression ≥ threshold (`EXIT_REGRESSED`),
 1 tool error — CI gates on this. Older run.json files still load: every
-field added after M1 (`pacing`, `target_settings`, and the M3 `aborted`/
-`aggregation`/`filtered`/flag fields) is `#[serde(default)]`, keep it
-that way. An aborted (Ctrl-C/SIGTERM) replay exits 130 after writing partial
+field added after M1 (`pacing`, `target_settings`, the M3 `aborted`/
+`aggregation`/`filtered`/flag fields, and the 0.2.0 `latency_source`/
+`settings_note`) is `#[serde(default)]`, keep it that way. An aborted (Ctrl-C/SIGTERM) replay exits 130 after writing partial
 reports; `compare` warns when an input run is `aborted`. Target settings are read with
 `SHOW VARIABLES LIKE` (returns no row instead of erroring on unknown
 variables); the 5.7 `tx_isolation` / 8.0 `transaction_isolation` rename is

@@ -924,6 +924,7 @@ async fn run_pass<T: Target, S: EventStream>(
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         capture_file: cap.file.clone(),
         capture_dialect: cap.dialect.clone(),
+        latency_source: crate::report::LATENCY_SOURCE_REPLAYED.to_string(),
         target_url: redact_url(&options.url),
         target_server_version: info.server_version.clone(),
         started_at: format_rfc3339(started_at),

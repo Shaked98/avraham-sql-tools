@@ -44,8 +44,14 @@ pub struct CompareReport {
     /// settings).
     pub comparability_warnings: Vec<String>,
     /// Target variables whose values differ between the runs (or exist on
-    /// only one side).
+    /// only one side). Empty (see `settings_note`) when a side records no
+    /// settings at all.
     pub settings_diff: Vec<SettingDiff>,
+    /// Present when the settings diff was skipped because at least one run
+    /// records no target settings (a recorded slow-log baseline, or an old
+    /// pre-M2 run.json).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_note: Option<String>,
     pub totals: TotalsDelta,
     /// Matched fingerprints with p95 delta >= threshold — plus zero-baseline
     /// fingerprints whose candidate p95 is nonzero (`delta_pct` is null for
@@ -71,7 +77,15 @@ pub struct CompareReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunMeta {
     pub file: String,
+    /// See [`RunReport::latency_source`]; defaults to replayed for
+    /// pre-0.2.0 reports.
+    #[serde(default = "crate::report::default_latency_source")]
+    pub latency_source: String,
+    /// Empty for recorded baselines — display via
+    /// [`RunMeta::display_server_version`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_server_version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_url: String,
     pub capture_file: String,
     pub capture_dialect: String,
@@ -86,9 +100,27 @@ pub struct RunMeta {
 }
 
 impl RunMeta {
+    pub fn is_recorded(&self) -> bool {
+        self.latency_source == crate::report::LATENCY_SOURCE_RECORDED
+    }
+
+    /// The server version for display: recorded baselines have none (the
+    /// slow log doesn't know it), so show their provenance instead of a
+    /// blank.
+    pub fn display_server_version(&self) -> String {
+        if !self.target_server_version.is_empty() {
+            self.target_server_version.clone()
+        } else if self.is_recorded() {
+            "recorded (slow log)".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+
     fn from_report(file: &str, r: &RunReport) -> Self {
         RunMeta {
             file: file.to_string(),
+            latency_source: r.latency_source.clone(),
             target_server_version: r.target_server_version.clone(),
             target_url: r.target_url.clone(),
             capture_file: r.capture_file.clone(),
@@ -200,7 +232,31 @@ pub fn compare_runs(
             baseline.capture_dialect, candidate.capture_dialect
         ));
     }
-    for (name, b, c) in flag_diffs(&baseline.flags, &candidate.flags) {
+    // One recorded side + one replayed side is the tool's intended
+    // production-baseline workflow, but the measurement planes differ
+    // systematically — say so up front, and loudly.
+    let both_replayed = !baseline.is_recorded() && !candidate.is_recorded();
+    if baseline.is_recorded() != candidate.is_recorded() {
+        let (rec, rep) = if baseline.is_recorded() {
+            ("baseline", "candidate")
+        } else {
+            ("candidate", "baseline")
+        };
+        warnings.push(format!(
+            "MEASUREMENT PLANES DIFFER: the {rec} latencies are server-side Query_time \
+             values recorded in the production slow log (measured under live production \
+             load, including lock waits and contention), while the {rep} latencies are \
+             client-side wall times measured by replay from the test host (including \
+             network round-trip and driver overhead). Deltas mix real server changes \
+             with this measurement gap — use a generous --threshold-pct and treat small \
+             deltas as noise"
+        ));
+    }
+    // Replay-execution knobs (speed, connection caps, write gate, ...) only
+    // exist on replayed runs; comparing them against a recorded baseline
+    // would be pure noise. Filter flags always matter — they change which
+    // slice of the capture each report covers.
+    for (name, b, c) in flag_diffs(&baseline.flags, &candidate.flags, both_replayed) {
         warnings.push(format!(
             "replay flag --{name} differs: {b} (baseline) vs {c} (candidate)"
         ));
@@ -214,7 +270,43 @@ pub fn compare_runs(
         }
     }
 
-    let settings_diff = settings_diff(&baseline.target_settings, &candidate.target_settings);
+    // A side with no recorded settings has nothing to diff against — skip
+    // the section with a note instead of listing every other-side variable
+    // as a spurious one-sided change.
+    let no_settings_side = |r: &RunReport| {
+        if r.is_recorded() {
+            "records no target settings (recorded from the slow log)"
+        } else {
+            "records no target settings (older report)"
+        }
+    };
+    let (settings_diff, settings_note) = match (
+        baseline.target_settings.is_empty(),
+        candidate.target_settings.is_empty(),
+    ) {
+        (false, false) => (
+            settings_diff(&baseline.target_settings, &candidate.target_settings),
+            None,
+        ),
+        (true, true) => (
+            Vec::new(),
+            Some("settings diff skipped: neither run records target settings".to_string()),
+        ),
+        (b_empty, _) => {
+            let (side, run) = if b_empty {
+                ("baseline", baseline)
+            } else {
+                ("candidate", candidate)
+            };
+            (
+                Vec::new(),
+                Some(format!(
+                    "settings diff skipped: the {side} run {}",
+                    no_settings_side(run)
+                )),
+            )
+        }
+    };
     if !settings_diff.is_empty() {
         let names: Vec<&str> = settings_diff.iter().map(|d| d.name.as_str()).collect();
         warnings.push(format!(
@@ -344,6 +436,7 @@ pub fn compare_runs(
         candidate: RunMeta::from_report(candidate_file, candidate),
         comparability_warnings: warnings,
         settings_diff,
+        settings_note,
         totals: TotalsDelta {
             baseline_qps: bt.qps,
             candidate_qps: ct.qps,
@@ -368,40 +461,46 @@ pub fn compare_runs(
     }
 }
 
-fn flag_diffs(b: &ReportFlags, c: &ReportFlags) -> Vec<(&'static str, String, String)> {
+fn flag_diffs(
+    b: &ReportFlags,
+    c: &ReportFlags,
+    include_replay_knobs: bool,
+) -> Vec<(&'static str, String, String)> {
     let mut out = Vec::new();
-    if b.max_connections != c.max_connections {
-        out.push((
-            "max-connections",
-            b.max_connections.to_string(),
-            c.max_connections.to_string(),
-        ));
-    }
-    if b.allow_writes != c.allow_writes {
-        out.push((
-            "allow-writes",
-            b.allow_writes.to_string(),
-            c.allow_writes.to_string(),
-        ));
-    }
-    if b.db_override != c.db_override {
-        let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "<none>".to_string());
-        out.push(("db-override", show(&b.db_override), show(&c.db_override)));
-    }
-    if b.speed != c.speed {
-        out.push(("speed", b.speed.clone(), c.speed.clone()));
+    if include_replay_knobs {
+        if b.max_connections != c.max_connections {
+            out.push((
+                "max-connections",
+                b.max_connections.to_string(),
+                c.max_connections.to_string(),
+            ));
+        }
+        if b.allow_writes != c.allow_writes {
+            out.push((
+                "allow-writes",
+                b.allow_writes.to_string(),
+                c.allow_writes.to_string(),
+            ));
+        }
+        if b.db_override != c.db_override {
+            let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "<none>".to_string());
+            out.push(("db-override", show(&b.db_override), show(&c.db_override)));
+        }
+        if b.speed != c.speed {
+            out.push(("speed", b.speed.clone(), c.speed.clone()));
+        }
+        if b.pool != c.pool {
+            let show = |v: &Option<usize>| {
+                v.map(|n| n.to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            };
+            out.push(("pool", show(&b.pool), show(&c.pool)));
+        }
+        if b.warmup != c.warmup {
+            out.push(("warmup", b.warmup.to_string(), c.warmup.to_string()));
+        }
     }
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "<none>".to_string());
-    if b.pool != c.pool {
-        let show = |v: &Option<usize>| {
-            v.map(|n| n.to_string())
-                .unwrap_or_else(|| "<none>".to_string())
-        };
-        out.push(("pool", show(&b.pool), show(&c.pool)));
-    }
-    if b.warmup != c.warmup {
-        out.push(("warmup", b.warmup.to_string(), c.warmup.to_string()));
-    }
     if b.filter_db != c.filter_db {
         out.push(("filter-db", show(&b.filter_db), show(&c.filter_db)));
     }
@@ -478,12 +577,21 @@ impl CompareReport {
 
     pub fn render_stdout(&self, top: usize) -> String {
         let mut out = String::new();
-        out.push_str("Comparing replay runs:\n");
+        out.push_str("Comparing runs:\n");
         for (label, m) in [("baseline", &self.baseline), ("candidate", &self.candidate)] {
-            out.push_str(&format!(
-                "  {label:>9}: {} — target {} ({})\n",
-                m.file, m.target_server_version, m.target_url
-            ));
+            if m.is_recorded() {
+                out.push_str(&format!(
+                    "  {label:>9}: {} — recorded (slow log) latencies from capture {}\n",
+                    m.file, m.capture_file
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  {label:>9}: {} — target {} ({})\n",
+                    m.file,
+                    m.display_server_version(),
+                    m.target_url
+                ));
+            }
         }
         out.push('\n');
 
@@ -497,6 +605,9 @@ impl CompareReport {
             out.push('\n');
         }
 
+        if let Some(note) = &self.settings_note {
+            out.push_str(&format!("Target settings: {note}\n\n"));
+        }
         if !self.settings_diff.is_empty() {
             out.push_str("Target settings diff (baseline -> candidate):\n");
             for d in &self.settings_diff {
@@ -653,6 +764,7 @@ mod tests {
             tool_version: "test".to_string(),
             capture_file: "capture.jsonl.zst".to_string(),
             capture_dialect: "mysql-5.7".to_string(),
+            latency_source: crate::report::LATENCY_SOURCE_REPLAYED.to_string(),
             target_url: "mysql://t/".to_string(),
             target_server_version: version.to_string(),
             started_at: String::new(),
@@ -887,6 +999,98 @@ mod tests {
         let rep = compare_runs("a", &base, "b", &cand, OPTS);
         assert!(rep.settings_diff.is_empty());
         assert!(rep.comparability_warnings.is_empty());
+    }
+
+    /// A `sql-replay baseline` report: recorded latencies, no target.
+    fn recorded_run(fps: Vec<FingerprintReport>) -> RunReport {
+        let mut r = run("", fps);
+        r.latency_source = crate::report::LATENCY_SOURCE_RECORDED.to_string();
+        r.target_url = String::new();
+        r.flags.max_connections = 0;
+        r.flags.speed = "recorded".to_string();
+        r
+    }
+
+    #[test]
+    fn recorded_vs_replayed_warns_about_measurement_planes() {
+        let base = recorded_run(vec![fp("q", 10, 0, 10_000)]);
+        let mut cand = run("8.0.46", vec![fp("q", 10, 0, 11_000)]);
+        cand.target_settings = BTreeMap::from([("sql_mode".to_string(), "X".to_string())]);
+        let rep = compare_runs("baseline.json", &base, "run-8.0.json", &cand, OPTS);
+
+        // The measurement-plane warning is present and explains both sides.
+        let plane = rep
+            .comparability_warnings
+            .iter()
+            .find(|w| w.contains("MEASUREMENT PLANES DIFFER"))
+            .expect("measurement-plane warning present");
+        assert!(plane.contains("Query_time"));
+        assert!(plane.contains("production slow log"));
+        assert!(plane.contains("wall times"));
+        assert!(plane.contains("--threshold-pct"));
+
+        // Replay-knob flag diffs (speed "recorded" vs "max", max-connections
+        // 0 vs 8) are suppressed — they'd be pure noise against a recorded
+        // side.
+        assert!(!rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("replay flag")));
+
+        // The settings diff is skipped with a note, not filled with
+        // one-sided entries; no "settings differ" warning either.
+        assert!(rep.settings_diff.is_empty());
+        let note = rep.settings_note.as_deref().expect("settings note");
+        assert!(note.contains("baseline"), "{note}");
+        assert!(note.contains("recorded from the slow log"), "{note}");
+        assert!(!rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("target server settings differ")));
+
+        // Delta math is unchanged: the fingerprints still match and rank.
+        assert_eq!(rep.stable.len(), 1);
+        assert_eq!(rep.stable[0].p95.delta_pct, Some(10.0));
+
+        // Display: the recorded side shows its provenance in the version
+        // slot rather than a blank.
+        assert_eq!(rep.baseline.display_server_version(), "recorded (slow log)");
+        assert_eq!(rep.candidate.display_server_version(), "8.0.46");
+        assert!(rep.baseline.is_recorded());
+        assert!(!rep.candidate.is_recorded());
+        let text = rep.render_stdout(10);
+        assert!(text.contains("recorded (slow log) latencies from capture"));
+        assert!(text.contains("MEASUREMENT PLANES DIFFER"));
+        assert!(text.contains("Target settings: settings diff skipped"));
+    }
+
+    #[test]
+    fn recorded_side_filter_flag_diffs_still_warn() {
+        let mut base = recorded_run(vec![]);
+        base.flags.filter_db = Some("shop".to_string());
+        let cand = run("8.0.46", vec![]);
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("--filter-db differs")));
+    }
+
+    #[test]
+    fn two_replayed_runs_get_no_measurement_plane_warning() {
+        let base = run("5.7.42", vec![fp("q", 10, 0, 10_000)]);
+        let cand = run("8.0.46", vec![fp("q", 10, 0, 10_000)]);
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert!(!rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("MEASUREMENT PLANES")));
+        // Both sides empty settings -> note, no spurious diff.
+        assert!(rep.settings_diff.is_empty());
+        assert_eq!(
+            rep.settings_note.as_deref(),
+            Some("settings diff skipped: neither run records target settings")
+        );
     }
 
     #[test]

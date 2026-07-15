@@ -197,12 +197,17 @@ fn m1_run_report_without_new_fields_still_loads() {
     let obj = v.as_object_mut().unwrap();
     obj.remove("target_settings");
     obj.remove("pacing");
+    obj.remove("latency_source");
     let m1: RunReport = serde_json::from_value(v).unwrap();
     assert!(m1.pacing.is_none());
     assert!(m1.target_settings.is_empty());
+    // Pre-0.2.0 reports carry no latency_source: they are all replayed.
+    assert_eq!(m1.latency_source, "replayed");
+    assert!(!m1.is_recorded());
 
-    // Comparing an M1 baseline against an M2 candidate must still work; every
-    // candidate setting then shows as one-sided in the diff.
+    // Comparing an M1 baseline against an M2 candidate must still work; the
+    // settings diff is skipped with a note (the M1 side recorded none) and
+    // no measurement-plane warning fires (both sides are replayed).
     let rep = compare_runs(
         "m1.json",
         &m1,
@@ -214,5 +219,12 @@ fn m1_run_report_without_new_fields_still_loads() {
         },
     );
     assert!(rep.regressed);
-    assert!(rep.settings_diff.iter().all(|d| d.baseline.is_none()));
+    assert!(rep.settings_diff.is_empty());
+    let note = rep.settings_note.as_deref().expect("settings note");
+    assert!(note.contains("baseline"), "{note}");
+    assert!(note.contains("older report"), "{note}");
+    assert!(!rep
+        .comparability_warnings
+        .iter()
+        .any(|w| w.contains("MEASUREMENT PLANES")));
 }
