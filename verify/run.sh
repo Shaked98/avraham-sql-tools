@@ -44,21 +44,31 @@ BIN=${SQL_REPLAY_BIN:-target/release/sql-replay}
 DATASET_URL=https://github.com/datacharmer/test_db/releases/download/v1.0.7/test_db-1.0.7.tar.gz
 DATASET_SHA256=c44c140f352f35d47fdb65df60f52b779ef552822fad6c4efcfa7b134c3faf84
 
-# Per-session class volumes (x SESSIONS = per-fingerprint sample size).
-PK_PER_SESSION=40 HIRE_PER_SESSION=30 GB_PER_SESSION=18 INS_PER_SESSION=30
-TOTAL_PK=$((PK_PER_SESSION * SESSIONS))
-TOTAL_HIRE=$((HIRE_PER_SESSION * SESSIONS))
-TOTAL_GB=$((GB_PER_SESSION * SESSIONS))
-TOTAL_INS=$((INS_PER_SESSION * SESSIONS))
+# Session roles and per-session class volumes (see verify/workload.sh:
+# GB_SESSIONS heavy-aggregate-only sessions, the rest fast-class sessions).
+GB_SESSIONS=4
+FAST_SESSIONS=$((SESSIONS - GB_SESSIONS))
+PK_PER_SESSION=80 HIRE_PER_SESSION=45 GB_PER_SESSION=50 INS_PER_SESSION=60
+TOTAL_PK=$((PK_PER_SESSION * FAST_SESSIONS))
+TOTAL_HIRE=$((HIRE_PER_SESSION * FAST_SESSIONS))
+TOTAL_GB=$((GB_PER_SESSION * GB_SESSIONS))
+TOTAL_INS=$((INS_PER_SESSION * FAST_SESSIONS))
 TOTAL_EVENTS=$((TOTAL_PK + TOTAL_HIRE + TOTAL_GB + TOTAL_INS))
+# The mysql client sends `select @@version_comment limit 1` on every
+# connection (batch mode included), so each session contributes exactly one
+# extra captured event beyond the generated statements.
+TOTAL_EXECUTED=$((TOTAL_EVENTS + SESSIONS))
 
-# The four workload classes as sql-replay fingerprints (normalized text,
-# matched exactly against compare's report.json). Must stay in sync with
-# the SQL emitted by verify/workload.sh.
+# The workload classes as sql-replay fingerprints (normalized text, matched
+# exactly against compare's report.json). Must stay in sync with the SQL
+# emitted by verify/workload.sh.
 FP_PK='select emp_no, first_name, last_name, gender from employees where emp_no = ?'
 FP_HIRE='select count(*), min(emp_no), max(emp_no) from employees where hire_date = ?'
 FP_GB='select e.first_name, e.last_name, count(*) as cnt, avg(s.salary) as avg_sal from employees e join salaries s on s.emp_no = e.emp_no where e.emp_no between ? and ? group by e.first_name, e.last_name order by avg_sal desc limit ?'
 FP_INS='insert into verify_audit (actor, action, note) values (?+)'
+# The mysql client's own startup query; deliberately below --min-count so
+# it lands in the report's low_sample bucket, never the ranking.
+FP_VER='select @@version_comment limit ?'
 
 # ---------------------------------------------------------------- helpers
 stage() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -227,7 +237,7 @@ for i in $(seq 1 20); do
 done >"$OUT/probe-hire.sql"
 # 3 group-by-class aggregates per batch (they are ~100x slower each).
 for i in 1 2 3; do
-  echo "SELECT e.first_name, e.last_name, COUNT(*) AS cnt, AVG(s.salary) AS avg_sal FROM employees e JOIN salaries s ON s.emp_no = e.emp_no WHERE e.emp_no BETWEEN 200000 AND 259999 GROUP BY e.first_name, e.last_name ORDER BY avg_sal DESC LIMIT 10;"
+  echo "SELECT e.first_name, e.last_name, COUNT(*) AS cnt, AVG(s.salary) AS avg_sal FROM employees e JOIN salaries s ON s.emp_no = e.emp_no WHERE e.emp_no BETWEEN 200000 AND 249999 GROUP BY e.first_name, e.last_name ORDER BY avg_sal DESC LIMIT 10;"
 done >"$OUT/probe-gb.sql"
 
 probe_ratio() { # probe_ratio <file> <label> <min-ratio>
@@ -243,14 +253,20 @@ probe_ratio() { # probe_ratio <file> <label> <min-ratio>
     die "plant '$2' looks ineffective: 8.0 batch ${ms80}ms vs 5.7 ${ms57}ms (need ${3}x); tune the plant/workload before trusting compare"
   fi
 }
-tmp_disk_delta() { # informational: Created_tmp_disk_tables delta for one gb probe
+tmp_disk_delta() { # Created_tmp_disk_tables delta for one gb-class query
   local c=$1 before after
   before=$(mrun "$c" "SHOW GLOBAL STATUS LIKE 'Created_tmp_disk_tables'" | cut -f2)
   head -1 "$OUT/probe-gb.sql" | docker exec -i "$c" mysql -uroot -N -B employees >/dev/null
   after=$(mrun "$c" "SHOW GLOBAL STATUS LIKE 'Created_tmp_disk_tables'" | cut -f2)
   echo $((after - before))
 }
-echo "gb probe on-disk temp tables created: 5.7=$(tmp_disk_delta "$C57") 8.0=$(tmp_disk_delta "$C80")"
+SPILL57=$(tmp_disk_delta "$C57")
+SPILL80=$(tmp_disk_delta "$C80")
+echo "gb probe on-disk temp tables created: 5.7=$SPILL57 8.0=$SPILL80"
+[[ "$SPILL57" == 0 ]] ||
+  die "gb class spills to disk on the 5.7 BASELINE too (delta $SPILL57) — the planted contrast is gone; shrink the group count"
+[[ "$SPILL80" -ge 1 ]] ||
+  die "gb class did not spill to disk on the 8.0 candidate — temptable plant ineffective; grow the group count"
 probe_ratio "$OUT/probe-hire.sql" "hire_date index drop" 3
 probe_ratio "$OUT/probe-gb.sql" "temptable disk spill" 2
 
@@ -261,6 +277,7 @@ SET GLOBAL log_slow_admin_statements = ON;
 SET GLOBAL long_query_time = 0;
 SET GLOBAL slow_query_log = ON;"
 WORKLOAD_OUT="$OUT" WORKLOAD_SEED="$SEED" WORKLOAD_SESSIONS="$SESSIONS" \
+  WORKLOAD_GB_SESSIONS="$GB_SESSIONS" \
   WORKLOAD_PK="$PK_PER_SESSION" WORKLOAD_HIRE="$HIRE_PER_SESSION" \
   WORKLOAD_GB="$GB_PER_SESSION" WORKLOAD_INS="$INS_PER_SESSION" \
   WORKLOAD_CONTAINER="$C57" verify/workload.sh all
@@ -273,8 +290,8 @@ stage "sql-replay capture"
 "$BIN" capture --input "$OUT/verify-slow.log" --out "$OUT/capture.jsonl.zst" |
   tee "$OUT/capture-summary.txt"
 CAPTURED=$(sed -n 's/^captured \([0-9]\+\) events.*/\1/p' "$OUT/capture-summary.txt")
-[[ -n "$CAPTURED" && "$CAPTURED" -ge "$TOTAL_EVENTS" ]] ||
-  die "capture holds ${CAPTURED:-0} events, expected >= $TOTAL_EVENTS"
+[[ -n "$CAPTURED" && "$CAPTURED" -ge "$TOTAL_EXECUTED" ]] ||
+  die "capture holds ${CAPTURED:-0} events, expected >= $TOTAL_EXECUTED"
 
 stage "replay (--warmup --repeat $REPEAT) against both servers, baseline first"
 replay() { # replay <url> <run.json>
@@ -289,15 +306,16 @@ replay() { # replay <url> <run.json>
     --out "$2"
 }
 assert_run() { # assert_run <run.json>
-  jq -e --argjson n "$TOTAL_EVENTS" '.totals.executed == $n' "$1" >/dev/null ||
-    die "$1: expected $TOTAL_EVENTS executed events, got $(jq '.totals.executed' "$1")"
+  jq -e --argjson n "$TOTAL_EXECUTED" '.totals.executed == $n' "$1" >/dev/null ||
+    die "$1: expected $TOTAL_EXECUTED executed events, got $(jq '.totals.executed' "$1")"
   jq -e '.totals.errors == 0' "$1" >/dev/null ||
     die "$1: replay hit SQL errors: $(jq -r '[.fingerprints[] | select(.errors > 0) | .first_error][0]' "$1")"
   jq -e '.aborted == false' "$1" >/dev/null || die "$1: replay was aborted"
   jq -e --argjson s "$SESSIONS" '.totals.sessions == $s' "$1" >/dev/null ||
     die "$1: expected $SESSIONS sessions, got $(jq '.totals.sessions' "$1")"
   local fp want
-  for spec in "$FP_PK|$TOTAL_PK" "$FP_HIRE|$TOTAL_HIRE" "$FP_GB|$TOTAL_GB" "$FP_INS|$TOTAL_INS"; do
+  for spec in "$FP_PK|$TOTAL_PK" "$FP_HIRE|$TOTAL_HIRE" "$FP_GB|$TOTAL_GB" \
+    "$FP_INS|$TOTAL_INS" "$FP_VER|$SESSIONS"; do
     fp=${spec%|*} want=${spec##*|}
     jq -e --arg fp "$fp" --argjson want "$want" \
       '[.fingerprints[] | select(.fingerprint == $fp) | .count] == [$want]' "$1" >/dev/null ||
@@ -356,7 +374,8 @@ check "control pk-lookup class present with a full sample (stable or improved)" 
   '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_PK"
 check "control insert class present with a full sample (stable or improved)" \
   '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_INS"
-check "no fingerprint fell below min-count" '.low_sample | length == 0'
+check "low-sample bucket holds only the mysql client's startup query" \
+  '[.low_sample[].fingerprint] == [$fp]' --arg fp "$FP_VER"
 check "no fingerprints exclusive to one run" \
   '(.only_in_baseline | length == 0) and (.only_in_candidate | length == 0)'
 check "no executed-count mismatches" '.count_mismatches == 0'
