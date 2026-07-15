@@ -16,8 +16,8 @@ pub struct RunReport {
     pub started_at: String,
     pub ended_at: String,
     pub wall_secs: f64,
-    /// True when the run was interrupted (Ctrl-C): the report is partial —
-    /// events that never got to run are counted under `not_run`.
+    /// True when the run was interrupted (Ctrl-C/SIGTERM): the report is
+    /// partial — events that never got to run are counted under `not_run`.
     #[serde(default)]
     pub aborted: bool,
     /// Present on the median-aggregated report of a `--repeat N` run.
@@ -84,7 +84,8 @@ pub struct Totals {
     pub executed: u64,
     pub skipped: u64,
     pub errors: u64,
-    /// Events abandoned after a fatal connection error in their session.
+    /// Events abandoned after a fatal connection error in their session,
+    /// or never attempted because the run was aborted.
     pub not_run: u64,
     pub connect_failures: u64,
     pub qps: f64,
