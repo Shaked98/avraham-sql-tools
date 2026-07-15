@@ -252,6 +252,111 @@ jobs:
         env:
           SQL_REPLAY_TEST_URL: mysql://root@127.0.0.1:3306/sqlreplay
 
+      # ---- M4 pcap leg: tcpdump real wire traffic, capture, replay ----
+      - name: tcpdump a scripted wire workload
+        run: |
+          # The service container's port is published on 127.0.0.1 via
+          # docker-proxy, so client<->server traffic crosses `lo`.
+          sudo tcpdump -i lo port 3306 -s 0 -U -w traffic.pcap &
+          TCPDUMP_PID=$!
+          sleep 2
+          # Binary-protocol prepared statements with bound parameters —
+          # something the plain mysql CLI never sends.
+          cargo run --release -p sql-replay --example wire_workload -- \
+            mysql://root@127.0.0.1:3306/sqlreplay
+          # The stock mysql 8.x CLI (negotiates CLIENT_QUERY_ATTRIBUTES).
+          # TLS must be off or the whole connection is opaque on the wire.
+          mysql -h 127.0.0.1 -P 3306 -u root --ssl-mode=DISABLED sqlreplay \
+            -e "SELECT id, v FROM pcap_smoke WHERE id = 2; SELECT COUNT(*) FROM pcap_smoke;"
+          sleep 2
+          sudo kill -INT "$TCPDUMP_PID"
+          sleep 2
+          sudo chmod a+r traffic.pcap
+          ls -l traffic.pcap
+      - name: capture from the pcap and assert decode quality
+        run: |
+          ./target/release/sql-replay capture \
+            --input traffic.pcap \
+            --out pcap-capture.jsonl.zst | tee pcap-capture.txt
+          # dialect carries the observed server version
+          grep -E 'dialect: pcap:' pcap-capture.txt
+          # every prepared execution expanded; nothing skipped or lost
+          grep -E 'prepared statements: [1-9][0-9]* expanded, 0 inexpandable' pcap-capture.txt
+          grep -E '0 TLS-skipped, 0 compressed-skipped, 0 mid-stream-skipped, 0 broken' pcap-capture.txt
+          grep -E '0 responses missing' pcap-capture.txt
+      - name: replay the pcap capture against MySQL ${{ matrix.mysql }}
+        run: |
+          ./target/release/sql-replay replay \
+            --capture pcap-capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --max-connections 8 \
+            --out run-pcap.json
+          jq . run-pcap.json
+          jq -e '.totals.events >= 12' run-pcap.json
+          # setup session + 2 concurrent readers + the mysql CLI
+          jq -e '.totals.sessions >= 4' run-pcap.json
+          jq -e '.totals.errors == 0' run-pcap.json
+          jq -e '.totals.executed >= 8' run-pcap.json
+          # writes in the captured workload stayed behind the gate
+          jq -e '.totals.skipped >= 5' run-pcap.json
+          # the prepared lookups round-tripped into replayable SQL text
+          jq -e '[.fingerprints[] | select(.fingerprint | contains("where id ="))] | length >= 1' run-pcap.json
+      - name: baseline from the pcap capture (recorded wire latencies)
+        run: |
+          ./target/release/sql-replay baseline \
+            --capture pcap-capture.jsonl.zst \
+            --out pcap-baseline.json
+          jq -e '.latency_source == "recorded-slow-log"' pcap-baseline.json
+          jq -e '.totals.events >= 12' pcap-baseline.json
+          # SELECT SLEEP(0.25)'s request->response wire latency was recorded
+          jq -e '[.fingerprints[] | select(.fingerprint | contains("sleep")) | select(.p95_us >= 200000)] | length >= 1' pcap-baseline.json
+
+      # ---- M4 checksum legs: correctness diffing on live data ----
+      - name: checksum leg — identical data yields zero mismatches
+        run: |
+          ./target/release/sql-replay replay \
+            --capture pcap-capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --checksum --out run-cs-base.json
+          ./target/release/sql-replay replay \
+            --capture pcap-capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --checksum --out run-cs-same.json
+          jq -e '.flags.checksum == true' run-cs-base.json
+          jq -e '[.fingerprints[] | select(.checksum != null)] | length >= 3' run-cs-base.json
+          ./target/release/sql-replay compare \
+            --baseline run-cs-base.json \
+            --candidate run-cs-same.json \
+            --json cs-same-report.json
+          jq -e '.correctness.checked >= 3' cs-same-report.json
+          jq -e '.correctness.matched == .correctness.checked' cs-same-report.json
+          jq -e '.correctness.mismatches | length == 0' cs-same-report.json
+          jq -e '.correctness_failed == false' cs-same-report.json
+      - name: checksum leg — planted data change is detected (exit 2)
+        run: |
+          mysql -h 127.0.0.1 -P 3306 -u root --ssl-mode=DISABLED sqlreplay \
+            -e "UPDATE pcap_smoke SET v = 'tampered' WHERE id = 1"
+          ./target/release/sql-replay replay \
+            --capture pcap-capture.jsonl.zst \
+            --url mysql://root@127.0.0.1:3306/sqlreplay \
+            --checksum --out run-cs-tampered.json
+          set +e
+          ./target/release/sql-replay compare \
+            --baseline run-cs-base.json \
+            --candidate run-cs-tampered.json \
+            --json cs-tampered-report.json \
+            --out cs-tampered-report.html
+          code=$?
+          set -e
+          test "$code" -eq 2
+          jq -e '.correctness_failed == true' cs-tampered-report.json
+          jq -e '.correctness.mismatches | length >= 1' cs-tampered-report.json
+          jq -e '[.correctness.mismatches[] | select(.fingerprint | contains("pcap_smoke"))] | length >= 1' cs-tampered-report.json
+          # the unchanged aggregate stayed matched (no blanket mismatching)
+          jq -e '.correctness.matched >= 1' cs-tampered-report.json
+          grep -q 'Result correctness' cs-tampered-report.html
+          ! grep -qE 'https?://' cs-tampered-report.html
+
   compare:
     name: compare 5.7 vs 8.0 runs
     runs-on: ubuntu-latest
