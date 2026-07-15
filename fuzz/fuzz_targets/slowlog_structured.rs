@@ -12,20 +12,51 @@ use sql_replay::slowlog::SlowLogParser;
 
 #[derive(Arbitrary, Debug)]
 enum Piece {
-    TimeOld { ts: u32 },
-    TimeRfc3339 { ts: u32, micros: u32 },
-    TimeRaw { text: String },
-    UserHost { user: String, host: String, id: u64 },
-    QueryTime { qt: f32, extra: bool, thread_id: u64 },
-    PerconaThread { id: u64, schema: String },
-    UseDb { db: String },
-    SetTimestamp { ts: u32 },
-    Statement { text: String, terminated: bool },
-    Banner { major: u8 },
+    TimeOld {
+        ts: u32,
+    },
+    TimeRfc3339 {
+        ts: u32,
+        micros: u32,
+    },
+    TimeRaw {
+        text: String,
+    },
+    UserHost {
+        user: String,
+        host: String,
+        id: u64,
+    },
+    QueryTime {
+        qt: f32,
+        extra: bool,
+        thread_id: u64,
+    },
+    PerconaThread {
+        id: u64,
+        schema: String,
+    },
+    UseDb {
+        db: String,
+    },
+    SetTimestamp {
+        ts: u32,
+    },
+    Statement {
+        text: String,
+        terminated: bool,
+    },
+    Banner {
+        major: u8,
+    },
     ColumnHeader,
-    AdminCommand { cmd: String },
+    AdminCommand {
+        cmd: String,
+    },
     BlankLine,
-    RawLine { text: String },
+    RawLine {
+        text: String,
+    },
 }
 
 #[derive(Arbitrary, Debug)]
@@ -69,9 +100,15 @@ fn render(plan: &Plan) -> Vec<u8> {
                 out.push('\n');
             }
             Piece::UserHost { user, host, id } => {
-                out.push_str(&format!("# User@Host: {user}[{user}] @ {host} []  Id: {id}\n"));
+                out.push_str(&format!(
+                    "# User@Host: {user}[{user}] @ {host} []  Id: {id}\n"
+                ));
             }
-            Piece::QueryTime { qt, extra, thread_id } => {
+            Piece::QueryTime {
+                qt,
+                extra,
+                thread_id,
+            } => {
                 if *extra {
                     out.push_str(&format!(
                         "# Query_time: {qt} Lock_time: 0.000045 Rows_sent: 1 Rows_examined: 1 Thread_id: {thread_id} Errno: 0 Killed: 0\n"
@@ -83,7 +120,9 @@ fn render(plan: &Plan) -> Vec<u8> {
                 }
             }
             Piece::PerconaThread { id, schema } => {
-                out.push_str(&format!("# Thread_id: {id}  Schema: {schema}  QC_hit: No\n"));
+                out.push_str(&format!(
+                    "# Thread_id: {id}  Schema: {schema}  QC_hit: No\n"
+                ));
             }
             Piece::UseDb { db } => {
                 out.push_str(&format!("use {db};\n"));

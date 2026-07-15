@@ -112,7 +112,14 @@ fuzz_target!(|data: &[u8]| {
     // A /*! ... */ prefix with content is deliberately absent: MySQL
     // executes conditional-comment contents, so it is not
     // classification-invariant (only the empty "/*! */" is).
-    for prefix in ["/*x*/ ", "/* update */ ", "/*! */ ", "  \t\n", "-- c\n", "# c\n"] {
+    for prefix in [
+        "/*x*/ ",
+        "/* update */ ",
+        "/*! */ ",
+        "  \t\n",
+        "-- c\n",
+        "# c\n",
+    ] {
         let padded = format!("{prefix}{s}");
         assert_eq!(
             classify(&padded),
