@@ -13,12 +13,14 @@ hdrhistogram = { version = "7.5.4", default-features = false }
 # already pull it in, so this adds no new C build requirements.
 libc = "0.2"
 mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "time"] }
+pcap-parser = "0.17.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 time = { version = "0.3.53", features = ["parsing", "formatting", "macros"] }
 tokio = { version = "1.52.3", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+xxhash-rust = { version = "0.8.17", features = ["xxh3"] }
 zstd = "0.13.3"
 
 [dev-dependencies]

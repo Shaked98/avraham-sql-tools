@@ -21,14 +21,24 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Parse a MySQL slow query log (legacy YYMMDD or modern RFC 3339
-    /// dialect) into a compressed replay file
+    /// dialect) or a tcpdump pcap file into a compressed replay file
     Capture {
-        /// Slow query log to parse (produce it with long_query_time=0)
+        /// Slow query log to parse (produce it with long_query_time=0), or
+        /// a pcap/pcap-ng file recorded with tcpdump (auto-detected by
+        /// magic bytes; see --format)
         #[arg(long)]
         input: PathBuf,
         /// Output capture file (zstd-compressed JSONL)
         #[arg(long)]
         out: PathBuf,
+        /// Input format: `auto` detects pcap files by magic bytes and
+        /// treats everything else as a slow log
+        #[arg(long, default_value = "auto", value_parser = ["auto", "slowlog", "pcap"])]
+        format: String,
+        /// MySQL server port to decode in a pcap input (plaintext protocol
+        /// only; TLS and compressed connections are skipped and counted)
+        #[arg(long, default_value_t = sql_replay::pcap::DEFAULT_MYSQL_PORT)]
+        port: u16,
         /// Override the auto-detected source dialect label (e.g. mysql-5.7)
         #[arg(long)]
         dialect: Option<String>,
@@ -193,10 +203,21 @@ fn main() -> Result<()> {
         Cmd::Capture {
             input,
             out,
+            format,
+            port,
             dialect,
         } => {
             let t0 = Instant::now();
-            let summary = sql_replay::capture::run_capture(&input, &out, dialect.as_deref())?;
+            let is_pcap = match format.as_str() {
+                "pcap" => true,
+                "slowlog" => false,
+                _ => sql_replay::pcap::looks_like_pcap(&input),
+            };
+            let summary = if is_pcap {
+                sql_replay::capture::run_capture_pcap(&input, &out, port, dialect.as_deref())?
+            } else {
+                sql_replay::capture::run_capture(&input, &out, dialect.as_deref())?
+            };
             println!(
                 "captured {} events / {} sessions / {} fingerprints (dialect: {}, \
                  admin commands ignored: {}) in {:.2}s -> {}",
@@ -208,6 +229,29 @@ fn main() -> Result<()> {
                 t0.elapsed().as_secs_f64(),
                 out.display(),
             );
+            if let Some(p) = &summary.pcap {
+                println!(
+                    "pcap: {} packets, {} connections ({} decoded, {} TLS-skipped, \
+                     {} compressed-skipped, {} mid-stream-skipped, {} broken); \
+                     prepared statements: {} expanded, {} inexpandable; \
+                     {} responses missing; server version(s): {}",
+                    p.packets,
+                    p.connections,
+                    p.connections_decoded,
+                    p.connections_tls_skipped,
+                    p.connections_compressed_skipped,
+                    p.connections_midstream_skipped,
+                    p.connections_broken,
+                    p.statements_expanded,
+                    p.statements_inexpandable,
+                    p.responses_missing,
+                    if p.server_versions.is_empty() {
+                        "none seen".to_string()
+                    } else {
+                        p.server_versions.join(", ")
+                    },
+                );
+            }
         }
         Cmd::Replay {
             capture,

@@ -125,6 +125,7 @@ pub fn write_capture(path: &Path, events: &[Event]) {
         session_count: sessions.len() as u64,
         admin_commands_ignored: 0,
         server_restarts_seen: 0,
+        pcap: None,
         fingerprints: (0..=max_fp)
             .map(|id| FingerprintEntry {
                 id,
@@ -168,6 +169,7 @@ pub fn generate_capture(path: &Path, sessions: u64, events_per_session: u64, fp_
         session_count: sessions,
         admin_commands_ignored: 0,
         server_restarts_seen: 0,
+        pcap: None,
         fingerprints: (0..fp_count)
             .map(|id| FingerprintEntry {
                 id,

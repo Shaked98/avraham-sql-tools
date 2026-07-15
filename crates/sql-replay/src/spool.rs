@@ -412,6 +412,7 @@ mod tests {
             session_count: sessions.len() as u64,
             admin_commands_ignored: 0,
             server_restarts_seen: 0,
+            pcap: None,
             fingerprints: vec![FingerprintEntry {
                 id: 0,
                 text: "select ?".to_string(),
