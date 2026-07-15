@@ -436,6 +436,29 @@ fn tls_connection_is_counted_in_summary() {
 }
 
 #[test]
+fn sink_error_stops_the_scan_and_propagates() {
+    let mut w = PcapWriter::new(MAGIC_MICROS, LINKTYPE_ETHERNET);
+    let mut c = Conn::new(&mut w, 9, 40_009);
+    c.handshake(T0, "8.0.36", 71, "app", "shop");
+    c.client_pkt(T0 + 1_000, ACK, &com_query("SELECT 1"));
+    c.server_pkt(T0 + 2_000, ACK, &ok_packet(1));
+    c.client_pkt(T0 + 3_000, ACK, &com_query("SELECT 2"));
+    c.server_pkt(T0 + 4_000, ACK, &ok_packet(1));
+    c.close(T0 + 5_000);
+    let pcap_path = tmp("sink-err.pcap");
+    w.write(&pcap_path);
+
+    let mut calls = 0;
+    let err = sql_replay::pcap::scan_pcap_file(&pcap_path, 3306, |_sid, _ev| {
+        calls += 1;
+        Err(anyhow::anyhow!("disk full"))
+    })
+    .expect_err("sink error must propagate");
+    assert!(err.to_string().contains("disk full"));
+    assert_eq!(calls, 1, "no events delivered after the sink failed");
+}
+
+#[test]
 fn not_a_pcap_file_errors_and_slowlog_detection_works() {
     let path = tmp("not-a.pcap");
     std::fs::write(&path, b"# Time: 2023-09-01T12:00:00.000000Z\n").expect("write");

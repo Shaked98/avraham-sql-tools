@@ -372,11 +372,23 @@ impl PcapEngine {
             self.stats.truncated_packets += 1;
         }
 
-        // A fresh SYN on a finished (tombstoned) 4-tuple means the port
-        // pair is being reused for a new connection.
+        // A fresh SYN on a known 4-tuple means the port pair is being
+        // reused for a new connection: drop a finished tombstone, and
+        // finalize an unfinished predecessor whose close was never
+        // captured (flushing its in-flight events and counting its
+        // disposition) so the new connection doesn't inherit its decoder
+        // state. A retransmitted SYN of the current connection (same ISN)
+        // is not a new connection.
         let fresh_syn = seg.syn && !seg.ack && dir == Dir::Client;
-        if fresh_syn && self.conns.get(&key).is_some_and(|c| c.finished) {
-            self.conns.remove(&key);
+        if fresh_syn {
+            let syn_retransmit = self.conns.get(&key).is_some_and(|c| {
+                !c.finished && c.c2s.started && c.c2s.isn == seg.seq.wrapping_add(1)
+            });
+            if !syn_retransmit {
+                if let Some(mut old) = self.conns.remove(&key) {
+                    self.finalize(&mut old, sink);
+                }
+            }
         }
 
         let conn = match self.conns.entry(key) {
@@ -715,17 +727,23 @@ pub fn scan_pcap_file(
     // ts offset in seconds).
     let mut ng_ifaces: Vec<(i32, u64, i64)> = Vec::new();
 
-    let mut sink_err: Option<anyhow::Error> = None;
+    let sink_err: std::cell::RefCell<Option<anyhow::Error>> = std::cell::RefCell::new(None);
     {
         let mut sink = |sid: u64, ev: ProtoEvent| {
-            if sink_err.is_none() {
+            if sink_err.borrow().is_none() {
                 if let Err(e) = on_event(sid, ev) {
-                    sink_err = Some(e);
+                    *sink_err.borrow_mut() = Some(e);
                 }
             }
         };
 
         loop {
+            // A sink failure (e.g. the output file's disk is full) is
+            // fatal; stop decoding instead of scanning the rest of the
+            // capture.
+            if sink_err.borrow().is_some() {
+                break;
+            }
             match reader.next() {
                 Ok((offset, block)) => {
                     match block {
@@ -797,9 +815,11 @@ pub fn scan_pcap_file(
                 Err(e) => bail!("malformed pcap file {}: {e:?}", path.display()),
             }
         }
-        engine.finish(&mut sink);
+        if sink_err.borrow().is_none() {
+            engine.finish(&mut sink);
+        }
     }
-    if let Some(e) = sink_err {
+    if let Some(e) = sink_err.into_inner() {
         return Err(e);
     }
     Ok(engine.stats)
@@ -1157,6 +1177,61 @@ mod tests {
         assert_eq!(d.events[1].0, 78);
         assert_eq!(d.engine.stats.connections, 2);
         assert_eq!(d.engine.stats.connections_decoded, 2);
+    }
+
+    #[test]
+    fn fresh_syn_on_unfinished_connection_finalizes_it_and_starts_anew() {
+        let mut d = Driver::new();
+        d.handshake();
+        d.client_pkt(ACK, &com_query("SELECT 1"));
+        // Neither the response nor any FIN/RST was captured; the client
+        // reconnects on the same port pair.
+        d.c_seq = 90_000;
+        d.s_seq = 40_000;
+        d.client_pkt(SYN, b"");
+        d.server_pkt(SYNACK, b"");
+        let g = greeting_payload("8.0.36", 78);
+        d.server_pkt(ACK, &g);
+        let l = login_payload("app", "shop");
+        d.client_pkt(ACK, &l);
+        d.server_pkt(ACK, &ok_packet(2));
+        d.client_pkt(ACK, &com_query("SELECT 2"));
+        d.server_pkt(ACK, &ok_packet(1));
+        d.finish();
+
+        assert_eq!(d.events.len(), 2);
+        assert_eq!(d.events[0].0, 77);
+        assert_eq!(d.events[0].1.query, "SELECT 1");
+        assert!(!d.events[0].1.response_seen);
+        assert_eq!(d.events[1].0, 78, "new session under the new thread id");
+        assert_eq!(d.events[1].1.query, "SELECT 2");
+        assert!(d.events[1].1.response_seen);
+        assert_eq!(d.engine.stats.connections, 2);
+        assert_eq!(d.engine.stats.connections_decoded, 2);
+        assert_eq!(d.engine.stats.responses_missing, 1);
+    }
+
+    #[test]
+    fn retransmitted_syn_is_not_a_new_connection() {
+        let mut d = Driver::new();
+        let isn = d.c_seq;
+        d.client_pkt(SYN, b"");
+        d.c_seq = isn; // same ISN: a retransmit, not a reconnect
+        d.client_pkt(SYN, b"");
+        d.server_pkt(SYNACK, b"");
+        let g = greeting_payload("8.0.36", 77);
+        d.server_pkt(ACK, &g);
+        let l = login_payload("app", "shop");
+        d.client_pkt(ACK, &l);
+        d.server_pkt(ACK, &ok_packet(2));
+        d.client_pkt(ACK, &com_query("SELECT 1"));
+        d.server_pkt(ACK, &ok_packet(1));
+        d.finish();
+
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.engine.stats.connections, 1);
+        assert_eq!(d.engine.stats.connections_decoded, 1);
+        assert_eq!(d.engine.stats.responses_missing, 0);
     }
 
     #[test]

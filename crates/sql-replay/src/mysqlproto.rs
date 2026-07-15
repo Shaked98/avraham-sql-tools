@@ -506,6 +506,13 @@ impl ConnDecoder {
     }
 
     fn on_command(&mut self, pkt: LogicalPacket) {
+        // A command with nothing in flight means the previous response is
+        // over: drop its continuation seq, or a multi-packet command whose
+        // resp_seq collides with it would have its response start swallowed
+        // as a continuation.
+        if self.pending.is_empty() {
+            self.server_cont_seq = None;
+        }
         // The response to this command starts at the command's last packet
         // seq + 1 (seq ids run per command/response cycle).
         let resp_seq = pkt.last_seq.wrapping_add(1);
@@ -1608,10 +1615,10 @@ mod tests {
         assert_eq!(s.events[2].ts_micros, first_ts);
     }
 
-    #[test]
-    fn multi_packet_payload_joins_continuations() {
-        let mut s = Session::established(0);
-        // Build a logical COM_QUERY payload of exactly 0xffffff + 10 bytes.
+    /// A COM_QUERY whose logical payload is exactly 0xffffff + 10 bytes,
+    /// split into two wire packets (seqs 0 and 1). Its response starts at
+    /// seq 2.
+    fn two_packet_com_query() -> Vec<u8> {
         let text_len = 0xff_ffff - 1 + 10; // minus command byte
         let mut text = b"SELECT '".to_vec();
         text.extend(std::iter::repeat_n(b'x', text_len - 9));
@@ -1625,17 +1632,34 @@ mod tests {
         wire.extend_from_slice(&payload[..0xff_ffff]);
         wire.extend_from_slice(&[10, 0, 0, 1]); // len 10, seq 1
         wire.extend_from_slice(&payload[0xff_ffff..]);
-        s.client(&wire);
+        wire
+    }
+
+    #[test]
+    fn multi_packet_payload_joins_continuations() {
+        let mut s = Session::established(0);
+        s.client(&two_packet_com_query());
         s.server(&ok_packet(2)); // response seq continues after seq 1
-                                 // seq-2 response start is tolerated? No: responses start at the
-                                 // command's last seq + 1. Feed a fresh seq-1 OK instead if the
-                                 // above was ignored.
-        if s.events.is_empty() {
-            s.server(&ok_packet(1));
-        }
         assert_eq!(s.events.len(), 1);
-        assert_eq!(s.events[0].query.len(), payload.len() - 1);
+        assert_eq!(s.events[0].query.len(), 0xff_ffff + 10 - 1);
         assert!(s.events[0].query.starts_with("SELECT 'xxx"));
+    }
+
+    #[test]
+    fn multi_packet_command_after_completed_response() {
+        let mut s = Session::established(0);
+        s.client(&com_query("SELECT 1"));
+        s.server(&ok_packet(1));
+        assert_eq!(s.events.len(), 1);
+        // The finished response's continuation seq would be 2 — exactly
+        // where this two-packet command's response starts. It must be
+        // matched as a response start, not swallowed as a continuation.
+        s.client(&two_packet_com_query());
+        s.server(&ok_packet(2));
+        assert_eq!(s.events.len(), 2);
+        assert!(s.events[1].response_seen);
+        s.finish();
+        assert_eq!(s.dec.stats.responses_missing, 0);
     }
 
     #[test]
