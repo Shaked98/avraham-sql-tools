@@ -242,9 +242,14 @@ impl Spool {
             if !filters.matches(&event) {
                 return Ok(());
             }
-            let s = sessions
-                .get_mut(&event.session_id)
-                .expect("session seen in pass A");
+            let Some(s) = sessions.get_mut(&event.session_id) else {
+                bail!(
+                    "capture {} changed while being spooled (session {} appeared \
+                     between passes)",
+                    capture_path.display(),
+                    event.session_id
+                );
+            };
             let rec = encode_record(&event)?;
             file.write_all_at(&rec, s.write_pos)
                 .context("cannot write to the replay spool file")?;

@@ -72,6 +72,9 @@ $ sql-replay replay \
   uncompressed capture size — `--spool-dir` picks where), and each session
   reads its own events one at a time. A 5M-event / 20k-session replay peaks
   around ~35 MiB of RSS; memory scales with session count, not event count.
+  Note the default spool location is the system temp dir, which is tmpfs
+  (RAM-backed) on some distros — point `--spool-dir` at real disk there,
+  or the spool itself occupies memory.
 - If the connection cap cannot fit under the process's open-files limit,
   replay fails up front with the `ulimit -n` / systemd `LimitNOFILE=` value
   to raise.
@@ -137,10 +140,11 @@ $ sql-replay replay --capture capture.jsonl.zst --url mysql://... \
   seconds, start-inclusive / end-exclusive, either side optional. Excluded
   events are counted in `totals.filtered`; the pacing origin becomes the
   earliest *included* timestamp. Filtering everything is an error.
-- **Graceful abort:** on Ctrl-C, in-flight queries finish, everything not
-  yet attempted is counted as `not_run`, and the partial `run.json` is
-  still written with `"aborted": true` (exit code 130; a second Ctrl-C
-  exits immediately). `compare` warns when fed an aborted run.
+- **Graceful abort:** on Ctrl-C or SIGTERM (what systemd sends on stop),
+  in-flight queries finish, everything not yet attempted is counted as
+  `not_run`, and the partial `run.json` is still written with
+  `"aborted": true` (exit code 130; a second Ctrl-C or SIGTERM exits
+  immediately). `compare` warns when fed an aborted run.
 - `--pool N` multiplexes sessions over a bounded pool of N connections,
   checked out per query, for captures whose session counts exceed
   practical connection counts (conflicts with `--max-connections`). This
@@ -210,8 +214,11 @@ file runs on RHEL 8 (and Rocky/Alma/Oracle 8+) database hosts as-is.
   runs the test suite, builds the musl binary, verifies it is static,
   packages tarball + RPM, and attaches them with checksums.
 - Operationally: the spool needs disk roughly the uncompressed capture
-  size (`--spool-dir` to place it), and the connection cap must fit under
-  `ulimit -n` (replay checks and tells you the value to raise it to).
+  size — use `--spool-dir` to place it, especially where the default
+  system temp dir is tmpfs (RAM-backed) — and the connection cap must fit
+  under `ulimit -n` (replay checks and tells you the value to raise it
+  to). Under systemd, stopping the unit (SIGTERM) aborts gracefully and
+  still writes the partial `run.json`.
 
 ### Building & testing
 

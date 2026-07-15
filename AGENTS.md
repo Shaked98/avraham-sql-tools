@@ -129,7 +129,8 @@ is tested without a database. Replay-side filters (`--filter-db/user`,
 so captures stay complete reusable artifacts. `--pool N` checks
 connections out per query (session state fidelity is documented as lost;
 captured USE is skipped, per-event db metadata reconciles instead).
-Graceful abort is a `watch::Receiver<bool>` threaded through sessions;
+Graceful abort is a `watch::Receiver<bool>` threaded through sessions
+(SIGINT and SIGTERM both trigger it — systemd stops units with SIGTERM);
 `--warmup`/`--repeat` rerun passes over the same spool and
 `aggregate.rs` does the median math.
 
@@ -157,7 +158,7 @@ Exit codes: 0 no regression, 2 regression ≥ threshold (`EXIT_REGRESSED`),
 1 tool error — CI gates on this. Older run.json files still load: every
 field added after M1 (`pacing`, `target_settings`, and the M3 `aborted`/
 `aggregation`/`filtered`/flag fields) is `#[serde(default)]`, keep it
-that way. An aborted (Ctrl-C) replay exits 130 after writing partial
+that way. An aborted (Ctrl-C/SIGTERM) replay exits 130 after writing partial
 reports; `compare` warns when an input run is `aborted`. Target settings are read with
 `SHOW VARIABLES LIKE` (returns no row instead of erroring on unknown
 variables); the 5.7 `tx_isolation` / 8.0 `transaction_isolation` rename is

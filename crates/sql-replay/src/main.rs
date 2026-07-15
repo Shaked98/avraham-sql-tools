@@ -101,7 +101,9 @@ enum Cmd {
         #[arg(long, conflicts_with = "max_connections", value_parser = clap::value_parser!(u32).range(1..))]
         pool: Option<u32>,
         /// Directory for the replay spool file (roughly the uncompressed
-        /// capture size; default: the system temp dir)
+        /// capture size; default: the system temp dir). On distros where
+        /// the temp dir is tmpfs (RAM-backed), point this at real disk to
+        /// keep replay memory bounded
         #[arg(long)]
         spool_dir: Option<PathBuf>,
     },

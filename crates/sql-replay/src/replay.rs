@@ -1165,22 +1165,48 @@ pub async fn run_replay_with_shutdown(
     run_replay_with_target(capture_path, &options, target, info, shutdown).await
 }
 
-/// Replay with Ctrl-C wired to a graceful abort: in-flight queries finish,
-/// everything else is recorded as not-run, and the (partial) report is
-/// still produced with `aborted: true`. A second Ctrl-C exits immediately.
+/// Waits for Ctrl-C; never resolves if the handler cannot be installed.
+async fn wait_ctrl_c() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Waits for the next SIGTERM on an optional stream; never resolves if the
+/// handler is absent or the stream ends.
+async fn wait_sigterm(sig: &mut Option<tokio::signal::unix::Signal>) {
+    if let Some(sig) = sig {
+        if sig.recv().await.is_some() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// Replay with Ctrl-C and SIGTERM wired to a graceful abort: in-flight
+/// queries finish, everything else is recorded as not-run, and the
+/// (partial) report is still produced with `aborted: true`. A second
+/// Ctrl-C or SIGTERM exits immediately. SIGTERM matters because systemd
+/// (the documented RHEL 8 deployment) stops units with it.
 pub async fn run_replay(capture_path: &Path, options: ReplayOptions) -> Result<ReplayOutcome> {
     let (tx, rx) = watch::channel(false);
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!(
-                "\nreceived Ctrl-C: finishing in-flight queries and writing a partial \
-                 report (press Ctrl-C again to exit immediately)"
-            );
-            let _ = tx.send(true);
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        let received = tokio::select! {
+            _ = wait_ctrl_c() => "Ctrl-C",
+            _ = wait_sigterm(&mut sigterm) => "SIGTERM",
+        };
+        eprintln!(
+            "\nreceived {received}: finishing in-flight queries and writing a partial \
+             report (a second Ctrl-C or SIGTERM exits immediately)"
+        );
+        let _ = tx.send(true);
+        tokio::select! {
+            _ = wait_ctrl_c() => {},
+            _ = wait_sigterm(&mut sigterm) => {},
         }
-        if tokio::signal::ctrl_c().await.is_ok() {
-            std::process::exit(130);
-        }
+        std::process::exit(130);
     });
     run_replay_with_shutdown(capture_path, options, rx).await
 }
