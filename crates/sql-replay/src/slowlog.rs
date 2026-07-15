@@ -482,7 +482,9 @@ fn parse_time_value(s: &str) -> Option<(i64, Dialect)> {
 
 /// Parse a `use <db>;` metadata line.
 fn parse_use_line(t: &str) -> Option<String> {
-    if t.len() < 5 || !t[..4].eq_ignore_ascii_case("use ") {
+    // Compare as bytes: slicing the str could split a multi-byte char
+    // (e.g. a statement line starting `INS€RT`) and panic.
+    if t.len() < 5 || !t.as_bytes()[..4].eq_ignore_ascii_case(b"use ") {
         return None;
     }
     let mut db = t[4..].trim().trim_end_matches(';').trim().to_string();
@@ -500,7 +502,11 @@ fn parse_use_line(t: &str) -> Option<String> {
 /// Parse a `SET timestamp=N;` metadata line into epoch microseconds.
 fn parse_set_timestamp(t: &str) -> Option<i64> {
     const PREFIX: &str = "set timestamp=";
-    if t.len() <= PREFIX.len() || !t[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+    // Byte comparison for the same reason as parse_use_line: a multi-byte
+    // char straddling the prefix boundary must not panic the slice.
+    if t.len() <= PREFIX.len()
+        || !t.as_bytes()[..PREFIX.len()].eq_ignore_ascii_case(PREFIX.as_bytes())
+    {
         return None;
     }
     let v = t[PREFIX.len()..].trim_end_matches(';').trim();
@@ -717,6 +723,23 @@ SELECT 2;
         let (qs, _, _) = parse_all(log);
         assert_eq!(qs[0].ts_micros, 1_693_569_601_000_000);
         assert_eq!(qs[1].ts_micros, 1_693_569_601_000_000);
+    }
+
+    #[test]
+    fn multibyte_chars_straddling_prefix_boundaries_do_not_panic() {
+        // A multi-byte char across byte 4 (`use ` check) or byte 14
+        // (`set timestamp=` check) used to panic the str slice.
+        assert_eq!(parse_use_line("INS€RT INTO t"), None);
+        assert_eq!(parse_set_timestamp("select 'ステータス' from t"), None);
+        let log = "\
+# User@Host: u[u] @ h []  Id: 1
+# Query_time: 0.1  Lock_time: 0.0 Rows_sent: 1  Rows_examined: 1
+SET timestamp=100;
+select 'ステータス変更' as ラベル;
+";
+        let (qs, _, _) = parse_all(log);
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].query, "select 'ステータス変更' as ラベル");
     }
 
     #[test]
