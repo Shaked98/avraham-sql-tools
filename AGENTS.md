@@ -103,7 +103,9 @@ Non-obvious cases handled there: `SET GLOBAL`/`PERSIST`/`SET PASSWORD`/
 is a write (plain `EXPLAIN`/`DESCRIBE` stay reads); `SELECT ... INTO
 OUTFILE`/`DUMPFILE` writes files on the server; `WITH` is classified by the
 first top-level verb after the CTEs; multi-statement text (a top-level `;`
-followed by more content) is always a write.
+followed by more content) is always a write; MySQL executes
+`/*! ... */` version-conditional comments, so their contents are
+classified as real content (only ordinary comments are inert).
 
 ## Replay ingestion is streamed — keep it that way (M3)
 

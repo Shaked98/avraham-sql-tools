@@ -14,7 +14,7 @@ the crate itself stays on stable and never depends on it).
 | `slowlog_parse` | `slowlog::SlowLogParser`, fed arbitrary bytes exactly the way `capture::run_capture` feeds it | emitted queries are never empty; `finish()` never emits twice |
 | `slowlog_structured` | same parser, but inputs are assembled from realistic building blocks (headers in any order, restart banners, fuzzed statements, CRLF, truncation at an arbitrary byte = rotation seam) | reaches header/state interactions raw bytes rarely hit |
 | `fingerprint` | `fingerprint::fingerprint` on arbitrary SQL-ish strings | metamorphic: ASCII case and leading/trailing whitespace never change the class |
-| `classify` | `classify::classify` (the `--allow-writes` gate) on arbitrary statements | appending `;DROP TABLE …` at top level must classify Write (checked against an independently written lexer); comment/whitespace prefixes never flip the gate |
+| `classify` | `classify::classify` (the `--allow-writes` gate) on arbitrary statements | appending `;DROP TABLE …` at top level must classify Write (checked against an independently written lexer); inert comment/whitespace prefixes never flip the gate (non-empty `/*! … */` prefixes are excluded — MySQL executes their contents, so they legitimately change the class) |
 | `capture_reader` | `format::stream_capture` on corrupted zstd-JSONL (both raw bytes and valid-zstd-wrapped fuzzed JSONL) | every failure is an `Err`, never a panic |
 
 ## Running
@@ -56,7 +56,10 @@ keep the minimized input as a regression test or seed once fixed.
   `crates/sql-replay/tests/corpus_test.rs` (event counts and metadata, so
   nothing is silently dropped), and the files double as `slowlog_parse`
   seeds in the smoke workflow. New adversarial log shapes belong there,
-  *with* a test; fuzz-only seeds belong in `seeds/`.
+  *with* a test; fuzz-only seeds belong in `seeds/`. Corpus files are
+  byte-exact (some deliberately carry CRLF or invalid UTF-8); the
+  directory's `.gitattributes` marks `*.log -text` so git never
+  normalizes them.
 
 ## CI
 
