@@ -255,9 +255,9 @@ impl RunReport {
         }
         if self.is_recorded() {
             out.push_str(
-                "Latencies: server-side Query_time recorded in the production slow log \
-                 (no replay target; the log carries no error information, so errors are \
-                 0 by definition)\n",
+                "Latencies: recorded in the source capture (slow-log Query_time, or \
+                 request→response wire time for pcap captures; no replay target — the \
+                 capture carries no error information, so errors are 0 by definition)\n",
             );
         } else {
             out.push_str(&format!(

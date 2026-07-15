@@ -20,8 +20,10 @@ size, thousands of concurrent sessions, warmup/repeat/filter/abort
 controls, an optional connection pool) and deployable on RHEL 8 (static
 musl binary, RPM spec, release workflow). 0.2.0 added `baseline`: build
 the baseline report from the capture's *recorded* production latencies
-when the source server cannot be replayed against. Planned next: pcap
-capture (M4).
+when the source server cannot be replayed against. M4 (0.3.0, the final
+planned milestone) added a second capture source — **pcap network
+captures** recorded with plain tcpdump — and **result-correctness
+diffing** (`replay --checksum` + a correctness section in `compare`).
 
 ### Capturing load on the source server
 
@@ -54,6 +56,69 @@ JSONL: a header record, one event per query
 (`ts_micros`, `session_id`, `user`, `db`, `query`, `orig_query_time_s`,
 `fingerprint_id`), and a summary record with the fingerprint table
 (pt-query-digest-style normalized query classes).
+
+### Capturing from the wire instead (pcap)
+
+When the slow log can't be enabled (permissions, log-volume concerns, a
+managed instance), `capture` can read a **tcpdump network capture** of the
+MySQL traffic instead. Record on the database host (or anywhere on the
+plaintext path between clients and server):
+
+```console
+$ # 60 seconds of production traffic, full packets (-s 0 is required —
+$ # snaplen-truncated packets break statement decoding and are counted):
+$ sudo timeout 60 tcpdump -i any port 3306 -w traffic.pcap -s 0
+$ # or bound by file size instead: -C 1000 -W 1 caps it at ~1 GB
+```
+
+then convert it exactly like a slow log — pcap files are detected by
+magic bytes (`--format pcap` forces it; `--port` for non-3306 servers):
+
+```console
+$ sql-replay capture --input traffic.pcap --out capture.jsonl.zst
+captured 17 events / 4 sessions / 9 fingerprints (dialect: pcap:8.0.36, admin commands ignored: 0) in 0.01s -> capture.jsonl.zst
+pcap: 196 packets, 4 connections (4 decoded, 0 TLS-skipped, 0 compressed-skipped, 0 mid-stream-skipped, 0 broken); prepared statements: 7 expanded, 0 inexpandable; 0 responses missing; server version(s): 8.0.36
+```
+
+The output is the *same* capture format the slow-log path emits — replay,
+baseline, and compare don't care which source it came from. Legacy pcap
+(micro- and nanosecond) and pcap-ng files both work, as do `-i any`
+captures (Linux SLL/SLL2), VLAN-tagged ethernet, IPv6, out-of-order and
+retransmitted segments.
+
+What the wire gives you that the slow log can't:
+
+- **True arrival timestamps.** Each event's timestamp is the request
+  packet's pcap timestamp, so `--speed 1.0` replay reproduces the exact
+  wire concurrency (slow logs only record query *completion* times).
+- **Recorded latency for free:** the request→first-response gap is stored
+  as the event's original latency, so `sql-replay baseline` works on pcap
+  captures too. Note the measurement point: this is server processing
+  *plus* the network path between capture point and server (capturing on
+  the DB host itself makes that gap ≈ server time), whereas the slow
+  log's `Query_time` is purely server-side.
+- **Prepared statements** (binary protocol) are decoded and expanded into
+  replayable SQL text with the bound parameter values interpolated —
+  best-effort for standard types; executions that can't be expanded
+  (statement prepared before the capture started, exotic parameter
+  encodings) are counted and reported, never silently dropped.
+
+Honest limits — every one of these is *counted* in the capture summary
+(`summary.pcap` in the file, warnings on stderr), never silent:
+
+- **TLS traffic is opaque and unsupported.** A connection that negotiates
+  TLS is skipped and counted; capture on a plaintext segment or disable
+  TLS for the capture window. Compressed-protocol connections are
+  likewise skipped and counted.
+- Connections whose handshake predates the capture start (mid-stream) are
+  skipped and counted — the decoder can't join a binary stream midway.
+  Statements still in flight when the capture ends get latency 0 and a
+  `responses_missing` count.
+- Overhead: tcpdump itself costs a few percent CPU under high packet
+  rates, and the pcap file grows with *traffic volume* (result sets
+  included), not query count — bound the capture with `timeout`/`-C`. The
+  slow-log path costs the server less on busy read workloads; the pcap
+  path costs zero server *configuration*.
 
 ### Replaying against the target
 
@@ -201,6 +266,58 @@ $ sql-replay compare \
   # non-zero exit fails the job when p95 regressions >= 25% exist
 ```
 
+### Result-correctness diffing (`--checksum`)
+
+A migration can return *wrong answers* long before it returns slow ones —
+collation changes reorder comparisons, sql_mode changes alter implicit
+casts, optimizer bugs drop rows. `replay --checksum` catches that
+(pt-upgrade's data-diff job, at replay concurrency):
+
+```console
+$ sql-replay replay --capture capture.jsonl.zst --url mysql://old:3306/ \
+    --checksum --out run-old.json
+$ sql-replay replay --capture capture.jsonl.zst --url mysql://new:3306/ \
+    --checksum --out run-new.json
+$ sql-replay compare --baseline run-old.json --candidate run-new.json
+```
+
+- Every executed **read** statement's full result set is checksummed:
+  per-row hashes combined **order-insensitively** (a multiset hash — row
+  order and session interleaving never matter; any changed, missing,
+  extra, or duplicated row changes the digest), plus row counts and
+  column names. Memory stays O(1) per result set.
+- run.json stores one aggregate per fingerprint (per-event checksums
+  would bloat reports with millions of events): the multiset hash of the
+  per-event digests, total rows, and column names. Two runs over the same
+  capture and identical data produce equal aggregates no matter how the
+  scheduler interleaved them.
+- `compare` gains a **Result correctness** section: matched fingerprints
+  whose digests diverge are reported separately from latency, and a
+  deterministic divergence sets **exit code 2** just like a latency
+  regression — a wrong answer is worse than a slow one.
+- **Nondeterminism handling:** fingerprints using volatile functions
+  (`NOW()`, `RAND()`, `UUID()`, `LAST_INSERT_ID()`, …), `@@variables`,
+  `information_schema`/`performance_schema` reads, or `LIMIT` with no
+  `ORDER BY` are classified up front and their divergences listed as
+  *advisory* instead of failures (so are fingerprints whose checksummed
+  event counts differ between the runs — those multisets aren't
+  conclusively comparable). The classifier is an honest token scan, not a
+  SQL parser: a column literally named `now` can false-positive, and
+  nondeterminism hidden inside views or stored functions is invisible —
+  such a query can land in the mismatch list even though its data is
+  fine. Read the mismatch list as "investigate", not "guaranteed bug".
+- **Only meaningful against identical data.** Both targets must hold the
+  same snapshot (and both runs must use `--checksum` — `compare` warns
+  when only one side did). Replaying with `--allow-writes` mutates data
+  as it goes; checksums then compare meaningfully only if both runs
+  started from the same snapshot and executed the same writes.
+- **Latency caveat:** checksumming reads every result row fully, so a
+  `--checksum` run's latencies include the full transfer and are **not
+  comparable to a non-checksum run's** (compare warns on that flag
+  mismatch). For a migration gate, either run both sides with
+  `--checksum`, or do two passes: one plain pair for latency, one
+  checksummed pair for correctness.
+
 ### No 5.7 replay target? Use the production-recorded baseline
 
 The classic workflow above replays the same capture against *both*
@@ -290,9 +407,13 @@ test) plus a live replay of a fixture capture against `mysql:5.7` and
 feeds run reports through `sql-replay compare` — including a recorded
 `baseline` built from the fixture capture compared against the live 8.0
 run — and asserts the report shape, the recorded-vs-replayed warning,
-and gate exit codes. A dedicated job builds the static musl binary,
-verifies it is statically linked, and smoke-builds the RPM from
-`packaging/sql-replay.spec`.
+and gate exit codes. The integration job also tcpdumps a real scripted
+workload (binary-protocol prepared statements included) and drives it
+through the full pcap → capture → replay → baseline path, and exercises
+`--checksum` end to end: two replays over identical data must compare
+clean, and a planted `UPDATE` must be detected with exit code 2. A
+dedicated job builds the static musl binary, verifies it is statically
+linked, and smoke-builds the RPM from `packaging/sql-replay.spec`.
 
 ### Real-data verification rig
 

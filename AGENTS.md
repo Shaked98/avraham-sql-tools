@@ -1,10 +1,11 @@
 # avraham-sql-tools — agent notes
 
 Cargo workspace of SQL tooling. First (and so far only) crate:
-`crates/sql-replay`, a MySQL slow-log capture + replay benchmarking tool
-with a `compare` regression gate. See `README.md` for user-facing usage
-and milestone scope (M1 capture/replay, M2 pacing + compare, M3 scale
-hardening + RHEL 8 packaging).
+`crates/sql-replay`, a MySQL slow-log/pcap capture + replay benchmarking
+tool with a `compare` regression gate. See `README.md` for user-facing
+usage and milestone scope (M1 capture/replay, M2 pacing + compare, M3
+scale hardening + RHEL 8 packaging, M4 pcap capture + result-correctness
+diffing — the final planned milestone).
 
 ## Build / test
 
@@ -90,6 +91,69 @@ tests, which are the executable spec):
   are ordinary captured statements.
 - Slow logs can contain invalid UTF-8 inside queries — capture reads raw
   bytes and converts lossily.
+
+## pcap capture source (M4)
+
+Two-module split, deliberately: `crates/sql-replay/src/mysqlproto.rs` is
+the MySQL wire-protocol decoder (packet framing, handshake, COM_QUERY,
+COM_STMT_PREPARE/EXECUTE expansion with bound-parameter interpolation) and
+never sees pcap or TCP; `crates/sql-replay/src/pcap.rs` owns pcap-file
+reading (pure-Rust `pcap-parser`, no libpcap), link/IP parsing, and
+per-4-tuple TCP reassembly. Module docs + tests of both are the spec;
+`tests/pcap_capture_test.rs` builds .pcap files byte-by-byte (never
+requires tcpdump locally). Non-obvious facts baked in:
+
+- Seq-id rule: in the command phase, "client packet with seq 0" is a
+  command; the response to it starts at the command's *last* packet seq +
+  1. Server seq wraparound in >255-packet responses must be treated as
+  continuation, not a new response (that's what `server_cont_seq` does).
+- TLS (CLIENT_SSL) and compression (CLIENT_COMPRESS/zstd) are negotiated
+  in the client handshake response — from then on the stream is opaque;
+  such connections are skipped and *counted* (`Disposition`), as are
+  mid-stream starts (no greeting seen ⇒ BadHandshake). Nothing is ever
+  silently dropped; every loss class lands in `summary.pcap` (a
+  serde-defaulted `format::PcapSummary`) and stderr warnings.
+- The mysql 8.x CLI negotiates CLIENT_QUERY_ATTRIBUTES: COM_QUERY then
+  carries an attribute section before the SQL text that must be skipped.
+- TCP reassembly maps seqs to u64 relative offsets (wraparound and >4 GiB
+  streams); out-of-order data buffers up to 8 MiB per direction, beyond
+  that the connection counts as broken. Session id = server thread id
+  from the greeting (matches the slow-log path); reused thread ids
+  (server restart mid-capture) get synthetic ids ≥ 1<<48.
+- Event latency = request packet → first response packet on the wire
+  (recorded into `orig_query_time_s`, so `baseline` works on pcap
+  captures; it includes the capture-point→server network path, unlike
+  slow-log Query_time — README documents this).
+- CI's pcap leg tcpdumps `-i lo` (docker-proxy publishes the service
+  container port on loopback) and uses `--ssl-mode=DISABLED` on the mysql
+  CLI — without it the connection negotiates TLS and decodes to nothing.
+  `examples/wire_workload.rs` generates the binary-protocol prepared
+  statements (the CLI's text PREPARE never sends COM_STMT_PREPARE).
+
+## Result-correctness diffing (M4)
+
+`replay --checksum` + the `compare` correctness section. Design decisions
+(docs in `target.rs`/`report.rs`/`compare.rs`, tests are the spec;
+`tests/checksum_test.rs` is the mock-target E2E):
+
+- Checksums are **multiset hashes** at two levels: per-row xxh3 hashes
+  combined with commutative sum+xor+count into a per-event digest
+  (`target::ChecksumBuilder`), per-event digests combined the same way
+  into one per-fingerprint aggregate in run.json. Order-insensitive by
+  construction (session interleaving differs between runs) and O(1)
+  memory (the M3 bounded-memory invariant) — that's why it is not a
+  sorted list of row hashes. Duplicate rows don't cancel (sum term).
+- Digests are only comparable between runs of this tool over the text
+  protocol; the canonical cell encoding (`RowHasher`, type-tagged) is
+  ours. The mock target in `tests/common/mod.rs` shares it, with a
+  `data_version` knob to plant a data change.
+- `classify::is_nondeterministic` (fingerprint-text token scan) demotes
+  volatile-function/`@@var`/info-schema/LIMIT-without-ORDER fingerprints to
+  advisory; `--repeat` pass disagreement also marks nondeterministic
+  (aggregate.rs). Deterministic digest divergence sets
+  `correctness_failed` ⇒ exit 2 (same code as latency regressions).
+- A `--checksum` run's latencies include full result reads — compare
+  warns on checksum-flag mismatch and skips the correctness diff.
 
 ## Replay write gate
 

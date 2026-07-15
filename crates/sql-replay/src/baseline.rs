@@ -315,7 +315,7 @@ mod tests {
 
         let table = report.render_table(10);
         assert!(table.contains("Recorded 3 events"));
-        assert!(table.contains("recorded in the production slow log"));
+        assert!(table.contains("recorded in the source capture"));
     }
 
     #[test]
