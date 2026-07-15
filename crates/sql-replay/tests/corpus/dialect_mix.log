@@ -1,0 +1,22 @@
+/usr/sbin/mysqld, Version: 5.6.51-log (MySQL Community Server (GPL)). started with:
+Tcp port: 3306  Unix socket: /tmp/mysql.sock
+Time                 Id Command    Argument
+# Time: 240301 03:00:00
+# User@Host: legacy[legacy] @ h []
+# Thread_id: 501  Schema: percona_db  QC_hit: No
+# Query_time: 1.500000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 10
+SET timestamp=1709262000;
+SELECT legacy_percona FROM t;
+# Time: 240301 03:00:05
+# User@Host: legacy[legacy] @ h []  Id:   502
+# Query_time: 0.500000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709262005;
+SELECT old_56 FROM t;
+/usr/sbin/mysqld, Version: 8.0.36 (MySQL Community Server - GPL). started with:
+Tcp port: 3306  Unix socket: /tmp/mysql.sock
+Time                 Id Command    Argument
+# Time: 2024-03-01T03:10:00.123456Z
+# User@Host: modern[modern] @ h []  Id:   503
+# Query_time: 0.000212 Lock_time: 0.000045 Rows_sent: 1 Rows_examined: 1 Thread_id: 503 Errno: 0 Killed: 0
+SET timestamp=1709262600;
+SELECT new_80 FROM t;

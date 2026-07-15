@@ -1,0 +1,13 @@
+# Time: 2024-03-01T04:00:00.000000Z
+# User@Host: root[root] @ localhost []  Id:   601
+# Query_time: 0.000010  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1709265600;
+# administrator command: Ping;
+# User@Host: root[root] @ localhost []  Id:   601
+# Query_time: 12.500000  Lock_time: 0.500000 Rows_sent: 0  Rows_examined: 100000
+SET timestamp=1709265610;
+ALTER TABLE big ADD COLUMN c INT;
+# User@Host: root[root] @ localhost []  Id:   601
+# Query_time: 0.000010  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1709265620;
+# administrator command: Quit;
