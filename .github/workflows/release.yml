@@ -67,8 +67,10 @@ jobs:
       - name: verify the binary is fully static
         run: |
           BIN="target/$MUSL_TARGET/release/sql-replay"
-          file "$BIN" | grep -q 'statically linked'
-          if ldd "$BIN" 2>&1 | grep -vq 'not a dynamic executable'; then
+          # rustc emits static-PIE for the musl target; file says
+          # "static-pie linked" and ldd says "statically linked".
+          file "$BIN" | grep -Eq 'statically linked|static-pie linked'
+          if ldd "$BIN" 2>&1 | grep -Evq 'not a dynamic executable|statically linked'; then
             echo "binary is not static:"; ldd "$BIN"; exit 1
           fi
           "$BIN" --version
