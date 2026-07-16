@@ -347,12 +347,17 @@ fn encode_record(event: &Event) -> Result<Vec<u8>> {
 /// data reachable through our handle and reclaims it when the last handle
 /// closes, even if the process crashes.
 fn create_unlinked_temp(dir: Option<&Path>) -> Result<File> {
+    // The clock alone is not unique: two spools created in the same process
+    // within one clock tick (e.g. parallel tests) would collide, so a
+    // per-process counter disambiguates them.
+    static SPOOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir: PathBuf = dir
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
     let path = dir.join(format!(
-        "sql-replay-spool-{}-{:x}.tmp",
+        "sql-replay-spool-{}-{}-{:x}.tmp",
         std::process::id(),
+        SPOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
