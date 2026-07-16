@@ -29,9 +29,9 @@ use tokio::sync::{watch, Semaphore};
 use crate::aggregate::aggregate_median;
 use crate::classify::{is_use_statement, should_execute};
 use crate::format::Event;
-use crate::report::ChecksumReport;
 use crate::report::{
-    redact_url, FingerprintReport, PacingReport, ReportFlags, RunReport, SaturationReport, Totals,
+    redact_url, size_bucket_index, ChecksumReport, FingerprintReport, PacingReport, ReportFlags,
+    ResultBytesReport, RunReport, SaturationReport, SizeBucketReport, Totals, SIZE_BUCKET_LABELS,
 };
 use crate::spool::{Filters, Spool, SpoolCursor};
 use crate::target::{MySqlTarget, ResultChecksum, Target, TargetConn};
@@ -306,6 +306,70 @@ struct FpAgg {
     /// Present when the run checksums results and this fingerprint
     /// executed at least one checksummed statement.
     checksum: Option<FpChecksumAgg>,
+    bytes: FpBytesAgg,
+    /// Per-result-size-decade latency sub-populations, allocated lazily —
+    /// a typical fingerprint touches one decade, so this usually costs
+    /// one extra histogram (only multi-size fingerprints, the ones the
+    /// split exists for, pay for more).
+    buckets: [Option<Box<BucketAgg>>; SIZE_BUCKET_LABELS.len()],
+}
+
+/// Running result-set byte stats of one fingerprint: exact total/min/max
+/// (the histogram quantizes) plus a coarse (2 significant digits)
+/// histogram for the percentiles.
+struct FpBytesAgg {
+    hist: Histogram<u64>,
+    total: u64,
+    min: u64,
+    max: u64,
+}
+
+impl Default for FpBytesAgg {
+    fn default() -> Self {
+        FpBytesAgg {
+            hist: Histogram::new_with_bounds(1, 1 << 42, 2)
+                .expect("static histogram bounds are valid"),
+            total: 0,
+            min: u64::MAX,
+            max: 0,
+        }
+    }
+}
+
+impl FpBytesAgg {
+    fn record(&mut self, bytes: u64) {
+        self.hist.saturating_record(bytes);
+        self.total += bytes;
+        self.min = self.min.min(bytes);
+        self.max = self.max.max(bytes);
+    }
+
+    fn report(&self, executed: u64) -> Option<ResultBytesReport> {
+        (executed > 0).then(|| ResultBytesReport {
+            total: self.total,
+            min: self.min,
+            max: self.max,
+            mean: self.total as f64 / executed as f64,
+            p50: self.hist.value_at_quantile(0.50),
+            p95: self.hist.value_at_quantile(0.95),
+        })
+    }
+}
+
+/// Latency histogram of one result-size decade of a fingerprint.
+struct BucketAgg {
+    hist: Histogram<u64>,
+    bytes_total: u64,
+}
+
+impl Default for BucketAgg {
+    fn default() -> Self {
+        BucketAgg {
+            hist: Histogram::new_with_bounds(1, 3_600_000_000, 3)
+                .expect("static histogram bounds are valid"),
+            bytes_total: 0,
+        }
+    }
 }
 
 /// Order-insensitive aggregate of per-event result checksums (see
@@ -377,7 +441,28 @@ impl FpAgg {
             skipped: 0,
             not_run: 0,
             checksum: None,
+            bytes: FpBytesAgg::default(),
+            buckets: Default::default(),
         }
+    }
+
+    fn size_buckets(&self) -> Vec<SizeBucketReport> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let b = b.as_ref()?;
+                Some(SizeBucketReport {
+                    bucket: SIZE_BUCKET_LABELS[i].to_string(),
+                    count: b.hist.len(),
+                    p50_us: b.hist.value_at_quantile(0.50),
+                    p95_us: b.hist.value_at_quantile(0.95),
+                    mean_us: b.hist.mean(),
+                    max_us: b.hist.max(),
+                    bytes_total: b.bytes_total,
+                })
+            })
+            .collect()
     }
 }
 
@@ -397,15 +482,20 @@ impl Metrics {
         f(map.entry(fp).or_insert_with(FpAgg::new));
     }
 
-    fn record_ok(&self, fp: u32, micros: u64, checksum: ChecksumOutcome) {
+    fn record_ok(&self, fp: u32, micros: u64, outcome: ExecOutcome) {
         self.executed.fetch_add(1, Ordering::Relaxed);
         self.with_fp(fp, |agg| {
             agg.executed += 1;
             agg.hist.saturating_record(micros.max(1));
-            if !matches!(checksum, ChecksumOutcome::Off) {
+            agg.bytes.record(outcome.bytes);
+            let bucket =
+                agg.buckets[size_bucket_index(outcome.bytes)].get_or_insert_with(Default::default);
+            bucket.hist.saturating_record(micros.max(1));
+            bucket.bytes_total += outcome.bytes;
+            if !matches!(outcome.checksum, ChecksumOutcome::Off) {
                 agg.checksum
                     .get_or_insert_with(Default::default)
-                    .add(checksum);
+                    .add(outcome.checksum);
             }
         });
     }
@@ -576,6 +666,14 @@ struct PassCtx<T: Target> {
     shutdown: watch::Receiver<bool>,
 }
 
+/// What executing one event produced: the result-set byte count (both
+/// query paths drain rows and count their `target::value_bytes`) plus the
+/// checksum outcome.
+struct ExecOutcome {
+    bytes: u64,
+    checksum: ChecksumOutcome,
+}
+
 /// Execute one event on a connection, checksumming read results when the
 /// pass runs with `--checksum` (writes execute plainly — their "result" is
 /// a state change, not a result set).
@@ -583,14 +681,23 @@ async fn execute_event<C: TargetConn>(
     conn: &mut C,
     query: &str,
     checksum: bool,
-) -> Result<ChecksumOutcome, crate::target::TargetError> {
+) -> Result<ExecOutcome, crate::target::TargetError> {
     if checksum && should_execute(query, false) {
         conn.query_checksum(query).await.map(|cs| match cs {
-            Some(cs) => ChecksumOutcome::Set(cs),
-            None => ChecksumOutcome::NoResult,
+            Some(cs) => ExecOutcome {
+                bytes: cs.bytes_total,
+                checksum: ChecksumOutcome::Set(cs),
+            },
+            None => ExecOutcome {
+                bytes: 0,
+                checksum: ChecksumOutcome::NoResult,
+            },
         })
     } else {
-        conn.query(query).await.map(|()| ChecksumOutcome::Off)
+        conn.query(query).await.map(|bytes| ExecOutcome {
+            bytes,
+            checksum: ChecksumOutcome::Off,
+        })
     }
 }
 
@@ -741,7 +848,7 @@ async fn run_session_dedicated<T: Target, S: EventStream>(
                 if current_db.as_deref() != Some(db) {
                     let stmt = format!("USE `{}`", db.replace('`', "``"));
                     match conn.query(&stmt).await {
-                        Ok(()) => current_db = Some(db.to_string()),
+                        Ok(_) => current_db = Some(db.to_string()),
                         Err(e) => {
                             ctx.metrics
                                 .record_err(ev.fingerprint_id, &format!("USE `{db}`: {e}"));
@@ -760,9 +867,10 @@ async fn run_session_dedicated<T: Target, S: EventStream>(
 
         let t0 = Instant::now();
         match execute_event(&mut conn, &ev.query, ctx.checksum).await {
-            Ok(cs) => ctx
-                .metrics
-                .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64, cs),
+            Ok(outcome) => {
+                ctx.metrics
+                    .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64, outcome)
+            }
             Err(e) => {
                 ctx.metrics.record_err(ev.fingerprint_id, &e.message);
                 if e.fatal {
@@ -855,7 +963,7 @@ async fn run_session_pooled<T: Target, S: EventStream>(
                 if pc.db.as_deref() != Some(db) {
                     let stmt = format!("USE `{}`", db.replace('`', "``"));
                     match pc.conn.query(&stmt).await {
-                        Ok(()) => pc.db = Some(db.to_string()),
+                        Ok(_) => pc.db = Some(db.to_string()),
                         Err(e) => {
                             ctx.metrics
                                 .record_err(ev.fingerprint_id, &format!("USE `{db}`: {e}"));
@@ -874,9 +982,9 @@ async fn run_session_pooled<T: Target, S: EventStream>(
 
         let t0 = Instant::now();
         match execute_event(&mut pc.conn, &ev.query, ctx.checksum).await {
-            Ok(cs) => {
+            Ok(outcome) => {
                 ctx.metrics
-                    .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64, cs);
+                    .record_ok(ev.fingerprint_id, t0.elapsed().as_micros() as u64, outcome);
                 pool.checkin(pc);
             }
             Err(e) => {
@@ -1000,6 +1108,8 @@ async fn run_pass<T: Target, S: EventStream>(
                 .checksum
                 .as_ref()
                 .map(|c| c.report(crate::classify::is_nondeterministic(&fingerprint)));
+            let result_bytes = agg.bytes.report(agg.executed);
+            let size_buckets = agg.size_buckets();
             FingerprintReport {
                 id,
                 fingerprint,
@@ -1014,6 +1124,8 @@ async fn run_pass<T: Target, S: EventStream>(
                 max_us: agg.hist.max(),
                 mean_us: agg.hist.mean(),
                 checksum,
+                result_bytes,
+                size_buckets,
             }
         })
         .collect();

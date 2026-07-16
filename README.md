@@ -84,6 +84,9 @@ when the source server cannot be replayed against. M4 (0.3.0, the final
 planned milestone) added a second capture source — **pcap network
 captures** recorded with plain tcpdump — and **result-correctness
 diffing** (`replay --checksum` + a correctness section in `compare`).
+0.4.0 added **result-set byte stats and size-decade splits** per
+fingerprint, so `compare` can flag a regression that only affects big
+rows instead of averaging it away inside a mixed-size fingerprint.
 
 ### Capturing load on the source server
 
@@ -242,7 +245,8 @@ $ sql-replay replay \
 - `run.json` carries run metadata (target server version, flags, wall
   clock, QPS, saturation) plus per-fingerprint stats (count, errors with a
   first-error sample, skipped/not-run counts, p50/p95/p99/max/mean latency
-  in µs); stdout
+  in µs, and the result-set byte stats described under "Result-set size
+  stats" below); stdout
   gets a top-N slowest-fingerprints table (`--top`, default 10). It also
   records comparability-relevant target settings (`sql_mode`,
   `character_set_server`, `collation_server`, `innodb_buffer_pool_size`,
@@ -348,6 +352,44 @@ $ sql-replay compare \
         --threshold-pct 25 --min-count 10 --json report.json
   # non-zero exit fails the job when p95 regressions >= 25% exist
 ```
+
+### Result-set size stats and size-decade regressions (0.4.0)
+
+Fingerprinting collapses literals, so one fingerprint can hide result
+sizes spanning orders of magnitude — `SELECT body FROM docs WHERE id = ?`
+against a document table fetches 100KB and 15MB rows under the same
+fingerprint, and its p50/p95 mix a 150x payload spread. A regression that
+only hits the big rows used to be averaged away. Replay therefore
+measures result sizes as it drains rows (always on — no flag, no extra
+buffering: rows were already read one at a time, counting their bytes is
+free):
+
+- Each fingerprint in `run.json` carries `result_bytes`
+  (total/min/max/mean exact, p50/p95 from a 2-significant-digit
+  histogram) and `size_buckets`: its latency stats split by
+  **result-size decade** — `<1KB`, `1KB-10KB`, `10KB-100KB`, `100KB-1MB`,
+  `1MB-10MB`, `>=10MB` (binary units, lower bound inclusive). Only
+  non-empty decades are stored; the stdout table shows mean result bytes
+  per query.
+- **Bytes are decoded payload, not wire bytes**: the canonical cell sizes
+  of every drained row (string/blob cells count their byte length,
+  fixed-width numerics their binary width, NULLs zero) — comparable
+  between runs of this tool, not to `Bytes_sent`.
+- `compare` shows per-fingerprint byte columns (a large byte delta means
+  the targets returned differently-sized data) and adds a **result-size
+  decade regressions** section: the same `--threshold-pct` / `--min-count`
+  rules applied per decade, catching a p95 regression confined to one
+  size class of a fingerprint whose mixed-size p95 stayed within the
+  threshold. Such a decade regression sets **exit code 2** exactly like a
+  fingerprint-level one (fingerprints already flagged at the top level
+  are not re-listed per decade). In the JSON report the decade findings
+  are a separate `size_regressions` list and `size_regressed` flag;
+  `regressed` keeps meaning fingerprint-level regressions.
+- **Older reports and recorded baselines degrade gracefully**: a run
+  without byte data (pre-0.4.0, or `sql-replay baseline` — the capture
+  records latencies, not result sizes) compares fine; byte columns show
+  n/a and the decade comparison is skipped with a note, never a spurious
+  verdict.
 
 ### Result-correctness diffing (`--checksum`)
 

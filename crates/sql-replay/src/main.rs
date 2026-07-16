@@ -401,7 +401,16 @@ fn main() -> Result<()> {
                     sql_replay::compare::EXIT_REGRESSED,
                 );
             }
-            if report.regressed || report.correctness_failed {
+            if report.size_regressed {
+                eprintln!(
+                    "FAIL: {} result-size decade(s) regressed >= {}% on p95 inside \
+                     otherwise-stable fingerprints (exit code {})",
+                    report.size_regressions.len(),
+                    threshold_pct,
+                    sql_replay::compare::EXIT_REGRESSED,
+                );
+            }
+            if report.regressed || report.size_regressed || report.correctness_failed {
                 std::process::exit(sql_replay::compare::EXIT_REGRESSED);
             }
         }

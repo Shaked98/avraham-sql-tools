@@ -6,11 +6,11 @@
 #
 #   rpmbuild -bb packaging/sql-replay.spec \
 #     --define "_sourcedir $PWD/dist" \
-#     --define "version 0.3.0"
+#     --define "version 0.4.0"
 #
 # where dist/ holds sql-replay-<version>-x86_64-unknown-linux-musl.tar.gz.
 
-%{!?version: %global version 0.3.0}
+%{!?version: %global version 0.4.0}
 
 # The binary is prebuilt and static: no debuginfo to extract, no build-id
 # links, and no automatic library dependencies to scan for.
@@ -55,6 +55,13 @@ install -Dm644 README.md %{buildroot}%{_docdir}/sql-replay/README.md
 %license LICENSE-MIT LICENSE-APACHE
 
 %changelog
+* Thu Jul 16 2026 avraham-sql-tools contributors - 0.4.0-1
+- Per-fingerprint result-set byte stats recorded in run.json
+  (total/min/max/mean plus p50/p95), measured on the streaming drain.
+- Size-decade latency buckets per fingerprint; `compare` applies the
+  regression threshold per decade so regressions confined to big rows
+  can't be averaged away (findings in `size_regressions`, exit 2).
+
 * Wed Jul 15 2026 avraham-sql-tools contributors - 0.3.0-1
 - pcap capture source: `capture --input traffic.pcap` decodes MySQL wire
   traffic recorded with tcpdump (prepared statements expanded, true wire
