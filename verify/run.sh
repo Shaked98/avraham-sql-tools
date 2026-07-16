@@ -163,20 +163,55 @@ docker rm -f "$C57" "$C80" >/dev/null 2>&1 || true
 # dataset stays cached (stable latencies); binlog off on 8.0 to match
 # 5.7's default (sync_binlog=1 would otherwise slow every replayed INSERT
 # on the candidate and poison the control group).
+#
+# Two further settings are pinned identically on BOTH servers because with
+# the stock defaults an HONEST, unsabotaged 8.0 already regresses the
+# join+GROUP BY class past the 100% threshold — which would make the
+# compare-level "temptable plant detected" assertion vacuous (it would keep
+# passing with the plant broken):
+#   - character_set_server=latin1 + collation_server=latin1_swedish_ci
+#     (5.7's stock defaults). The employees DDL pins no charset, so tables
+#     inherit the server default — latin1 on 5.7 but utf8mb4 with the
+#     costlier utf8mb4_0900_ai_ci on stock 8.0, and the gb class groups on
+#     two VARCHAR name keys, 4x wider under utf8mb4.
+#   - tmp_table_size/max_heap_table_size=128M (defaults: 16M). 8.0 creates
+#     an internal temp table directly ON DISK when the optimizer's estimate
+#     of its size exceeds the in-memory limit; its ~888k-row estimate for
+#     the gb aggregation (actual: ~50k groups) blows the 16M default, so
+#     honest 8.0 pays an on-disk InnoDB temp table on every gb query —
+#     ~4.4x slower than 5.7, which keeps the same aggregation in a MEMORY
+#     table under identical settings. This, not the charset, is the larger
+#     effect. 128M keeps honest 8.0's aggregation in RAM; the plant still
+#     bites because temptable_max_ram caps TempTable's RAM budget
+#     regardless of tmp_table_size.
+# With both pinned, the gb class regresses only when the temptable plant is
+# active (see verify/README.md, "Why the server config is pinned").
+PINS=(--character-set-server=latin1 --collation-server=latin1_swedish_ci
+  --tmp-table-size=134217728 --max-heap-table-size=134217728)
 docker run -d --name "$C57" -p "127.0.0.1:$PORT57:3306" \
   -e MYSQL_ALLOW_EMPTY_PASSWORD=yes \
   -v "$DATASET_DIR:/test_db:ro" \
-  mysql:5.7 --innodb-buffer-pool-size=512M >/dev/null
+  mysql:5.7 --innodb-buffer-pool-size=512M "${PINS[@]}" >/dev/null
 docker run -d --name "$C80" -p "127.0.0.1:$PORT80:3306" \
   -e MYSQL_ALLOW_EMPTY_PASSWORD=yes \
   -v "$DATASET_DIR:/test_db:ro" \
-  mysql:8.0 --innodb-buffer-pool-size=512M --disable-log-bin >/dev/null
+  mysql:8.0 --innodb-buffer-pool-size=512M --disable-log-bin "${PINS[@]}" >/dev/null
 wait_ready "$C57"
 wait_ready "$C80"
 # Cut fsync-per-commit out of both servers identically: INSERT latencies on
 # shared CI runners are hopeless otherwise.
 mrun "$C57" "SET GLOBAL innodb_flush_log_at_trx_commit = 2"
 mrun "$C80" "SET GLOBAL innodb_flush_log_at_trx_commit = 2"
+# Fail fast if a future image stops honoring the pins: the dataset has not
+# been loaded yet (tables inherit the charset at CREATE time), and a
+# silently ignored temp-table limit would quietly re-weaken the gb ground
+# truth.
+for c in "$C57" "$C80"; do
+  got=$(mrun "$c" "SELECT @@character_set_server, @@collation_server,
+                   @@tmp_table_size, @@max_heap_table_size")
+  [[ "$got" == $'latin1\tlatin1_swedish_ci\t134217728\t134217728' ]] ||
+    die "server config pins did not apply on $c (got: $got); the gb ground truth needs them identical on both servers"
+done
 
 stage "load the employees dataset into both servers (parallel, ~2-5 min)"
 load() { # load <container> <logfile>

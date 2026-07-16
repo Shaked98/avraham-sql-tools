@@ -294,6 +294,15 @@ Gotchas baked into it (relearn them from its comments before changing it):
   `push:` trigger instead.
 - Replay-side `--filter-user` on a dedicated workload MySQL user is how
   the rig keeps its own admin statements out of the replayed event set.
+- Both containers pin `character_set_server=latin1` (the employees DDL
+  pins no charset, so stock 8.0's utf8mb4 default widens the GROUP BY
+  keys 4x) AND `tmp_table_size`/`max_heap_table_size=128M` (8.0's
+  optimizer over-estimates the gb temp table past the 16M default and
+  creates it directly on disk — the larger effect). Without the pins an
+  honest, unsabotaged 8.0 regresses the join+GROUP BY class past the 100%
+  threshold, making the compare-level temptable-plant assertion vacuous.
+  Rationale + measurements in verify/README.md ("Why the server config is
+  pinned").
 
 ## Maintaining this file
 

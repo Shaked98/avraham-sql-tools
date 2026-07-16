@@ -7,7 +7,9 @@ there and stays quiet about queries that did not change.
 
 ## What it does
 
-1. Starts `mysql:5.7` (baseline) and `mysql:8.0` (candidate) containers and
+1. Starts `mysql:5.7` (baseline) and `mysql:8.0` (candidate) containers —
+   both with the server charset and in-memory temp-table limits pinned
+   identically (see "Why the server config is pinned" below) — and
    loads both with the identical, canonical
    [employees test dataset](https://github.com/datacharmer/test_db)
    (v1.0.7, ~300k employees / 2.8M salary rows, row counts verified against
@@ -66,6 +68,48 @@ and must NOT spill on the 5.7 baseline) so a misconfigured plant fails
 fast with a clear message instead of a mysterious compare verdict. If a
 class ever proves noisy in practice, add executions
 (`WORKLOAD_*` volumes) rather than loosening assertions.
+
+## Why the server config is pinned on both containers
+
+On *stock defaults*, an honest, unsabotaged 8.0 already regresses the
+join+GROUP BY class ~5x p95 on real hardware — past the rig's 100%
+detection threshold. That would make the compare-level "planted
+temp-table-spill class regressed" assertion vacuous: it would keep passing
+even with the temptable plant silently broken, leaving the pre-replay
+disk-spill probe as the only real check on that plant. Two stock-default
+differences drive it, so the rig pins both identically on both containers
+(and assert-checks the pins before the dataset loads):
+
+- **`character_set_server=latin1` / `collation_server=latin1_swedish_ci`**
+  (5.7's stock defaults). Stock 8.0 defaults to
+  `utf8mb4`/`utf8mb4_0900_ai_ci`, and the employees dataset DDL pins no
+  charset, so without the pin the same `CREATE TABLE` produces latin1
+  tables on 5.7 and utf8mb4 tables on 8.0 — and the gb class groups on two
+  VARCHAR name columns, 4x wider under utf8mb4 with a costlier collation.
+- **`tmp_table_size` / `max_heap_table_size = 128M`** (defaults: 16M).
+  This is the *larger* effect, and it is easy to misattribute to the
+  charset: MySQL creates an internal temp table directly **on disk** when
+  the optimizer's size estimate exceeds the in-memory limit, and 8.0's
+  ~888k-row estimate for the gb aggregation (actual: ~50k groups) blows
+  the 16M default — so honest 8.0 pays an on-disk InnoDB temp table on
+  every gb query (~4.4x slower), while 5.7 keeps the same aggregation in a
+  MEMORY table under identical settings. Raising the limit keeps honest
+  8.0's aggregation in RAM. The plant still bites regardless, because
+  `temptable_max_ram` caps the TempTable engine's RAM budget independently
+  of `tmp_table_size`.
+
+Measured on the rig box (i7-13700KF/WSL2, honest 8.0, same replay): stock
+defaults +465% p95; charset pinned alone still +341%; both pinned ~+35% —
+comfortably inside the threshold, so the gb class regresses only when the
+plant is active and every planted assertion again isolates its plant.
+
+This is a property of the *rig* (its job is isolating planted effects),
+not advice to hide those costs: a real stock-defaults 5.7→8.0 migration
+genuinely pays both, and `compare` surfaces the cue in its comparability
+warning (`character_set_server: latin1 -> utf8mb4`). For a real migration
+assessment, run the comparison twice — once on stock defaults (what you
+will get) and once with the charset and temp-table limits pinned or
+schemas converted deliberately (what the engine change alone costs).
 
 ## Running it
 
