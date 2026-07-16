@@ -9,7 +9,11 @@
 //! is at least `threshold_pct` (or its baseline p95 is zero while the
 //! candidate's is not — an unbounded regression with no percentage) and it
 //! executed at least `min_count` times in both runs; `compare` exits with
-//! code 2 when any exist (see [`EXIT_REGRESSED`]).
+//! code 2 when any exist (see [`EXIT_REGRESSED`]). The same threshold and
+//! min-count rules also run per result-size decade (0.4.0), so a
+//! regression confined to one size class of an otherwise-stable
+//! fingerprint still gates — those findings land in the separate
+//! `size_regressions` list and drive the same exit code.
 
 use std::collections::{BTreeMap, HashMap};
 
