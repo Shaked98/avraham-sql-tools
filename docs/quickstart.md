@@ -7,7 +7,9 @@ evaluate sql-replay for a real 5.7 → 8.0 migration. Every command below
 was executed exactly as shown, against the real v0.3.0 release binary and
 throwaway MySQL containers; the outputs are real (a few long ones are
 trimmed and marked). Exact latency numbers will differ on your machine —
-the shapes and verdicts should not.
+the shapes and verdicts should not. For the big picture first, the
+[architecture diagram](architecture.svg) shows the whole
+capture → replay → compare pipeline this walkthrough drives end to end.
 
 What you will do:
 
