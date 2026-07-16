@@ -55,7 +55,14 @@ install -Dm644 README.md %{buildroot}%{_docdir}/sql-replay/README.md
 %license LICENSE-MIT LICENSE-APACHE
 
 %changelog
-* Wed Jul 15 2026 avraham-sql-tools contributors - 0.4.0-1
+* Thu Jul 16 2026 avraham-sql-tools contributors - 0.4.0-1
+- Per-fingerprint result-set byte stats recorded in run.json
+  (total/min/max/mean plus p50/p95), measured on the streaming drain.
+- Size-decade latency buckets per fingerprint; `compare` applies the
+  regression threshold per decade so regressions confined to big rows
+  can't be averaged away (findings in `size_regressions`, exit 2).
+
+* Wed Jul 15 2026 avraham-sql-tools contributors - 0.3.0-1
 - pcap capture source: `capture --input traffic.pcap` decodes MySQL wire
   traffic recorded with tcpdump (prepared statements expanded, true wire
   timestamps, request->response latencies recorded for `baseline`).
