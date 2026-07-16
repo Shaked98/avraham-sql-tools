@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 /// latencies are client-side wall times measured by this tool.
 pub const LATENCY_SOURCE_REPLAYED: &str = "replayed";
 /// [`RunReport::latency_source`] for reports produced by `baseline`:
-/// latencies are server-side `Query_time` values recorded in the
-/// production slow log.
+/// latencies were recorded in the source capture (server-side `Query_time`
+/// for slow logs, request→first-response wire time for pcap captures —
+/// the value stays `recorded-slow-log` for format compatibility).
 pub const LATENCY_SOURCE_RECORDED: &str = "recorded-slow-log";
 
 pub(crate) fn default_latency_source() -> String {
@@ -25,18 +26,18 @@ pub struct RunReport {
     pub capture_dialect: String,
     /// Where the per-fingerprint latencies were measured:
     /// [`LATENCY_SOURCE_REPLAYED`] (client-side wall time observed by
-    /// `sql-replay replay`) or [`LATENCY_SOURCE_RECORDED`] (server-side
-    /// `Query_time` parsed from the production slow log by
-    /// `sql-replay baseline`). Absent in pre-0.2.0 reports, which are all
-    /// replayed (serde default).
+    /// `sql-replay replay`) or [`LATENCY_SOURCE_RECORDED`] (the capture's
+    /// recorded per-event latency aggregated by `sql-replay baseline`).
+    /// Absent in pre-0.2.0 reports, which are all replayed (serde
+    /// default).
     #[serde(default = "default_latency_source")]
     pub latency_source: String,
     /// Empty (and omitted from JSON) for recorded baselines, which have no
     /// target server.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_url: String,
-    /// Empty (and omitted from JSON) for recorded baselines — the slow log
-    /// does not know the server version string.
+    /// Empty (and omitted from JSON) for recorded baselines — there was no
+    /// replay to observe the server version string.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub target_server_version: String,
     pub started_at: String,
@@ -88,6 +89,11 @@ pub struct ReportFlags {
     pub read_only: bool,
     pub db_override: Option<String>,
     pub speed: String,
+    /// Result-set checksums were recorded (`--checksum`, 0.3.0). Latencies
+    /// of a checksummed run include reading every result row and are not
+    /// comparable to a non-checksummed run's.
+    #[serde(default)]
+    pub checksum: bool,
     /// Sessions multiplexed over a bounded connection pool of this size
     /// instead of one dedicated connection per session (M3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,6 +149,45 @@ pub struct FingerprintReport {
     pub p99_us: u64,
     pub max_us: u64,
     pub mean_us: f64,
+    /// Result-set checksum aggregate, present when the run used
+    /// `--checksum` and this fingerprint executed read statements
+    /// (0.3.0; serde default keeps older reports loading).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<ChecksumReport>,
+}
+
+/// Per-fingerprint result-set checksum aggregate (`replay --checksum`).
+///
+/// Per-event checksums would bloat run.json (a fingerprint can have
+/// millions of events), so events collapse into one order-insensitive
+/// digest: per-event result digests are combined with commutative
+/// operations (wrapping sum + xor + count), making the aggregate a
+/// multiset hash of the event checksums. Two runs over the same capture
+/// and identical data produce the same multiset — regardless of session
+/// interleaving — so equal digests mean no observed divergence, and any
+/// changed result set changes the digest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChecksumReport {
+    /// Executed statements whose result set was checksummed.
+    pub events: u64,
+    /// Executed checksummed statements that returned no result set (OK
+    /// packet only, e.g. SET) — nothing to diff.
+    pub no_result: u64,
+    /// Total rows read across all checksummed events.
+    pub rows_total: u64,
+    /// Combined order-insensitive digest (16 hex chars) over the
+    /// per-event result checksums.
+    pub digest: String,
+    /// Column names of the first checksummed result set.
+    pub columns: Vec<String>,
+    /// Column names/count varied between events of this fingerprint.
+    pub shape_varied: bool,
+    /// The query looks nondeterministic (volatile functions, LIMIT
+    /// without ORDER BY, server-state reads — see
+    /// `classify::is_nondeterministic`), or its digest empirically varied
+    /// across `--repeat` passes: checksum diffs are advisory, not hard
+    /// mismatches.
+    pub nondeterministic: bool,
 }
 
 impl RunReport {
@@ -150,8 +195,8 @@ impl RunReport {
     /// than by the target server.
     pub const SATURATION_WARN_PCT: f64 = 20.0;
 
-    /// True for reports whose latencies were recorded in the production
-    /// slow log (`sql-replay baseline`) rather than measured by a replay.
+    /// True for reports whose latencies were recorded in the source
+    /// capture (`sql-replay baseline`) rather than measured by a replay.
     pub fn is_recorded(&self) -> bool {
         self.latency_source == LATENCY_SOURCE_RECORDED
     }
@@ -211,9 +256,9 @@ impl RunReport {
         }
         if self.is_recorded() {
             out.push_str(
-                "Latencies: server-side Query_time recorded in the production slow log \
-                 (no replay target; the log carries no error information, so errors are \
-                 0 by definition)\n",
+                "Latencies: recorded in the source capture (slow-log Query_time, or \
+                 request→response wire time for pcap captures; no replay target — the \
+                 capture carries no error information, so errors are 0 by definition)\n",
             );
         } else {
             out.push_str(&format!(

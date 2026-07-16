@@ -14,7 +14,9 @@ use std::time::Duration;
 use sql_replay::format::{
     CaptureWriter, Event, FingerprintEntry, Header, Record, Summary, FORMAT_VERSION,
 };
-use sql_replay::target::{Target, TargetConn, TargetError};
+use sql_replay::target::{
+    ChecksumBuilder, ResultChecksum, RowHasher, Target, TargetConn, TargetError,
+};
 use tokio::sync::watch;
 
 #[derive(Default)]
@@ -27,6 +29,9 @@ pub struct MockState {
     /// queries have started (deterministic mid-run abort).
     pub shutdown_after: AtomicU64,
     pub shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
+    /// Version stamp mixed into mock result checksums: bump it between
+    /// runs to simulate the target's data changing.
+    pub data_version: AtomicU64,
 }
 
 /// Mock target: counts connections/queries, tracks peak concurrent
@@ -100,6 +105,24 @@ impl TargetConn for MockConn {
         Ok(())
     }
 
+    async fn query_checksum(&mut self, sql: &str) -> Result<Option<ResultChecksum>, TargetError> {
+        self.query(sql).await?;
+        if sql.contains("MOCK_NO_RESULT") {
+            return Ok(None);
+        }
+        // Deterministic synthetic result set: one row derived from the
+        // statement text and the mock's data version, so identical runs
+        // produce identical checksums and a bumped version diverges.
+        let version = self.state.data_version.load(Ordering::SeqCst);
+        let mut b = ChecksumBuilder::new();
+        b.set_columns(["value".to_string()]);
+        let mut row = RowHasher::new();
+        row.cell_bytes(sql.as_bytes());
+        row.cell_uint(version);
+        b.add_row_hash(row.finish());
+        Ok(Some(b.finish()))
+    }
+
     async fn disconnect(self) {}
 }
 
@@ -114,9 +137,15 @@ pub fn write_capture(path: &Path, events: &[Event]) {
     .expect("write header");
     let mut sessions = std::collections::HashSet::new();
     let mut max_fp = 0;
+    // Real normalized text per fingerprint id (first event of the id
+    // wins), so report-time classification sees genuine SQL.
+    let mut texts: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     for e in events {
         sessions.insert(e.session_id);
         max_fp = max_fp.max(e.fingerprint_id);
+        texts
+            .entry(e.fingerprint_id)
+            .or_insert_with(|| sql_replay::fingerprint::fingerprint(&e.query));
         w.write(&Record::Event(e.clone())).expect("write event");
     }
     w.write(&Record::Summary(Summary {
@@ -125,10 +154,13 @@ pub fn write_capture(path: &Path, events: &[Event]) {
         session_count: sessions.len() as u64,
         admin_commands_ignored: 0,
         server_restarts_seen: 0,
+        pcap: None,
         fingerprints: (0..=max_fp)
             .map(|id| FingerprintEntry {
                 id,
-                text: format!("fingerprint {id}"),
+                text: texts
+                    .remove(&id)
+                    .unwrap_or_else(|| format!("fingerprint {id}")),
             })
             .collect(),
     }))
@@ -168,6 +200,7 @@ pub fn generate_capture(path: &Path, sessions: u64, events_per_session: u64, fp_
         session_count: sessions,
         admin_commands_ignored: 0,
         server_restarts_seen: 0,
+        pcap: None,
         fingerprints: (0..fp_count)
             .map(|id| FingerprintEntry {
                 id,

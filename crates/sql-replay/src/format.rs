@@ -49,8 +49,31 @@ pub struct Summary {
     pub session_count: u64,
     pub admin_commands_ignored: u64,
     pub server_restarts_seen: u64,
+    /// Wire-decode counters, present only for captures built from a pcap
+    /// file (0.3.0+; serde default keeps older captures loading).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pcap: Option<PcapSummary>,
     /// fingerprint_id -> normalized query text
     pub fingerprints: Vec<FingerprintEntry>,
+}
+
+/// pcap-source decode counters (mirrors `pcap::PcapStats`); everything the
+/// wire decode skipped or lost is counted here so it is never silent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PcapSummary {
+    pub packets: u64,
+    pub truncated_packets: u64,
+    pub ip_fragments_skipped: u64,
+    pub connections: u64,
+    pub connections_decoded: u64,
+    pub connections_tls_skipped: u64,
+    pub connections_compressed_skipped: u64,
+    pub connections_midstream_skipped: u64,
+    pub connections_broken: u64,
+    pub statements_expanded: u64,
+    pub statements_inexpandable: u64,
+    pub responses_missing: u64,
+    pub server_versions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

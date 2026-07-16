@@ -1,4 +1,5 @@
-//! Statement classification for the replay safety gate.
+//! Statement classification for the replay safety gate, plus the
+//! nondeterminism classifier used by `--checksum` result diffing.
 //!
 //! Anything not provably read-only is classified as a write and is only
 //! executed when `--allow-writes` is passed.
@@ -93,6 +94,112 @@ fn classify_explain_analyze_tail(scan: &mut TokenScanner) -> QueryClass {
         }
     }
     QueryClass::Write
+}
+
+/// Best-effort detector for queries whose result set can legitimately
+/// differ between two runs against identical data. Used by `--checksum`
+/// result diffing to demote such fingerprints to "advisory" instead of
+/// hard mismatches. Operates on the normalized *fingerprint* text
+/// (lowercased, literals collapsed to `?`, comments stripped).
+///
+/// Detected classes (the honest limits — this is a token scan, not a SQL
+/// parser; a column actually named `now` etc. can false-positive, and
+/// nondeterminism hidden in views or stored functions is invisible):
+/// - volatile functions: NOW()/SYSDATE()/CURDATE()/RAND()/UUID()/
+///   LAST_INSERT_ID()/CONNECTION_ID()/FOUND_ROWS()/... and the bare
+///   CURRENT_TIMESTAMP/CURRENT_DATE/... forms, plus no-argument
+///   UNIX_TIMESTAMP()
+/// - `@@variable` reads and VERSION() (differ across servers by design)
+/// - reads from information_schema / performance_schema (live server
+///   state)
+/// - LIMIT with no ORDER BY anywhere in the statement (which rows are
+///   returned is storage-order dependent; an ORDER BY anywhere disarms
+///   this heuristic even though only a top-level one truly fixes the
+///   ambiguity)
+pub fn is_nondeterministic(fingerprint: &str) -> bool {
+    // Functions that are volatile only as calls: require a following `(`.
+    const VOLATILE_FUNCS: &[&str] = &[
+        "now",
+        "sysdate",
+        "curdate",
+        "curtime",
+        "rand",
+        "uuid",
+        "uuid_short",
+        "last_insert_id",
+        "connection_id",
+        "found_rows",
+        "row_count",
+        "benchmark",
+        "get_lock",
+        "release_lock",
+        "is_free_lock",
+        "is_used_lock",
+        "version",
+        "sleep",
+    ];
+    // Keywords volatile even without parentheses.
+    const VOLATILE_WORDS: &[&str] = &[
+        "current_timestamp",
+        "current_date",
+        "current_time",
+        "localtime",
+        "localtimestamp",
+        "utc_timestamp",
+        "utc_date",
+        "utc_time",
+        "information_schema",
+        "performance_schema",
+    ];
+
+    let b = fingerprint.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    let mut has_limit = false;
+    let mut has_order = false;
+    while i < n {
+        let c = b[i];
+        match c {
+            b'`' | b'\'' | b'"' => i = skip_quoted(b, i),
+            b'@' if i + 1 < n && b[i + 1] == b'@' => return true,
+            _ if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                    i += 1;
+                }
+                let word = &fingerprint[start..i];
+                let mut j = i;
+                while j < n && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let called = j < n && b[j] == b'(';
+                if VOLATILE_WORDS.contains(&word) {
+                    return true;
+                }
+                if called && VOLATILE_FUNCS.contains(&word) {
+                    return true;
+                }
+                // UNIX_TIMESTAMP() without arguments is "now"; with an
+                // argument it is a pure conversion.
+                if called && word == "unix_timestamp" {
+                    let mut k = j + 1;
+                    while k < n && b[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if k < n && b[k] == b')' {
+                        return true;
+                    }
+                }
+                match word {
+                    "limit" => has_limit = true,
+                    "order" => has_order = true,
+                    _ => {}
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    has_limit && !has_order
 }
 
 /// True when a `;` outside strings/comments is followed by anything other
@@ -325,6 +432,53 @@ mod tests {
         assert!(!is_use_statement("SELECT 'use mydb'"));
         assert!(!is_use_statement("SELECT used FROM t"));
         assert!(!is_use_statement("INSERT INTO uses VALUES (1)"));
+    }
+
+    #[test]
+    fn nondeterministic_fingerprints_are_flagged() {
+        for q in [
+            "select now()",
+            "select * from t where created_at > now() - interval ? day",
+            "select current_timestamp",
+            "select rand()",
+            "select uuid()",
+            "select last_insert_id()",
+            "select sysdate()",
+            "select unix_timestamp()",
+            "select found_rows()",
+            "select connection_id()",
+            "select @@version_comment limit ?",
+            "select version()",
+            "select * from information_schema.tables",
+            "select * from performance_schema.threads",
+            // LIMIT with no ORDER BY: which rows come back is not defined.
+            "select id from t limit ?",
+            "select id from t where a = ? limit ?, ?",
+        ] {
+            assert!(is_nondeterministic(q), "should be nondeterministic: {q}");
+        }
+    }
+
+    #[test]
+    fn deterministic_fingerprints_are_not_flagged() {
+        for q in [
+            "select ? from t where id = ?",
+            "select id from t order by id limit ?",
+            // ORDER BY anywhere disarms the LIMIT heuristic (documented).
+            "select * from (select a from t order by a) q limit ?",
+            // Conversion form of unix_timestamp is pure.
+            "select unix_timestamp(created_at) from t",
+            "select unix_timestamp(?) from t",
+            // Words that merely resemble volatile functions.
+            "select `now` from t",
+            "select nowhere from t",
+            "select rand_score from t",
+            "select * from randomizer",
+            "select version_tag from releases",
+            "select email from users where name = ?",
+        ] {
+            assert!(!is_nondeterministic(q), "should be deterministic: {q}");
+        }
     }
 
     #[test]

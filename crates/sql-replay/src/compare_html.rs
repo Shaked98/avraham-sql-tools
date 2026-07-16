@@ -4,7 +4,7 @@
 
 use std::fmt::Write as _;
 
-use crate::compare::{CompareReport, FpDelta, OnlyIn, RunMeta};
+use crate::compare::{ChecksumDelta, CompareReport, FpDelta, OnlyIn, RunMeta};
 
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -105,6 +105,46 @@ fn only_in_table(out: &mut String, title: &str, list: &[OnlyIn]) {
             esc(&o.fingerprint)
         );
         out.push('\n');
+    }
+    out.push_str("</tbody></table>\n");
+}
+
+fn checksum_table(out: &mut String, title: &str, list: &[ChecksumDelta], failures: bool) {
+    if list.is_empty() {
+        return;
+    }
+    let _ = write!(
+        out,
+        "<h3>{title} ({n})</h3>\n<table><thead><tr><th>fingerprint</th>\
+<th>digest b</th><th>digest c</th><th>rows b</th><th>rows c</th>\
+<th>events b</th><th>events c</th><th>flags</th></tr></thead><tbody>\n",
+        title = esc(title),
+        n = list.len()
+    );
+    for d in list {
+        let mut badges = String::new();
+        if d.columns_differ {
+            badges.push_str(r#" <span class="badge">columns differ</span>"#);
+        }
+        if d.events_differ {
+            badges.push_str(r#" <span class="badge">event counts differ</span>"#);
+        }
+        if d.nondeterministic {
+            badges.push_str(r#" <span class="badge">nondeterministic</span>"#);
+        }
+        let cls = if failures { " class=\"differs\"" } else { "" };
+        let _ = writeln!(
+            out,
+            r#"<tr{cls}><td class="fp">{fp}</td><td class="num">{bd}</td><td class="num">{cd}</td>
+<td class="num">{br}</td><td class="num">{cr}</td><td class="num">{be}</td><td class="num">{ce}</td><td>{badges}</td></tr>"#,
+            fp = esc(&d.fingerprint),
+            bd = esc(&d.baseline_digest),
+            cd = esc(&d.candidate_digest),
+            br = d.baseline_rows,
+            cr = d.candidate_rows,
+            be = d.baseline_events,
+            ce = d.candidate_events,
+        );
     }
     out.push_str("</tbody></table>\n");
 }
@@ -252,6 +292,17 @@ table.sortable th[data-dir="desc"]::after {{ content: " ▼"; }}
         out.push_str("</ul></div>\n");
     }
 
+    if r.correctness_failed {
+        let n = r
+            .correctness
+            .as_ref()
+            .map(|c| c.mismatches.len())
+            .unwrap_or(0);
+        let _ = writeln!(
+            out,
+            r#"<p><b class="worse">{n} fingerprint(s) returned different data (result checksum mismatch)</b> (exit code 2).</p>"#,
+        );
+    }
     let verdict = if r.regressed {
         format!(
             r#"<p><b class="worse">{} fingerprint(s) regressed ≥ {}% on p95</b> (exit code 2).</p>"#,
@@ -319,6 +370,30 @@ table.sortable th[data-dir="desc"]::after {{ content: " ▼"; }}
             );
         }
         out.push_str("</tbody></table>\n");
+    }
+
+    if let Some(corr) = &r.correctness {
+        let _ = write!(
+            out,
+            "<h2>Result correctness (--checksum): {} checked, {} matched, {} mismatched, {} advisory</h2>\n<p class=\"muted\">{}</p>\n",
+            corr.checked,
+            corr.matched,
+            corr.mismatches.len(),
+            corr.advisory.len(),
+            esc(&corr.note),
+        );
+        checksum_table(
+            &mut out,
+            "Mismatches (deterministic — wrong answers)",
+            &corr.mismatches,
+            true,
+        );
+        checksum_table(
+            &mut out,
+            "Advisory (nondeterministic or unequal event populations)",
+            &corr.advisory,
+            false,
+        );
     }
 
     let matched = r.regressions.len() + r.improvements.len() + r.stable.len() + r.low_sample.len();

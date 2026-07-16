@@ -70,6 +70,52 @@ pub struct CompareReport {
     pub count_mismatches: u64,
     /// True when `regressions` is non-empty; drives the exit code.
     pub regressed: bool,
+    /// Result-correctness diff, present when both runs recorded result
+    /// checksums (`replay --checksum`); 0.3.0, serde-defaulted so older
+    /// compare reports load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correctness: Option<CorrectnessReport>,
+    /// True when `correctness.mismatches` is non-empty — a deterministic
+    /// query returned different data. Drives exit code 2 like `regressed`
+    /// (a wrong answer is worse than a slow one).
+    #[serde(default)]
+    pub correctness_failed: bool,
+}
+
+/// Result-correctness section: matched fingerprints whose result-set
+/// checksums diverge between the runs. Only meaningful when both runs
+/// executed against identical data — see `note`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrectnessReport {
+    /// Matched fingerprints checksummed (with at least one result set) in
+    /// both runs.
+    pub checked: u64,
+    /// ... of which the digests agree.
+    pub matched: u64,
+    /// Deterministic fingerprints with diverging results: hard failures.
+    pub mismatches: Vec<ChecksumDelta>,
+    /// Diverging fingerprints that are classified nondeterministic (or
+    /// whose checksummed event counts differ, making the multisets
+    /// incomparable): advisory only, not failures.
+    pub advisory: Vec<ChecksumDelta>,
+    pub note: String,
+}
+
+/// One fingerprint's checksum divergence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChecksumDelta {
+    pub fingerprint: String,
+    pub baseline_digest: String,
+    pub candidate_digest: String,
+    pub baseline_rows: u64,
+    pub candidate_rows: u64,
+    /// Checksummed events per side; unequal populations cannot be
+    /// compared conclusively (the delta is then advisory).
+    pub baseline_events: u64,
+    pub candidate_events: u64,
+    pub columns_differ: bool,
+    pub nondeterministic: bool,
+    pub events_differ: bool,
 }
 
 /// Per-run metadata carried into the compare report so both runs' context
@@ -243,13 +289,14 @@ pub fn compare_runs(
             ("candidate", "baseline")
         };
         warnings.push(format!(
-            "MEASUREMENT PLANES DIFFER: the {rec} latencies are server-side Query_time \
-             values recorded in the production slow log (measured under live production \
-             load, including lock waits and contention), while the {rep} latencies are \
-             client-side wall times measured by replay from the test host (including \
-             network round-trip and driver overhead). Deltas mix real server changes \
-             with this measurement gap — use a generous --threshold-pct and treat small \
-             deltas as noise"
+            "MEASUREMENT PLANES DIFFER: the {rec} latencies were recorded in the source \
+             capture — server-side slow-log Query_time (measured under live production \
+             load, including lock waits and contention) or request→response wire time \
+             for pcap captures (server plus the capture-point→server network path) — \
+             while the {rep} latencies are client-side wall times measured by replay \
+             from the test host (including network round-trip and driver overhead). \
+             Deltas mix real server changes with this measurement gap — use a generous \
+             --threshold-pct and treat small deltas as noise"
         ));
     }
     // Replay-execution knobs (speed, connection caps, write gate, ...) only
@@ -327,6 +374,32 @@ pub fn compare_runs(
         .map(|f| f.fingerprint.as_str())
         .collect();
 
+    // Result-correctness diff: only when both runs recorded checksums.
+    let both_checksummed = baseline.flags.checksum && candidate.flags.checksum;
+    if baseline.flags.checksum != candidate.flags.checksum {
+        let (with, without) = if baseline.flags.checksum {
+            ("baseline", "candidate")
+        } else {
+            ("candidate", "baseline")
+        };
+        warnings.push(format!(
+            "only the {with} run recorded result checksums (--checksum) — the \
+             correctness diff is skipped, and the {with} run's latencies include \
+             reading every result row, so they are not comparable to the {without} \
+             run's"
+        ));
+    }
+    let mut correctness = both_checksummed.then(|| CorrectnessReport {
+        checked: 0,
+        matched: 0,
+        mismatches: Vec::new(),
+        advisory: Vec::new(),
+        note: "result checksums diverge meaningfully only when both runs executed \
+               against identical data; nondeterministic queries (volatile functions, \
+               LIMIT without ORDER BY, server-state reads) are listed as advisory"
+            .to_string(),
+    });
+
     let mut regressions = Vec::new();
     let mut improvements = Vec::new();
     let mut stable = Vec::new();
@@ -346,6 +419,34 @@ pub fn compare_runs(
         let count_mismatch = b.count != c.count;
         if count_mismatch {
             count_mismatches += 1;
+        }
+        if let Some(corr) = correctness.as_mut() {
+            if let (Some(bc), Some(cc)) = (&b.checksum, &c.checksum) {
+                if bc.events > 0 && cc.events > 0 {
+                    corr.checked += 1;
+                    if bc.digest == cc.digest {
+                        corr.matched += 1;
+                    } else {
+                        let delta = ChecksumDelta {
+                            fingerprint: b.fingerprint.clone(),
+                            baseline_digest: bc.digest.clone(),
+                            candidate_digest: cc.digest.clone(),
+                            baseline_rows: bc.rows_total,
+                            candidate_rows: cc.rows_total,
+                            baseline_events: bc.events,
+                            candidate_events: cc.events,
+                            columns_differ: bc.columns != cc.columns,
+                            nondeterministic: bc.nondeterministic || cc.nondeterministic,
+                            events_differ: bc.events != cc.events,
+                        };
+                        if delta.nondeterministic || delta.events_differ {
+                            corr.advisory.push(delta);
+                        } else {
+                            corr.mismatches.push(delta);
+                        }
+                    }
+                }
+            }
         }
         let delta = FpDelta {
             fingerprint: b.fingerprint.clone(),
@@ -424,6 +525,25 @@ pub fn compare_runs(
         ));
     }
 
+    let correctness_failed = correctness
+        .as_ref()
+        .is_some_and(|c| !c.mismatches.is_empty());
+    if let Some(corr) = &mut correctness {
+        // Deterministic order: worst absolute row delta first.
+        let rank =
+            |d: &ChecksumDelta| std::cmp::Reverse(d.baseline_rows.abs_diff(d.candidate_rows));
+        corr.mismatches.sort_by_key(rank);
+        corr.advisory.sort_by_key(rank);
+        if correctness_failed {
+            warnings.push(format!(
+                "RESULT MISMATCH: {} fingerprint(s) returned different data on the two \
+                 targets (see the correctness section) — if both runs executed against \
+                 identical data, the candidate server returns wrong answers",
+                corr.mismatches.len()
+            ));
+        }
+    }
+
     let bt = &baseline.totals;
     let ct = &candidate.totals;
     let regressed = !regressions.is_empty();
@@ -458,6 +578,8 @@ pub fn compare_runs(
         only_in_candidate,
         count_mismatches,
         regressed,
+        correctness,
+        correctness_failed,
     }
 }
 
@@ -498,6 +620,9 @@ fn flag_diffs(
         }
         if b.warmup != c.warmup {
             out.push(("warmup", b.warmup.to_string(), c.warmup.to_string()));
+        }
+        if b.checksum != c.checksum {
+            out.push(("checksum", b.checksum.to_string(), c.checksum.to_string()));
         }
     }
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "<none>".to_string());
@@ -650,6 +775,56 @@ impl CompareReport {
             self.count_mismatches,
         ));
 
+        if let Some(corr) = &self.correctness {
+            out.push_str(&format!(
+                "Result correctness (--checksum): {} fingerprints checked, {} matched, \
+                 {} MISMATCHED, {} advisory\n",
+                corr.checked,
+                corr.matched,
+                corr.mismatches.len(),
+                corr.advisory.len(),
+            ));
+            out.push_str(&format!("  note: {}\n", corr.note));
+            for (label, list) in [
+                ("MISMATCH (deterministic — wrong answers)", &corr.mismatches),
+                (
+                    "advisory (nondeterministic — diff advisory only)",
+                    &corr.advisory,
+                ),
+            ] {
+                if list.is_empty() {
+                    continue;
+                }
+                out.push_str(&format!("  {label}:\n"));
+                for d in list.iter().take(top) {
+                    out.push_str(&format!(
+                        "    digest {} -> {} | rows {} -> {} | events {}/{}{}{}  {}\n",
+                        d.baseline_digest,
+                        d.candidate_digest,
+                        d.baseline_rows,
+                        d.candidate_rows,
+                        d.baseline_events,
+                        d.candidate_events,
+                        if d.columns_differ {
+                            " | COLUMNS DIFFER"
+                        } else {
+                            ""
+                        },
+                        if d.events_differ {
+                            " | event counts differ"
+                        } else {
+                            ""
+                        },
+                        truncate_chars(&d.fingerprint, 60),
+                    ));
+                }
+                if list.len() > top {
+                    out.push_str(&format!("    … and {} more\n", list.len() - top));
+                }
+            }
+            out.push('\n');
+        }
+
         out.push_str(&format!(
             "Regressions (p95 {:+.0}% or worse, count >= {} in both runs): {}\n",
             self.threshold_pct,
@@ -753,6 +928,7 @@ mod tests {
             p99_us: p95_us * 2,
             max_us: p95_us * 3,
             mean_us: p95_us as f64 / 2.0,
+            checksum: None,
         }
     }
 
@@ -773,6 +949,7 @@ mod tests {
             aborted: false,
             aggregation: None,
             flags: ReportFlags {
+                checksum: false,
                 max_connections: 8,
                 allow_writes: false,
                 read_only: false,
@@ -1025,7 +1202,8 @@ mod tests {
             .find(|w| w.contains("MEASUREMENT PLANES DIFFER"))
             .expect("measurement-plane warning present");
         assert!(plane.contains("Query_time"));
-        assert!(plane.contains("production slow log"));
+        assert!(plane.contains("source capture"));
+        assert!(plane.contains("pcap"));
         assert!(plane.contains("wall times"));
         assert!(plane.contains("--threshold-pct"));
 
@@ -1062,6 +1240,117 @@ mod tests {
         assert!(text.contains("recorded (slow log) latencies from capture"));
         assert!(text.contains("MEASUREMENT PLANES DIFFER"));
         assert!(text.contains("Target settings: settings diff skipped"));
+    }
+
+    /// Attach a checksum aggregate to a fingerprint report.
+    fn with_cs(
+        mut f: FingerprintReport,
+        digest: &str,
+        events: u64,
+        rows: u64,
+        nondet: bool,
+    ) -> FingerprintReport {
+        f.checksum = Some(crate::report::ChecksumReport {
+            events,
+            no_result: 0,
+            rows_total: rows,
+            digest: digest.to_string(),
+            columns: vec!["id".to_string(), "v".to_string()],
+            shape_varied: false,
+            nondeterministic: nondet,
+        });
+        f
+    }
+
+    fn checksummed_run(version: &str, fps: Vec<FingerprintReport>) -> RunReport {
+        let mut r = run(version, fps);
+        r.flags.checksum = true;
+        r
+    }
+
+    #[test]
+    fn identical_checksums_pass_and_diverging_ones_fail() {
+        let base = checksummed_run(
+            "5.7.42",
+            vec![
+                with_cs(fp("q_same", 10, 0, 1_000), "aaaa", 10, 100, false),
+                with_cs(fp("q_diff", 10, 0, 1_000), "bbbb", 10, 100, false),
+                with_cs(fp("q_nondet", 10, 0, 1_000), "cccc", 10, 100, true),
+                with_cs(fp("q_pop", 10, 0, 1_000), "dddd", 10, 100, false),
+                fp("q_uncheck", 10, 0, 1_000), // executed but never checksummed
+            ],
+        );
+        let cand = checksummed_run(
+            "8.0.46",
+            vec![
+                with_cs(fp("q_same", 10, 0, 1_000), "aaaa", 10, 100, false),
+                with_cs(fp("q_diff", 10, 0, 1_000), "eeee", 10, 90, false),
+                with_cs(fp("q_nondet", 10, 0, 1_000), "ffff", 10, 100, false),
+                with_cs(fp("q_pop", 10, 0, 1_000), "gggg", 7, 70, false),
+                fp("q_uncheck", 10, 0, 1_000),
+            ],
+        );
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        let corr = rep.correctness.as_ref().expect("correctness section");
+        assert_eq!(corr.checked, 4);
+        assert_eq!(corr.matched, 1);
+        // q_diff is a hard mismatch; q_nondet (flagged on either side) and
+        // q_pop (unequal checksummed-event populations) are advisory.
+        assert_eq!(corr.mismatches.len(), 1);
+        assert_eq!(corr.mismatches[0].fingerprint, "q_diff");
+        assert_eq!(corr.mismatches[0].baseline_rows, 100);
+        assert_eq!(corr.mismatches[0].candidate_rows, 90);
+        assert!(!corr.mismatches[0].events_differ);
+        let advisory: Vec<&str> = corr
+            .advisory
+            .iter()
+            .map(|d| d.fingerprint.as_str())
+            .collect();
+        assert_eq!(advisory.len(), 2);
+        assert!(advisory.contains(&"q_nondet"));
+        assert!(advisory.contains(&"q_pop"));
+        assert!(rep.correctness_failed);
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("RESULT MISMATCH")));
+        let text = rep.render_stdout(10);
+        assert!(text.contains("Result correctness"));
+        assert!(text.contains("q_diff"));
+        assert!(text.contains("MISMATCH"));
+        assert!(text.contains("advisory"));
+
+        // Identical data: silent (no mismatches, no exit-2 driver).
+        let rep = compare_runs("a", &base, "b", &base, OPTS);
+        let corr = rep.correctness.as_ref().expect("correctness section");
+        assert_eq!(corr.checked, 4);
+        assert_eq!(corr.matched, 4);
+        assert!(corr.mismatches.is_empty() && corr.advisory.is_empty());
+        assert!(!rep.correctness_failed);
+    }
+
+    #[test]
+    fn checksum_flag_mismatch_warns_and_skips_correctness() {
+        let base = checksummed_run("5.7.42", vec![fp("q", 10, 0, 1_000)]);
+        let cand = run("8.0.46", vec![fp("q", 10, 0, 1_000)]);
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert!(rep.correctness.is_none());
+        assert!(!rep.correctness_failed);
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("only the baseline run recorded result checksums")));
+        assert!(rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("--checksum differs")));
+        // Neither run checksummed: no section, no warnings about it.
+        let rep = compare_runs("a", &cand, "b", &cand, OPTS);
+        assert!(rep.correctness.is_none());
+        assert!(!rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("checksum")));
     }
 
     #[test]

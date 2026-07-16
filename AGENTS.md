@@ -1,10 +1,11 @@
 # avraham-sql-tools — agent notes
 
 Cargo workspace of SQL tooling. First (and so far only) crate:
-`crates/sql-replay`, a MySQL slow-log capture + replay benchmarking tool
-with a `compare` regression gate. See `README.md` for user-facing usage
-and milestone scope (M1 capture/replay, M2 pacing + compare, M3 scale
-hardening + RHEL 8 packaging).
+`crates/sql-replay`, a MySQL slow-log/pcap capture + replay benchmarking
+tool with a `compare` regression gate. See `README.md` for user-facing
+usage and milestone scope (M1 capture/replay, M2 pacing + compare, M3
+scale hardening + RHEL 8 packaging, M4 pcap capture + result-correctness
+diffing — the final planned milestone).
 
 ## Build / test
 
@@ -91,6 +92,72 @@ tests, which are the executable spec):
 - Slow logs can contain invalid UTF-8 inside queries — capture reads raw
   bytes and converts lossily.
 
+## pcap capture source (M4)
+
+Two-module split, deliberately: `crates/sql-replay/src/mysqlproto.rs` is
+the MySQL wire-protocol decoder (packet framing, handshake, COM_QUERY,
+COM_STMT_PREPARE/EXECUTE expansion with bound-parameter interpolation) and
+never sees pcap or TCP; `crates/sql-replay/src/pcap.rs` owns pcap-file
+reading (pure-Rust `pcap-parser`, no libpcap), link/IP parsing, and
+per-4-tuple TCP reassembly. Module docs + tests of both are the spec;
+`tests/pcap_capture_test.rs` builds .pcap files byte-by-byte (never
+requires tcpdump locally). Non-obvious facts baked in:
+
+- Seq-id rule: in the command phase, "client packet with seq 0" is a
+  command; the response to it starts at the command's *last* packet seq +
+  1. Server seq wraparound in >255-packet responses must be treated as
+  continuation, not a new response (that's what `server_cont_seq` does).
+- TLS (CLIENT_SSL) and compression (CLIENT_COMPRESS/zstd) are negotiated
+  in the client handshake response — from then on the stream is opaque;
+  such connections are skipped and *counted* (`Disposition`), as are
+  mid-stream starts (no greeting seen ⇒ BadHandshake). Nothing is ever
+  silently dropped; every loss class lands in `summary.pcap` (a
+  serde-defaulted `format::PcapSummary`) and stderr warnings.
+- The mysql 8.x CLI negotiates CLIENT_QUERY_ATTRIBUTES: COM_QUERY then
+  carries an attribute section before the SQL text that must be skipped.
+  But it sends that flag even to pre-8.0 servers that never advertised
+  the capability (and then uses plain COM_QUERY), so the decoder ANDs
+  client and server (greeting) capability flags before trusting it.
+- TCP reassembly maps seqs to u64 relative offsets (wraparound and >4 GiB
+  streams); out-of-order data buffers up to 8 MiB per direction, beyond
+  that the connection counts as broken. Session id = server thread id
+  from the greeting (matches the slow-log path); reused thread ids
+  (server restart mid-capture) get synthetic ids ≥ 1<<48.
+- Event latency = request packet → first response packet on the wire
+  (recorded into `orig_query_time_s`, so `baseline` works on pcap
+  captures; it includes the capture-point→server network path, unlike
+  slow-log Query_time — README documents this).
+- CI's pcap leg tcpdumps `-i lo` (docker-proxy publishes the service
+  container port on loopback) and uses `--ssl-mode=DISABLED` on the mysql
+  CLI — without it the connection negotiates TLS and decodes to nothing.
+  `examples/wire_workload.rs` generates the binary-protocol prepared
+  statements (the CLI's text PREPARE never sends COM_STMT_PREPARE).
+
+## Result-correctness diffing (M4)
+
+`replay --checksum` + the `compare` correctness section. Design decisions
+(docs in `target.rs`/`report.rs`/`compare.rs`, tests are the spec;
+`tests/checksum_test.rs` is the mock-target E2E):
+
+- Checksums are **multiset hashes** at two levels: per-row xxh3 hashes
+  combined with commutative sum+xor+count into a per-event digest
+  (`target::ChecksumBuilder`), per-event digests combined the same way
+  into one per-fingerprint aggregate in run.json. Order-insensitive by
+  construction (session interleaving differs between runs) and O(1)
+  memory (the M3 bounded-memory invariant) — that's why it is not a
+  sorted list of row hashes. Duplicate rows don't cancel (sum term).
+- Digests are only comparable between runs of this tool over the text
+  protocol; the canonical cell encoding (`RowHasher`, type-tagged) is
+  ours. The mock target in `tests/common/mod.rs` shares it, with a
+  `data_version` knob to plant a data change.
+- `classify::is_nondeterministic` (fingerprint-text token scan) demotes
+  volatile-function/`@@var`/info-schema/LIMIT-without-ORDER fingerprints to
+  advisory; `--repeat` pass disagreement also marks nondeterministic
+  (aggregate.rs). Deterministic digest divergence sets
+  `correctness_failed` ⇒ exit 2 (same code as latency regressions).
+- A `--checksum` run's latencies include full result reads — compare
+  warns on checksum-flag mismatch and skips the correctness diff.
+
 ## Replay write gate
 
 `crates/sql-replay/src/classify.rs` (its tests are the spec): anything not
@@ -158,8 +225,9 @@ Provenance is `RunReport::latency_source` (`"recorded-slow-log"` vs
 `"replayed"`, serde-defaulted to replayed so pre-0.2.0 run.json loads);
 recorded reports have empty `target_url`/`target_server_version`
 (skip-serialized) and no settings. `compare` handles mixed pairs: a loud
-MEASUREMENT PLANES DIFFER warning (server-side Query_time under live load
-vs client-side replay wall time), replay-knob flag diffs suppressed
+MEASUREMENT PLANES DIFFER warning (recorded latencies — server-side
+slow-log Query_time or pcap request→response wire time — vs client-side
+replay wall time), replay-knob flag diffs suppressed
 (filter flags still compared — they change the workload slice), settings
 diff skipped with `settings_note`, "recorded (slow log)" in the version
 slot. Baseline errors are 0 by definition (the slow log records none) —
@@ -176,8 +244,11 @@ Fingerprints match by normalized *text*, not id (ids are capture-local).
 Exit codes: 0 no regression, 2 regression ≥ threshold (`EXIT_REGRESSED`),
 1 tool error — CI gates on this. Older run.json files still load: every
 field added after M1 (`pacing`, `target_settings`, the M3 `aborted`/
-`aggregation`/`filtered`/flag fields, and the 0.2.0 `latency_source`/
-`settings_note`) is `#[serde(default)]`, keep it that way. An aborted (Ctrl-C/SIGTERM) replay exits 130 after writing partial
+`aggregation`/`filtered`/flag fields, the 0.2.0 `latency_source`/
+`settings_note`, and the 0.3.0 checksum fields — `flags.checksum`,
+per-fingerprint `checksum`, compare's `correctness`/`correctness_failed` —
+plus the capture summary's `pcap` block) is `#[serde(default)]`, keep it
+that way. An aborted (Ctrl-C/SIGTERM) replay exits 130 after writing partial
 reports; `compare` warns when an input run is `aborted`. Target settings are read with
 `SHOW VARIABLES LIKE` (returns no row instead of erroring on unknown
 variables); the 5.7 `tx_isolation` / 8.0 `transaction_isolation` rename is
