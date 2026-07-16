@@ -161,7 +161,7 @@ enum Cmd {
         /// baseline from `sql-replay baseline`)
         #[arg(long)]
         baseline: PathBuf,
-        /// Candidate run report (e.g. the MySQL 8.0 run.json)
+        /// Candidate run report (e.g. the MySQL 8.0 or MariaDB run.json)
         #[arg(long)]
         candidate: PathBuf,
         /// Write a self-contained HTML report (inline CSS/JS, renders

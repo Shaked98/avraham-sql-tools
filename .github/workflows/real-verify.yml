@@ -2,7 +2,7 @@
 # employees dataset into mysql:5.7, mysql:8.0 and mariadb:10.11, plants
 # two large regressions on each candidate (never the 5.7 baseline), and
 # asserts that capture -> replay -> compare flags exactly those and
-# neither control class — on the same-engine 5.7 -> 8.0 pair and on the
+# no control class — on the same-engine 5.7 -> 8.0 pair and on the
 # cross-engine 5.7 -> MariaDB migration pair. See verify/README.md.
 #
 # Deliberately NOT per-PR: it downloads a ~35 MB dataset and runs minutes

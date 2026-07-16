@@ -16,8 +16,11 @@ there and stays quiet about queries that did not change.
    (v1.0.7, ~300k employees / 2.8M salary rows, row counts verified against
    the dataset's published checksums table).
 2. Sets up identical schema extras on all servers: a secondary index
-   `idx_hire_date` on `employees(hire_date)` and an audit-style
-   `verify_audit` table.
+   `idx_hire_date` on `employees(hire_date)`, an audit-style
+   `verify_audit` table, and a `verify_xmldoc` table seeded server-side
+   with 300 big-LONGTEXT rows in five deterministic size decades (~1 KB
+   to ~254 KB per row; row count and total bytes asserted identical on
+   every server).
 3. **Plants two large regressions on each candidate only** (the 5.7
    baseline is never touched):
    - drops `idx_hire_date`, so one query class degrades from an index
@@ -49,7 +52,7 @@ there and stays quiet about queries that did not change.
    violation:
    - `compare` exits 2 (the regression gate fired);
    - the regressions list is *exactly* the two planted classes;
-   - both control classes are present with their full sample and are
+   - all four control classes are present with their full sample and are
      *stable or improved* — never regressed, never low-sample;
    - the cross-engine pair (and only it) carries compare's
      "target engine families differ" warning, and the MariaDB candidate's
@@ -86,7 +89,7 @@ fast with a clear message instead of a mysterious compare verdict. If a
 class ever proves noisy in practice, add executions
 (`WORKLOAD_*` volumes) rather than loosening assertions.
 
-## Why the server config is pinned on both containers
+## Why the server config is pinned on every container
 
 On *stock defaults*, an honest, unsabotaged 8.0 already regresses the
 join+GROUP BY class ~5x p95 on real hardware — past the rig's 100%
@@ -163,9 +166,9 @@ for post-mortem poking.
   is wrong with sql-replay itself. Check the probe timings printed just
   above, and whether the MySQL images changed behavior.
 - **`FAIL planted ... class regressed`** — the whole point: sql-replay
-  failed to detect a regression that is really there. Open
-  `verify/out/report.json` and find the class's fingerprint under
-  `stable`/`improvements` to see the measured p95s.
+  failed to detect a regression that is really there. Open the failing
+  candidate's `verify/out/report{,-maria}.json` and find the class's
+  fingerprint under `stable`/`improvements` to see the measured p95s.
 - **`FAIL control ... is NOT a regression`** — a false positive on an
   untouched query class. Look at the class's p95s in the report; if the
   candidate really was 2x slower, suspect environmental asymmetry

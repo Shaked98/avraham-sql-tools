@@ -31,12 +31,12 @@
 # --warmup --repeat 3 against ALL servers, and each candidate's median
 # report is compared against the 5.7 one. The rig exits non-zero unless,
 # for EVERY candidate: compare exits 2, exactly the two planted classes are
-# in the regressions list, and both control classes are present and clean.
+# in the regressions list, and all control classes are present and clean.
 #
 # Requirements: docker, jq, curl, tar, and the sql-replay binary (built
 # from this checkout with `cargo build --release` if missing). Runtime on a
-# 4-core GitHub runner: ~15-25 minutes, most of it dataset load and the
-# deliberately slow candidate replay. verify/out/ is wiped at the start of
+# 4-core GitHub runner: ~20-30 minutes, most of it dataset loads and the
+# deliberately slow candidate replays. verify/out/ is wiped at the start of
 # each run; the ~35 MB dataset tarball is cached in verify/.cache/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -500,7 +500,7 @@ check() { # check <description> <jq filter> [extra jq args...]
 
 # ground_truth <report.json> <compare-exit> — the detection-quality
 # assertions, identical for every candidate: exactly the two planted
-# classes regress, both controls stay clean.
+# classes regress, all controls stay clean.
 ground_truth() {
   REPORT=$1
   local compare_exit=$2

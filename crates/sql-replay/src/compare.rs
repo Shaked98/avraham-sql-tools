@@ -1,6 +1,7 @@
 //! The `compare` subcommand: diff two `replay --out run.json` reports to
 //! find per-fingerprint latency regressions (baseline vs candidate, e.g.
-//! MySQL 5.7 vs 8.0).
+//! MySQL 5.7 vs 8.0, or cross-engine MySQL 5.7 vs MariaDB — see
+//! [`server_family`]).
 //!
 //! Fingerprints are matched by normalized text (not id), so runs from
 //! different captures still line up where the workload overlaps — with

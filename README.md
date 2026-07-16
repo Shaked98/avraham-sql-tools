@@ -6,13 +6,15 @@
 Modern SQL tooling.
 
 - **sql-replay** — multi-threaded MySQL query-replay benchmarking tool for
-  5.7 → 8.0 migration testing (maintained successor to the abandoned Percona
-  Playback; unlike pt-upgrade it replays at the original concurrency).
+  5.7 → 8.0 and 5.7 → MariaDB migration testing (maintained successor to the
+  abandoned Percona Playback; unlike pt-upgrade it replays at the original
+  concurrency).
 
 ## sql-replay
 
-Replay real production load captured on MySQL 5.7 against MySQL 8.0 (or any
-other target) to find performance regressions before cutover.
+Replay real production load captured on MySQL 5.7 against MySQL 8.0,
+MariaDB, or any other MySQL-protocol target to find performance
+regressions before cutover.
 
 ### Installation
 

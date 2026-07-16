@@ -347,7 +347,7 @@ Keep the dep tree free of OpenSSL/system libs or the static build breaks
 real employees dataset against mysql:5.7/8.0 and mariadb:10.11 containers
 — plants the same two big regressions on each candidate (8.0 AND MariaDB;
 never the 5.7 baseline), asserts `compare` flags exactly those and
-neither control class, per candidate. Manual/weekly CI job, deliberately
+no control class, per candidate. Manual/weekly CI job, deliberately
 not per-PR.
 Gotchas baked into it (relearn them from its comments before changing it):
 
