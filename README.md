@@ -25,7 +25,7 @@ file. This README documents the code on `main`; check a release's notes
 for what its tag includes.
 
 ```console
-$ VERSION=0.2.0   # the latest release tag, without the leading v
+$ VERSION=0.3.0   # the latest release tag, without the leading v
 $ curl -LO https://github.com/Shaked98/avraham-sql-tools/releases/download/v$VERSION/sql-replay-$VERSION-x86_64-unknown-linux-musl.tar.gz
 $ curl -LO https://github.com/Shaked98/avraham-sql-tools/releases/download/v$VERSION/SHA256SUMS
 $ sha256sum --check --ignore-missing SHA256SUMS
