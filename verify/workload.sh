@@ -8,36 +8,49 @@
 # `verify` user (one mysql client process = one connection = one slow-log
 # thread id = one replay session).
 #
-# The four query classes (their fingerprints are the rig's ground truth —
+# The six query classes (their fingerprints are the rig's ground truth —
 # keep the SQL text in sync with the FP_* constants in verify/run.sh):
-#   pk    control  : PK point lookup on employees
-#   hire  planted  : secondary-index lookup on employees(hire_date); the rig
-#                    drops idx_hire_date on the candidate server only
-#   gb    planted  : join + GROUP BY big enough to need an internal temp
-#                    table (> 2 MiB); the rig strangles temptable_max_ram on
-#                    the candidate server so it spills to disk
-#   ins   control  : short INSERT stream into an audit-style table
+#   pk     control  : PK point lookup on employees
+#   hire   planted  : secondary-index lookup on employees(hire_date); the rig
+#                     drops idx_hire_date on the candidate server only
+#   gb     planted  : join + GROUP BY big enough to need an internal temp
+#                     table (> 2 MiB); the rig strangles temptable_max_ram on
+#                     the candidate server so it spills to disk
+#   ins    control  : short INSERT stream into an audit-style table
+#   xmlpt  control  : big-LONGTEXT point fetch — SELECT xmldata FROM
+#                     verify_xmldoc WHERE id = N; rows span 1 KB..254 KB
+#                     (five size decades), so this class also exercises the
+#                     per-fingerprint byte stats and size-decade buckets on
+#                     real big rows
+#   xmlin  control  : the same big rows fetched four at a time via
+#                     WHERE id IN (a, b, c, d)
 #
 # Sessions have roles: GB_SESSIONS run only the heavy gb class,
-# HIRE_SESSIONS run only the hire class (both planted), and the rest — the
-# fast sessions — interleave the two control classes (pk, ins). Every
-# heavy session opens with SELECT SLEEP(GATE_SECS): at replay --speed max
-# that first event parks the heavy sessions on both servers (near-zero
-# CPU, identical cost) while the control sessions complete their entire
-# run on an otherwise idle box. Without the gate the planted classes'
-# CPU burn inflates the sub-ms controls' p95 through scheduler contention
-# — measurably worse on the deliberately slower candidate, i.e. a
-# false-positive machine (run 2 of the rig measured the pk control at
-# +127% p95 from contention alone).
+# HIRE_SESSIONS run only the hire class (both planted), XML_SESSIONS
+# interleave the two xml fetch classes, and the rest — the fast sessions —
+# interleave the two sub-ms control classes (pk, ins). Every
+# planted-class session opens with SELECT SLEEP(GATE_SECS): at replay
+# --speed max that first event parks those sessions on both servers
+# (near-zero CPU, identical cost) while the control sessions complete
+# their entire run on an otherwise idle box. Without the gate the planted
+# classes' CPU burn inflates the sub-ms controls' p95 through scheduler
+# contention — measurably worse on the deliberately slower candidate,
+# i.e. a false-positive machine (run 2 of the rig measured the pk control
+# at +127% p95 from contention alone). The xml sessions are deliberately
+# NOT gated: their load is symmetric (the class is never planted, both
+# servers fetch identical bytes), so running them alongside the fast wave
+# perturbs baseline and candidate equally — while gating them would land
+# them in the middle of the planted classes' asymmetric CPU burn instead.
 #
 # Usage: workload.sh gen|run|all   (env-driven; see the variables below)
 set -euo pipefail
 
 OUT_DIR=${WORKLOAD_OUT:?set WORKLOAD_OUT to the output directory}
 SEED=${WORKLOAD_SEED:-42}
-SESSIONS=${WORKLOAD_SESSIONS:-12}
+SESSIONS=${WORKLOAD_SESSIONS:-14}
 GB_SESSIONS=${WORKLOAD_GB_SESSIONS:-4}
 HIRE_SESSIONS=${WORKLOAD_HIRE_SESSIONS:-4}
+XML_SESSIONS=${WORKLOAD_XML_SESSIONS:-2}
 GATE_SECS=${WORKLOAD_GATE_SECS:-12}
 # Executions per session per class (x that role's session count = the
 # per-fingerprint sample size; keep every class >= ~200 total for stable
@@ -46,6 +59,8 @@ PK_PER_SESSION=${WORKLOAD_PK:-160}
 HIRE_PER_SESSION=${WORKLOAD_HIRE:-90}
 GB_PER_SESSION=${WORKLOAD_GB:-50}
 INS_PER_SESSION=${WORKLOAD_INS:-120}
+XML_PT_PER_SESSION=${WORKLOAD_XML_PT:-100}
+XML_IN_PER_SESSION=${WORKLOAD_XML_IN:-100}
 # Only needed for `run`:
 CONTAINER=${WORKLOAD_CONTAINER:-}
 MYSQL_USER=${WORKLOAD_MYSQL_USER:-verify}
@@ -97,6 +112,31 @@ gen_gb() {
   echo "SELECT e.first_name, e.last_name, COUNT(*) AS cnt, AVG(s.salary) AS avg_sal FROM employees e JOIN salaries s ON s.emp_no = e.emp_no WHERE e.emp_no BETWEEN ${a} AND $((a + 49999)) GROUP BY e.first_name, e.last_name ORDER BY avg_sal DESC LIMIT 10;"
 }
 
+gen_xmlpt() {
+  # verify_xmldoc holds 300 rows whose xmldata spans 1 KB..254 KB in five
+  # deterministic size decades (id % 5 picks the decade; see the seeding
+  # SQL in verify/run.sh).
+  rnd 300
+  echo "SELECT xmldata FROM verify_xmldoc WHERE id = $((1 + R));"
+}
+
+gen_xmlin() {
+  # Four ids per fetch; the fingerprint normalizer collapses IN lists of
+  # any length to `in (?+)`, so the list length need not be fixed — four
+  # keeps every fetch a multi-hundred-KB result without ballooning the
+  # replay wall time.
+  local a b c d
+  rnd 300
+  a=$((1 + R))
+  rnd 300
+  b=$((1 + R))
+  rnd 300
+  c=$((1 + R))
+  rnd 300
+  d=$((1 + R))
+  echo "SELECT id, xmldata FROM verify_xmldoc WHERE id IN (${a}, ${b}, ${c}, ${d});"
+}
+
 gen_ins() {
   local actions=(login logout view update) actor act note
   rnd 100
@@ -122,6 +162,10 @@ generate() {
     elif ((s <= GB_SESSIONS + HIRE_SESSIONS)); then
       gate=1
       for ((i = 0; i < HIRE_PER_SESSION; i++)); do mix+=(hire); done
+    elif ((s <= GB_SESSIONS + HIRE_SESSIONS + XML_SESSIONS)); then
+      # No gate: xml load is symmetric across servers (see the header).
+      for ((i = 0; i < XML_PT_PER_SESSION; i++)); do mix+=(xmlpt); done
+      for ((i = 0; i < XML_IN_PER_SESSION; i++)); do mix+=(xmlin); done
     else
       for ((i = 0; i < PK_PER_SESSION; i++)); do mix+=(pk); done
       for ((i = 0; i < INS_PER_SESSION; i++)); do mix+=(ins); done

@@ -1,43 +1,58 @@
 #!/usr/bin/env bash
 # Real-data verification rig for sql-replay: prove, on the real employees
-# dataset against real MySQL 5.7 and 8.0 servers, that the capture ->
-# replay -> compare loop DETECTS deliberately planted regressions and does
-# NOT flag untouched control queries. Ground truth, not another unit suite.
+# dataset against real MySQL 5.7/8.0 and MariaDB servers, that the
+# capture -> replay -> compare loop DETECTS deliberately planted
+# regressions and does NOT flag untouched control queries. Ground truth,
+# not another unit suite.
 #
-#   baseline  mysql:5.7  loaded with github.com/datacharmer/test_db, plus a
-#             secondary index on employees(hire_date)
-#   candidate mysql:8.0  loaded identically, then sabotaged:
+#   baseline  mysql:5.7      loaded with github.com/datacharmer/test_db,
+#                            plus a secondary index on employees(hire_date)
+#   candidate mysql:8.0      loaded identically, then sabotaged:
 #               (a) idx_hire_date dropped        -> index lookups scan 300k rows
 #               (b) temptable_max_ram=2MiB (min) -> the join+GROUP BY class
 #                   + temptable_max_mmap=0          spills to on-disk temp tables
-#             while the PK-lookup and INSERT classes stay untouched as the
-#             no-false-positive control group.
+#   candidate mariadb:10.11  loaded identically, then sabotaged the same
+#             way modulo engine differences (MariaDB has no TempTable
+#             engine, so the temp-table plant floors tmp_table_size /
+#             max_heap_table_size instead):
+#               (a) idx_hire_date dropped        -> same 300k-row scans
+#               (b) tmp_table_size=1K (floor)    -> the join+GROUP BY class
+#                   + max_heap_table_size=16K       spills to on-disk Aria
+#                                                   temp tables
+#             On every candidate the PK-lookup, INSERT, and big-LONGTEXT
+#             xml-fetch classes (point and IN-list fetches of 1 KB..254 KB
+#             xmldata rows — they also pin the size-decade byte stats on
+#             real big rows) stay untouched as the no-false-positive
+#             control group. The MariaDB leg proves cross-engine detection
+#             for the 5.7 -> MariaDB migration path.
 #
-# A seeded 12-session workload (verify/workload.sh) runs against 5.7 with
+# A seeded 14-session workload (verify/workload.sh) runs against 5.7 with
 # the slow log capturing; the log is captured, replayed with
-# --warmup --repeat 3 against BOTH servers, and the median reports are
-# compared. The rig exits non-zero unless: compare exits 2, exactly the two
-# planted classes are in the regressions list, and both control classes are
-# present and clean.
+# --warmup --repeat 3 against ALL servers, and each candidate's median
+# report is compared against the 5.7 one. The rig exits non-zero unless,
+# for EVERY candidate: compare exits 2, exactly the two planted classes are
+# in the regressions list, and all control classes are present and clean.
 #
 # Requirements: docker, jq, curl, tar, and the sql-replay binary (built
 # from this checkout with `cargo build --release` if missing). Runtime on a
-# 4-core GitHub runner: ~15-25 minutes, most of it dataset load and the
-# deliberately slow candidate replay. verify/out/ is wiped at the start of
+# 4-core GitHub runner: ~20-30 minutes, most of it dataset loads and the
+# deliberately slow candidate replays. verify/out/ is wiped at the start of
 # each run; the ~35 MB dataset tarball is cached in verify/.cache/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------- knobs
 SEED=${VERIFY_SEED:-42}
-SESSIONS=${VERIFY_SESSIONS:-12}
+SESSIONS=${VERIFY_SESSIONS:-14}
 REPEAT=${VERIFY_REPEAT:-3}
 THRESHOLD_PCT=${VERIFY_THRESHOLD_PCT:-100} # compare gate: p95 must double
 MIN_COUNT=${VERIFY_MIN_COUNT:-50}
 PORT57=${VERIFY_PORT_57:-13306}
 PORT80=${VERIFY_PORT_80:-13307}
+PORTMD=${VERIFY_PORT_MARIA:-13308}
 C57=sql-replay-verify-57
 C80=sql-replay-verify-80
+CMARIA=sql-replay-verify-maria
 OUT=verify/out
 CACHE=${VERIFY_CACHE:-verify/.cache}
 BIN=${SQL_REPLAY_BIN:-target/release/sql-replay}
@@ -46,24 +61,30 @@ DATASET_SHA256=c44c140f352f35d47fdb65df60f52b779ef552822fad6c4efcfa7b134c3faf84
 
 # Session roles and per-session class volumes (see verify/workload.sh:
 # planted classes get dedicated SLEEP-gated sessions so the control
-# classes run on a quiet box; the rest are fast control sessions).
+# classes run on a quiet box; xml sessions are ungated big-LONGTEXT
+# fetchers whose load is symmetric; the rest are fast control sessions).
 GB_SESSIONS=4
 HIRE_SESSIONS=4
+XML_SESSIONS=2
 HEAVY_SESSIONS=$((GB_SESSIONS + HIRE_SESSIONS))
-FAST_SESSIONS=$((SESSIONS - HEAVY_SESSIONS))
+FAST_SESSIONS=$((SESSIONS - HEAVY_SESSIONS - XML_SESSIONS))
 PK_PER_SESSION=160 HIRE_PER_SESSION=90 GB_PER_SESSION=50 INS_PER_SESSION=120
+XML_PT_PER_SESSION=100 XML_IN_PER_SESSION=100
 TOTAL_PK=$((PK_PER_SESSION * FAST_SESSIONS))
 TOTAL_HIRE=$((HIRE_PER_SESSION * HIRE_SESSIONS))
 TOTAL_GB=$((GB_PER_SESSION * GB_SESSIONS))
 TOTAL_INS=$((INS_PER_SESSION * FAST_SESSIONS))
-TOTAL_EVENTS=$((TOTAL_PK + TOTAL_HIRE + TOTAL_GB + TOTAL_INS))
+TOTAL_XMLPT=$((XML_PT_PER_SESSION * XML_SESSIONS))
+TOTAL_XMLIN=$((XML_IN_PER_SESSION * XML_SESSIONS))
+TOTAL_EVENTS=$((TOTAL_PK + TOTAL_HIRE + TOTAL_GB + TOTAL_INS + TOTAL_XMLPT + TOTAL_XMLIN))
 # Beyond the generated statements, every session's mysql client sends
 # `select @@version_comment limit 1` on connect (batch mode included), and
-# every heavy session opens with its SELECT SLEEP gate event.
+# every planted-class (gated) session opens with its SELECT SLEEP gate
+# event.
 TOTAL_EXECUTED=$((TOTAL_EVENTS + SESSIONS + HEAVY_SESSIONS))
 ((FAST_SESSIONS >= 1)) || {
-  printf '\nFAIL: VERIFY_SESSIONS=%s leaves no control sessions: the %s heavy planted-class sessions are fixed, so it must be at least %s\n' \
-    "$SESSIONS" "$HEAVY_SESSIONS" "$((HEAVY_SESSIONS + 1))" >&2
+  printf '\nFAIL: VERIFY_SESSIONS=%s leaves no control sessions: the %s planted-class and %s xml sessions are fixed, so it must be at least %s\n' \
+    "$SESSIONS" "$HEAVY_SESSIONS" "$XML_SESSIONS" "$((HEAVY_SESSIONS + XML_SESSIONS + 1))" >&2
   exit 1
 }
 ((SESSIONS < MIN_COUNT)) || {
@@ -79,6 +100,8 @@ FP_PK='select emp_no, first_name, last_name, gender from employees where emp_no 
 FP_HIRE='select count(*), min(emp_no), max(emp_no) from employees where hire_date = ?'
 FP_GB='select e.first_name, e.last_name, count(*) as cnt, avg(s.salary) as avg_sal from employees e join salaries s on s.emp_no = e.emp_no where e.emp_no between ? and ? group by e.first_name, e.last_name order by avg_sal desc limit ?'
 FP_INS='insert into verify_audit (actor, action, note) values (?+)'
+FP_XMLPT='select xmldata from verify_xmldoc where id = ?'
+FP_XMLIN='select id, xmldata from verify_xmldoc where id in (?+)'
 # Incidental fingerprints, both deliberately below --min-count so they
 # land in the report's low_sample bucket, never the ranking: the mysql
 # client's own startup query and the heavy sessions' SLEEP gate.
@@ -109,9 +132,9 @@ timed_batch() {
 
 cleanup() {
   if [[ "${KEEP_CONTAINERS:-0}" != 1 ]]; then
-    docker rm -f "$C57" "$C80" >/dev/null 2>&1 || true
+    docker rm -f "$C57" "$C80" "$CMARIA" >/dev/null 2>&1 || true
   else
-    echo "KEEP_CONTAINERS=1: leaving $C57 (:$PORT57) and $C80 (:$PORT80) running"
+    echo "KEEP_CONTAINERS=1: leaving $C57 (:$PORT57), $C80 (:$PORT80) and $CMARIA (:$PORTMD) running"
   fi
 }
 trap cleanup EXIT
@@ -157,8 +180,8 @@ else
 fi
 DATASET_DIR=$(cd "$CACHE/test_db" && pwd)
 
-stage "start mysql:5.7 (baseline, :$PORT57) and mysql:8.0 (candidate, :$PORT80)"
-docker rm -f "$C57" "$C80" >/dev/null 2>&1 || true
+stage "start mysql:5.7 (baseline, :$PORT57), mysql:8.0 (candidate, :$PORT80) and mariadb:10.11 (candidate, :$PORTMD)"
+docker rm -f "$C57" "$C80" "$CMARIA" >/dev/null 2>&1 || true
 # Identical config apart from version quirks: 512M buffer pool so the
 # dataset stays cached (stable latencies); binlog off on 8.0 to match
 # 5.7's default (sync_binlog=1 would otherwise slow every replayed INSERT
@@ -196,24 +219,34 @@ docker run -d --name "$C80" -p "127.0.0.1:$PORT80:3306" \
   -e MYSQL_ALLOW_EMPTY_PASSWORD=yes \
   -v "$DATASET_DIR:/test_db:ro" \
   mysql:8.0 --innodb-buffer-pool-size=512M --disable-log-bin "${PINS[@]}" >/dev/null
+# The mariadb image keeps mysql/mysqladmin compat shims, so mrun/wait_ready
+# work unchanged. Binlog is already off by default; the same charset and
+# temp-table pins matter doubly here because MariaDB 10.6+ also defaults
+# character_set_server to utf8mb4.
+docker run -d --name "$CMARIA" -p "127.0.0.1:$PORTMD:3306" \
+  -e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes \
+  -v "$DATASET_DIR:/test_db:ro" \
+  mariadb:10.11 --innodb-buffer-pool-size=512M "${PINS[@]}" >/dev/null
 wait_ready "$C57"
 wait_ready "$C80"
-# Cut fsync-per-commit out of both servers identically: INSERT latencies on
+wait_ready "$CMARIA"
+# Cut fsync-per-commit out of all servers identically: INSERT latencies on
 # shared CI runners are hopeless otherwise.
 mrun "$C57" "SET GLOBAL innodb_flush_log_at_trx_commit = 2"
 mrun "$C80" "SET GLOBAL innodb_flush_log_at_trx_commit = 2"
+mrun "$CMARIA" "SET GLOBAL innodb_flush_log_at_trx_commit = 2"
 # Fail fast if a future image stops honoring the pins: the dataset has not
 # been loaded yet (tables inherit the charset at CREATE time), and a
 # silently ignored temp-table limit would quietly re-weaken the gb ground
 # truth.
-for c in "$C57" "$C80"; do
+for c in "$C57" "$C80" "$CMARIA"; do
   got=$(mrun "$c" "SELECT @@character_set_server, @@collation_server,
                    @@tmp_table_size, @@max_heap_table_size")
   [[ "$got" == $'latin1\tlatin1_swedish_ci\t134217728\t134217728' ]] ||
     die "server config pins did not apply on $c (got: $got); the gb ground truth needs them identical on both servers"
 done
 
-stage "load the employees dataset into both servers (parallel, ~2-5 min)"
+stage "load the employees dataset into all servers (parallel, ~2-5 min)"
 load() { # load <container> <logfile>
   docker exec -i -w /test_db "$1" sh -c 'mysql -uroot <employees.sql' >"$2" 2>&1
 }
@@ -221,6 +254,8 @@ load "$C57" "$OUT/load-57.log" &
 P57=$!
 load "$C80" "$OUT/load-80.log" &
 P80=$!
+load "$CMARIA" "$OUT/load-maria.log" &
+PMD=$!
 wait $P57 || {
   tail -20 "$OUT/load-57.log" >&2
   die "dataset load failed on 5.7"
@@ -229,8 +264,12 @@ wait $P80 || {
   tail -20 "$OUT/load-80.log" >&2
   die "dataset load failed on 8.0"
 }
+wait $PMD || {
+  tail -20 "$OUT/load-maria.log" >&2
+  die "dataset load failed on mariadb"
+}
 
-stage "verify both servers hold the identical canonical dataset"
+stage "verify all servers hold the identical canonical dataset"
 COUNTS_SQL="SELECT 'employees', COUNT(*) FROM employees
 UNION ALL SELECT 'departments', COUNT(*) FROM departments
 UNION ALL SELECT 'dept_manager', COUNT(*) FROM dept_manager
@@ -238,16 +277,20 @@ UNION ALL SELECT 'dept_emp', COUNT(*) FROM dept_emp
 UNION ALL SELECT 'titles', COUNT(*) FROM titles
 UNION ALL SELECT 'salaries', COUNT(*) FROM salaries"
 CANONICAL=$'employees\t300024\ndepartments\t9\ndept_manager\t24\ndept_emp\t331603\ntitles\t443308\nsalaries\t2844047'
-for c in "$C57" "$C80"; do
+for c in "$C57" "$C80" "$CMARIA"; do
   got=$(mrun "$c" "$COUNTS_SQL" employees)
   [[ "$got" == "$CANONICAL" ]] || {
     printf 'expected:\n%s\ngot from %s:\n%s\n' "$CANONICAL" "$c" "$got" >&2
     die "dataset row counts wrong on $c"
   }
 done
-echo "row counts match the canonical employees dataset on both servers"
+echo "row counts match the canonical employees dataset on all servers"
 
-stage "common setup on both servers (index, audit table, ANALYZE)"
+stage "common setup on all servers (index, audit + xmldoc tables, ANALYZE)"
+# verify_xmldoc: 300 big-LONGTEXT rows for the xml fetch classes. id % 5
+# picks one of five deterministic size decades (~1 KB, ~4 KB, ~16 KB,
+# ~63 KB, ~254 KB — a ~20 MB table), generated server-side from the
+# employees PK range so the content is bit-identical on every server.
 SETUP_SQL="ALTER TABLE employees ADD INDEX idx_hire_date (hire_date);
 CREATE TABLE verify_audit (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -256,21 +299,52 @@ CREATE TABLE verify_audit (
   note VARCHAR(64) NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
-ANALYZE TABLE employees, salaries;"
+CREATE TABLE verify_xmldoc (
+  id INT NOT NULL PRIMARY KEY,
+  xmldata LONGTEXT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO verify_xmldoc (id, xmldata)
+SELECT emp_no - 10000,
+       CONCAT('<doc id=\"', emp_no, '\"><body>',
+              REPEAT('<item><name>lorem ipsum dolor</name><qty>42</qty></item>',
+                     16 * POW(4, (emp_no - 10001) % 5)),
+              '</body></doc>')
+FROM employees WHERE emp_no BETWEEN 10001 AND 10300;
+ANALYZE TABLE employees, salaries, verify_xmldoc;"
 mrun "$C57" "$SETUP_SQL" employees >/dev/null
 mrun "$C80" "$SETUP_SQL" employees >/dev/null
+mrun "$CMARIA" "$SETUP_SQL" employees >/dev/null
+# The xml ground truth needs identical payloads everywhere: pin the row
+# count and total decoded bytes to the 5.7 reference on every server.
+XMLREF=$(mrun "$C57" "SELECT COUNT(*), SUM(LENGTH(xmldata)) FROM verify_xmldoc" employees)
+[[ "$XMLREF" == 300$'\t'* ]] || die "verify_xmldoc seeding produced unexpected shape on 5.7: $XMLREF"
+echo "verify_xmldoc: $XMLREF (rows, total bytes)"
+for c in "$C80" "$CMARIA"; do
+  got=$(mrun "$c" "SELECT COUNT(*), SUM(LENGTH(xmldata)) FROM verify_xmldoc" employees)
+  [[ "$got" == "$XMLREF" ]] ||
+    die "verify_xmldoc differs on $c (got: $got, want: $XMLREF) — xml classes need identical payloads"
+done
 # Dedicated workload user on the capture side, so replay can --filter-user
 # and the rig's own admin statements never become replayed events.
 mrun "$C57" "CREATE USER 'verify'@'%' IDENTIFIED BY 'verify';
 GRANT SELECT, INSERT ON employees.* TO 'verify'@'%';"
 
-stage "plant regressions on the 8.0 candidate ONLY"
+stage "plant regressions on the candidates ONLY (never the 5.7 baseline)"
 mrun "$C80" "ALTER TABLE employees DROP INDEX idx_hire_date" employees
 # 2 MiB is temptable_max_ram's floor; with mmap overflow disabled, any
 # internal temp table above it becomes an on-disk InnoDB temp table.
 mrun "$C80" "SET GLOBAL temptable_max_ram = 2097152"
 mrun "$C80" "SET GLOBAL temptable_max_mmap = 0"
-echo "planted: idx_hire_date dropped; temptable_max_ram=2MiB, mmap overflow off"
+echo "planted on 8.0: idx_hire_date dropped; temptable_max_ram=2MiB, mmap overflow off"
+mrun "$CMARIA" "ALTER TABLE employees DROP INDEX idx_hire_date" employees
+# MariaDB has no TempTable engine (and no temptable_max_ram): the
+# equivalent plant floors the classic MEMORY-engine limits, so the gb
+# class's several-MiB internal temp table converts to an on-disk Aria
+# table on every query. 1K/16K are the variables' documented minimums;
+# SET GLOBAL affects new connections, and replay connects fresh.
+mrun "$CMARIA" "SET GLOBAL tmp_table_size = 1024"
+mrun "$CMARIA" "SET GLOBAL max_heap_table_size = 16384"
+echo "planted on mariadb: idx_hire_date dropped; tmp_table_size=1K, max_heap_table_size=16K"
 
 stage "verify the plants actually bite (probe timings, min work before the long replay)"
 have_idx() { # have_idx <container> -> row count of the index in i_s
@@ -280,6 +354,7 @@ have_idx() { # have_idx <container> -> row count of the index in i_s
 }
 [[ "$(have_idx "$C57")" == 1 ]] || die "idx_hire_date missing on the 5.7 baseline"
 [[ "$(have_idx "$C80")" == 0 ]] || die "idx_hire_date still present on the 8.0 candidate"
+[[ "$(have_idx "$CMARIA")" == 0 ]] || die "idx_hire_date still present on the mariadb candidate"
 
 # 20 index-class lookups per batch: client startup cost amortizes away.
 for i in $(seq 1 20); do
@@ -290,17 +365,17 @@ for i in 1 2 3; do
   echo "SELECT e.first_name, e.last_name, COUNT(*) AS cnt, AVG(s.salary) AS avg_sal FROM employees e JOIN salaries s ON s.emp_no = e.emp_no WHERE e.emp_no BETWEEN 200000 AND 249999 GROUP BY e.first_name, e.last_name ORDER BY avg_sal DESC LIMIT 10;"
 done >"$OUT/probe-gb.sql"
 
-probe_ratio() { # probe_ratio <file> <label> <min-ratio>
-  local ms57 ms80
+probe_ratio() { # probe_ratio <candidate-container> <cand-label> <file> <label> <min-ratio>
+  local cand=$1 cand_label=$2 file=$3 label=$4 min=$5 ms57 msc
   # First run doubles as cache warm-up on both sides; measure the second.
-  timed_batch "$C57" "$1" >/dev/null
-  ms57=$(timed_batch "$C57" "$1")
-  timed_batch "$C80" "$1" >/dev/null
-  ms80=$(timed_batch "$C80" "$1")
-  echo "probe $2: 5.7=${ms57}ms 8.0=${ms80}ms (batch)" >&2
+  timed_batch "$C57" "$file" >/dev/null
+  ms57=$(timed_batch "$C57" "$file")
+  timed_batch "$cand" "$file" >/dev/null
+  msc=$(timed_batch "$cand" "$file")
+  echo "probe $label: 5.7=${ms57}ms $cand_label=${msc}ms (batch)" >&2
   [[ "$ms57" -gt 0 ]] || ms57=1
-  if ((ms80 < $3 * ms57)); then
-    die "plant '$2' looks ineffective: 8.0 batch ${ms80}ms vs 5.7 ${ms57}ms (need ${3}x); tune the plant/workload before trusting compare"
+  if ((msc < min * ms57)); then
+    die "plant '$label' looks ineffective: $cand_label batch ${msc}ms vs 5.7 ${ms57}ms (need ${min}x); tune the plant/workload before trusting compare"
   fi
 }
 tmp_disk_delta() { # Created_tmp_disk_tables delta for one gb-class query
@@ -312,13 +387,18 @@ tmp_disk_delta() { # Created_tmp_disk_tables delta for one gb-class query
 }
 SPILL57=$(tmp_disk_delta "$C57")
 SPILL80=$(tmp_disk_delta "$C80")
-echo "gb probe on-disk temp tables created: 5.7=$SPILL57 8.0=$SPILL80"
+SPILLMD=$(tmp_disk_delta "$CMARIA")
+echo "gb probe on-disk temp tables created: 5.7=$SPILL57 8.0=$SPILL80 mariadb=$SPILLMD"
 [[ "$SPILL57" == 0 ]] ||
   die "gb class spills to disk on the 5.7 BASELINE too (delta $SPILL57) — the planted contrast is gone; shrink the group count"
 [[ "$SPILL80" -ge 1 ]] ||
   die "gb class did not spill to disk on the 8.0 candidate — temptable plant ineffective; grow the group count"
-probe_ratio "$OUT/probe-hire.sql" "hire_date index drop" 3
-probe_ratio "$OUT/probe-gb.sql" "temptable disk spill" 2
+[[ "$SPILLMD" -ge 1 ]] ||
+  die "gb class did not spill to disk on the mariadb candidate — tmp_table_size plant ineffective; grow the group count"
+probe_ratio "$C80" "8.0" "$OUT/probe-hire.sql" "hire_date index drop (8.0)" 3
+probe_ratio "$C80" "8.0" "$OUT/probe-gb.sql" "temptable disk spill (8.0)" 2
+probe_ratio "$CMARIA" "mariadb" "$OUT/probe-hire.sql" "hire_date index drop (mariadb)" 3
+probe_ratio "$CMARIA" "mariadb" "$OUT/probe-gb.sql" "tmp-table disk spill (mariadb)" 2
 
 stage "run the seeded workload against 5.7 with the slow log capturing"
 mrun "$C57" "SET GLOBAL slow_query_log_file = '/var/lib/mysql/verify-slow.log';
@@ -328,8 +408,10 @@ SET GLOBAL long_query_time = 0;
 SET GLOBAL slow_query_log = ON;"
 WORKLOAD_OUT="$OUT" WORKLOAD_SEED="$SEED" WORKLOAD_SESSIONS="$SESSIONS" \
   WORKLOAD_GB_SESSIONS="$GB_SESSIONS" WORKLOAD_HIRE_SESSIONS="$HIRE_SESSIONS" \
+  WORKLOAD_XML_SESSIONS="$XML_SESSIONS" \
   WORKLOAD_PK="$PK_PER_SESSION" WORKLOAD_HIRE="$HIRE_PER_SESSION" \
   WORKLOAD_GB="$GB_PER_SESSION" WORKLOAD_INS="$INS_PER_SESSION" \
+  WORKLOAD_XML_PT="$XML_PT_PER_SESSION" WORKLOAD_XML_IN="$XML_IN_PER_SESSION" \
   WORKLOAD_CONTAINER="$C57" verify/workload.sh all
 mrun "$C57" "SET GLOBAL slow_query_log = OFF; SET GLOBAL long_query_time = 10;"
 docker cp "$C57:/var/lib/mysql/verify-slow.log" "$OUT/verify-slow.log"
@@ -343,7 +425,7 @@ CAPTURED=$(sed -n 's/^captured \([0-9]\+\) events.*/\1/p' "$OUT/capture-summary.
 [[ -n "$CAPTURED" && "$CAPTURED" -ge "$TOTAL_EXECUTED" ]] ||
   die "capture holds ${CAPTURED:-0} events, expected >= $TOTAL_EXECUTED"
 
-stage "replay (--warmup --repeat $REPEAT) against both servers, baseline first"
+stage "replay (--warmup --repeat $REPEAT) against all servers, baseline first"
 replay() { # replay <url> <run.json>
   "$BIN" replay \
     --capture "$OUT/capture.jsonl.zst" \
@@ -365,34 +447,45 @@ assert_run() { # assert_run <run.json>
     die "$1: expected $SESSIONS sessions, got $(jq '.totals.sessions' "$1")"
   local fp want
   for spec in "$FP_PK|$TOTAL_PK" "$FP_HIRE|$TOTAL_HIRE" "$FP_GB|$TOTAL_GB" \
-    "$FP_INS|$TOTAL_INS" "$FP_VER|$SESSIONS" "$FP_SLEEP|$HEAVY_SESSIONS"; do
+    "$FP_INS|$TOTAL_INS" "$FP_XMLPT|$TOTAL_XMLPT" "$FP_XMLIN|$TOTAL_XMLIN" \
+    "$FP_VER|$SESSIONS" "$FP_SLEEP|$HEAVY_SESSIONS"; do
     fp=${spec%|*} want=${spec##*|}
     jq -e --arg fp "$fp" --argjson want "$want" \
       '[.fingerprints[] | select(.fingerprint == $fp) | .count] == [$want]' "$1" >/dev/null ||
       die "$1: fingerprint '$fp' does not have exactly $want executions"
   done
+  # The xml rows span five size decades by construction, so the byte-stat
+  # machinery must spread the point-fetch class across several
+  # size-decade buckets in every run report — a real-data pin of the
+  # 0.4.0 result-size stats on every target engine.
+  jq -e --arg fp "$FP_XMLPT" \
+    '[.fingerprints[] | select(.fingerprint == $fp) | (.size_buckets | length)] | .[0] >= 3' "$1" >/dev/null ||
+    die "$1: xml point-fetch class does not span >= 3 result-size decades"
 }
 replay "mysql://root@127.0.0.1:$PORT57/employees" "$OUT/run-baseline-57.json"
 assert_run "$OUT/run-baseline-57.json"
 replay "mysql://root@127.0.0.1:$PORT80/employees" "$OUT/run-candidate-80.json"
 assert_run "$OUT/run-candidate-80.json"
+replay "mysql://root@127.0.0.1:$PORTMD/employees" "$OUT/run-candidate-maria.json"
+assert_run "$OUT/run-candidate-maria.json"
 
-stage "compare (threshold ${THRESHOLD_PCT}% p95, min-count $MIN_COUNT) — expecting exit 2"
-set +e
-"$BIN" compare \
-  --baseline "$OUT/run-baseline-57.json" \
-  --candidate "$OUT/run-candidate-80.json" \
-  --threshold-pct "$THRESHOLD_PCT" \
-  --min-count "$MIN_COUNT" \
-  --top 20 \
-  --json "$OUT/report.json" \
-  --out "$OUT/report.html" | tee "$OUT/compare-stdout.txt"
-COMPARE_EXIT=${PIPESTATUS[0]}
-set -e
-[[ -s "$OUT/report.json" ]] || die "compare produced no report.json"
+# compare_candidate <run.json> <report-basename> <stdout-file> — exit code
+# lands in COMPARE_EXIT.
+compare_candidate() {
+  set +e
+  "$BIN" compare \
+    --baseline "$OUT/run-baseline-57.json" \
+    --candidate "$1" \
+    --threshold-pct "$THRESHOLD_PCT" \
+    --min-count "$MIN_COUNT" \
+    --top 20 \
+    --json "$OUT/$2.json" \
+    --out "$OUT/$2.html" | tee "$OUT/$3"
+  COMPARE_EXIT=${PIPESTATUS[0]}
+  set -e
+  [[ -s "$OUT/$2.json" ]] || die "compare produced no $2.json"
+}
 
-stage "ground truth"
-REPORT="$OUT/report.json"
 FAILURES=0
 check() { # check <description> <jq filter> [extra jq args...]
   local desc=$1 filter=$2
@@ -404,59 +497,113 @@ check() { # check <description> <jq filter> [extra jq args...]
     FAILURES=$((FAILURES + 1))
   fi
 }
-if [[ "$COMPARE_EXIT" == 2 ]]; then
-  echo "  ok   compare exited 2 (regression gate fired)"
-else
-  echo "  FAIL compare exited $COMPARE_EXIT, want 2"
-  FAILURES=$((FAILURES + 1))
-fi
-check "planted index-drop class regressed" \
-  '[.regressions[].fingerprint] | index($fp) != null' --arg fp "$FP_HIRE"
-check "planted temp-table-spill class regressed" \
-  '[.regressions[].fingerprint] | index($fp) != null' --arg fp "$FP_GB"
-check "regressions list is EXACTLY the two planted classes" \
-  '.regressions | length == 2'
-check "control pk-lookup class is NOT a regression" \
-  '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_PK"
-check "control insert class is NOT a regression" \
-  '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_INS"
-check "control pk-lookup class present with a full sample (stable or improved)" \
-  '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_PK"
-check "control insert class present with a full sample (stable or improved)" \
-  '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_INS"
-check "low-sample bucket holds only the client startup query and the SLEEP gate" \
-  '([.low_sample[].fingerprint] | sort) == ([$fpver, $fpsleep] | sort)' \
-  --arg fpver "$FP_VER" --arg fpsleep "$FP_SLEEP"
-check "no fingerprints exclusive to one run" \
-  '(.only_in_baseline | length == 0) and (.only_in_candidate | length == 0)'
-check "no executed-count mismatches" '.count_mismatches == 0'
 
-stage "per-class verdicts"
-printf '%-28s %-11s %13s %13s %11s\n' class verdict "p95 5.7 (ms)" "p95 8.0 (ms)" "delta"
-row() { # row <label> <fp>
-  jq -r --arg fp "$2" --arg label "$1" '
-    def loc: if ([.regressions[].fingerprint] | index($fp)) != null then "REGRESSED"
-      elif ([.improvements[].fingerprint] | index($fp)) != null then "improved"
-      elif ([.stable[].fingerprint] | index($fp)) != null then "stable"
-      elif ([.low_sample[].fingerprint] | index($fp)) != null then "low-sample"
-      else "MISSING" end;
-    ((.regressions + .improvements + .stable + .low_sample)[] | select(.fingerprint == $fp)) as $d |
-    [$label, loc,
-     ($d.p95.baseline_us / 1000 | tostring),
-     ($d.p95.candidate_us / 1000 | tostring),
-     (if $d.p95.delta_pct == null then "n/a" else ($d.p95.delta_pct | round | tostring) + "%" end)]
-    | @tsv' "$REPORT" 2>/dev/null |
-    awk -F'\t' '{printf "%-28s %-11s %13.2f %13.2f %11s\n", $1, $2, $3, $4, $5}'
+# ground_truth <report.json> <compare-exit> — the detection-quality
+# assertions, identical for every candidate: exactly the two planted
+# classes regress, all controls stay clean.
+ground_truth() {
+  REPORT=$1
+  local compare_exit=$2
+  if [[ "$compare_exit" == 2 ]]; then
+    echo "  ok   compare exited 2 (regression gate fired)"
+  else
+    echo "  FAIL compare exited $compare_exit, want 2"
+    FAILURES=$((FAILURES + 1))
+  fi
+  check "planted index-drop class regressed" \
+    '[.regressions[].fingerprint] | index($fp) != null' --arg fp "$FP_HIRE"
+  check "planted temp-table-spill class regressed" \
+    '[.regressions[].fingerprint] | index($fp) != null' --arg fp "$FP_GB"
+  check "regressions list is EXACTLY the two planted classes" \
+    '.regressions | length == 2'
+  check "control pk-lookup class is NOT a regression" \
+    '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_PK"
+  check "control insert class is NOT a regression" \
+    '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_INS"
+  check "control xml point-fetch class is NOT a regression" \
+    '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_XMLPT"
+  check "control xml IN-fetch class is NOT a regression" \
+    '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_XMLIN"
+  check "control pk-lookup class present with a full sample (stable or improved)" \
+    '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_PK"
+  check "control insert class present with a full sample (stable or improved)" \
+    '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_INS"
+  check "control xml point-fetch class present with a full sample (stable or improved)" \
+    '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_XMLPT"
+  check "control xml IN-fetch class present with a full sample (stable or improved)" \
+    '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_XMLIN"
+  # Both runs carry byte stats for the xml classes, so compare must report
+  # the per-fingerprint result-bytes delta (identical payloads => tiny
+  # mean shift) instead of degrading to a size_note.
+  check "xml point-fetch class carries a result-bytes delta in compare" \
+    '[(.regressions + .improvements + .stable + .low_sample)[] | select(.fingerprint == $fp) | .result_bytes] | .[0] != null' \
+    --arg fp "$FP_XMLPT"
+  check "low-sample bucket holds only the client startup query and the SLEEP gate" \
+    '([.low_sample[].fingerprint] | sort) == ([$fpver, $fpsleep] | sort)' \
+    --arg fpver "$FP_VER" --arg fpsleep "$FP_SLEEP"
+  check "no fingerprints exclusive to one run" \
+    '(.only_in_baseline | length == 0) and (.only_in_candidate | length == 0)'
+  check "no executed-count mismatches" '.count_mismatches == 0'
 }
-row "hire-date (index dropped)" "$FP_HIRE"
-row "group-by (temptable spill)" "$FP_GB"
-row "pk-lookup (control)" "$FP_PK"
-row "insert (control)" "$FP_INS"
+
+verdicts() { # verdicts <report.json> <candidate-label>
+  REPORT=$1
+  printf '%-28s %-11s %13s %13s %11s\n' class verdict "p95 5.7 (ms)" "p95 $2 (ms)" "delta"
+  row() { # row <label> <fp>
+    jq -r --arg fp "$2" --arg label "$1" '
+      def loc: if ([.regressions[].fingerprint] | index($fp)) != null then "REGRESSED"
+        elif ([.improvements[].fingerprint] | index($fp)) != null then "improved"
+        elif ([.stable[].fingerprint] | index($fp)) != null then "stable"
+        elif ([.low_sample[].fingerprint] | index($fp)) != null then "low-sample"
+        else "MISSING" end;
+      ((.regressions + .improvements + .stable + .low_sample)[] | select(.fingerprint == $fp)) as $d |
+      [$label, loc,
+       ($d.p95.baseline_us / 1000 | tostring),
+       ($d.p95.candidate_us / 1000 | tostring),
+       (if $d.p95.delta_pct == null then "n/a" else ($d.p95.delta_pct | round | tostring) + "%" end)]
+      | @tsv' "$REPORT" 2>/dev/null |
+      awk -F'\t' '{printf "%-28s %-11s %13.2f %13.2f %11s\n", $1, $2, $3, $4, $5}'
+  }
+  row "hire-date (index dropped)" "$FP_HIRE"
+  row "group-by (temptable spill)" "$FP_GB"
+  row "pk-lookup (control)" "$FP_PK"
+  row "insert (control)" "$FP_INS"
+  row "xml point-fetch (control)" "$FP_XMLPT"
+  row "xml IN-fetch (control)" "$FP_XMLIN"
+}
+
+stage "compare 5.7 -> 8.0 (threshold ${THRESHOLD_PCT}% p95, min-count $MIN_COUNT) — expecting exit 2"
+compare_candidate "$OUT/run-candidate-80.json" report compare-stdout.txt
+COMPARE_EXIT_80=$COMPARE_EXIT
+
+stage "compare 5.7 -> mariadb (threshold ${THRESHOLD_PCT}% p95, min-count $MIN_COUNT) — expecting exit 2"
+compare_candidate "$OUT/run-candidate-maria.json" report-maria compare-stdout-maria.txt
+COMPARE_EXIT_MD=$COMPARE_EXIT
+
+stage "ground truth: 5.7 -> 8.0"
+ground_truth "$OUT/report.json" "$COMPARE_EXIT_80"
+# Same-engine pair: the cross-engine warning must not fire here.
+check "no engine-family warning on the same-engine pair" \
+  '[.comparability_warnings[] | select(contains("engine families differ"))] | length == 0'
+
+stage "ground truth: 5.7 -> mariadb (cross-engine)"
+ground_truth "$OUT/report-maria.json" "$COMPARE_EXIT_MD"
+# The cross-engine pair must be labeled as such, and the MariaDB target's
+# version must be reported first-class.
+check "engine-family warning present on the cross-engine pair" \
+  '[.comparability_warnings[] | select(contains("engine families differ"))] | length == 1'
+check "candidate server version reports as MariaDB" \
+  '.candidate.target_server_version | contains("MariaDB")'
+
+stage "per-class verdicts: 5.7 -> 8.0"
+verdicts "$OUT/report.json" "8.0"
+stage "per-class verdicts: 5.7 -> mariadb"
+verdicts "$OUT/report-maria.json" "maria"
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
-  echo "PASS: both planted regressions detected, both controls clean."
-  echo "reports: $OUT/report.html, $OUT/report.json"
+  echo "PASS: both planted regressions detected on every candidate, all controls clean."
+  echo "reports: $OUT/report.html, $OUT/report.json, $OUT/report-maria.html, $OUT/report-maria.json"
 else
   die "$FAILURES ground-truth assertion(s) failed (see above; reports in $OUT)"
 fi

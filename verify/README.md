@@ -7,51 +7,71 @@ there and stays quiet about queries that did not change.
 
 ## What it does
 
-1. Starts `mysql:5.7` (baseline) and `mysql:8.0` (candidate) containers —
-   both with the server charset and in-memory temp-table limits pinned
-   identically (see "Why the server config is pinned" below) — and
-   loads both with the identical, canonical
+1. Starts `mysql:5.7` (baseline), `mysql:8.0` (candidate) and
+   `mariadb:10.11` (cross-engine candidate — the 5.7 → MariaDB migration
+   path) containers — all with the server charset and in-memory
+   temp-table limits pinned identically (see "Why the server config is
+   pinned" below) — and loads each with the identical, canonical
    [employees test dataset](https://github.com/datacharmer/test_db)
    (v1.0.7, ~300k employees / 2.8M salary rows, row counts verified against
    the dataset's published checksums table).
-2. Sets up identical schema extras on both: a secondary index
-   `idx_hire_date` on `employees(hire_date)` and an audit-style
-   `verify_audit` table.
-3. **Plants two large regressions on the 8.0 candidate only:**
+2. Sets up identical schema extras on all servers: a secondary index
+   `idx_hire_date` on `employees(hire_date)`, an audit-style
+   `verify_audit` table, and a `verify_xmldoc` table seeded server-side
+   with 300 big-LONGTEXT rows in five deterministic size decades (~1 KB
+   to ~254 KB per row; row count and total bytes asserted identical on
+   every server).
+3. **Plants two large regressions on each candidate only** (the 5.7
+   baseline is never touched):
    - drops `idx_hire_date`, so one query class degrades from an index
      lookup to a 300k-row table scan (expected 10x+ on p95);
-   - sets `temptable_max_ram` to its 2 MiB floor and disables mmap
-     overflow (`temptable_max_mmap=0`), so the join + GROUP BY class —
-     whose internal temp table is several MiB — spills to on-disk InnoDB
+   - forces the join + GROUP BY class — whose internal temp table is
+     several MiB — to spill to on-disk temp tables. On 8.0:
+     `temptable_max_ram` at its 2 MiB floor with mmap overflow disabled
+     (`temptable_max_mmap=0`) → on-disk InnoDB temp tables. On MariaDB
+     (no TempTable engine, no `temptable_max_ram`): `tmp_table_size=1K` /
+     `max_heap_table_size=16K` (the variables' floors) → on-disk Aria
      temp tables.
-   The PK-lookup and INSERT classes are left untouched as the
-   **no-false-positive control group**.
-4. Runs a deterministic, seeded 12-session concurrent workload
+   The PK-lookup, INSERT, and two big-LONGTEXT xml-fetch classes are left
+   untouched as the **no-false-positive control group**.
+4. Runs a deterministic, seeded 14-session concurrent workload
    (`verify/workload.sh`) against 5.7 with the slow log capturing
-   (`long_query_time=0`), >= 200 executions per class.
+   (`long_query_time=0`), >= 200 executions per class. Two sessions fetch
+   big LONGTEXT `xmldata` rows (point lookups and 4-id `IN` fetches from a
+   seeded 300-row table spanning five size decades, ~1 KB to ~254 KB per
+   row) — they measure how each target handles large-text lookups and
+   fetches, and they pin the per-fingerprint byte stats and size-decade
+   buckets on real big rows (each run report must spread the point-fetch
+   class across >= 3 decades, and compare must carry its result-bytes
+   delta).
 5. `sql-replay capture` the slow log, `replay --warmup --repeat 3` against
-   **both** servers (baseline first, sequentially, so the runs never share
-   CPU), then `compare` the median reports with `--threshold-pct 100
-   --min-count 50`.
-6. **Asserts the ground truth** and exits non-zero on any violation:
+   **all three** servers (baseline first, sequentially, so the runs never
+   share CPU), then `compare` each candidate's median report against the
+   baseline's with `--threshold-pct 100 --min-count 50`.
+6. **Asserts the ground truth, per candidate,** and exits non-zero on any
+   violation:
    - `compare` exits 2 (the regression gate fired);
    - the regressions list is *exactly* the two planted classes;
-   - both control classes are present with their full sample and are
+   - all four control classes are present with their full sample and are
      *stable or improved* — never regressed, never low-sample;
+   - the cross-engine pair (and only it) carries compare's
+     "target engine families differ" warning, and the MariaDB candidate's
+     server version is reported first-class;
    - every stage that could silently produce nothing is checked (dataset
      row counts, non-empty slow log, exact capture/replay event counts,
      zero replay errors).
 
-A PASS/FAIL verdict per class, with the measured p95s, is printed at the
-end; `verify/out/report.html` / `report.json` carry the full compare
-output.
+A PASS/FAIL verdict per class and per candidate, with the measured p95s,
+is printed at the end; `verify/out/report{,-maria}.html` /
+`report{,-maria}.json` carry the full compare output.
 
 ## Robustness against noisy runners
 
 Detection must be reliable, so every lever pushes the same way: seeded
 workload and fixed dataset (bit-identical runs), 512 MiB buffer pools so
-data stays cached, `innodb_flush_log_at_trx_commit=2` on both servers and
-binlog off on 8.0 (fsync noise would poison the INSERT control), a warmup
+data stays cached, `innodb_flush_log_at_trx_commit=2` on every server and
+binlog off on the candidates (fsync noise would poison the INSERT
+control; MariaDB's is off by default), a warmup
 pass before measuring, medians over 3 passes, planted effects sized 10x+,
 and a 100% p95 threshold. The planted classes run in dedicated sessions
 that open with a `SELECT SLEEP(...)` gate: at `--speed max` that parks
@@ -63,13 +83,13 @@ machine; run 2 of this rig measured the PK control at +127% p95 from
 contention alone). Before the long replay, cheap probes
 verify each plant actually bites (index gone from
 `information_schema.statistics`, probe batch timing ratios, and
-`Created_tmp_disk_tables` deltas — the GROUP BY probe must spill on 8.0
-and must NOT spill on the 5.7 baseline) so a misconfigured plant fails
+`Created_tmp_disk_tables` deltas — the GROUP BY probe must spill on every
+candidate and must NOT spill on the 5.7 baseline) so a misconfigured plant fails
 fast with a clear message instead of a mysterious compare verdict. If a
 class ever proves noisy in practice, add executions
 (`WORKLOAD_*` volumes) rather than loosening assertions.
 
-## Why the server config is pinned on both containers
+## Why the server config is pinned on every container
 
 On *stock defaults*, an honest, unsabotaged 8.0 already regresses the
 join+GROUP BY class ~5x p95 on real hardware — past the rig's 100%
@@ -77,15 +97,17 @@ detection threshold. That would make the compare-level "planted
 temp-table-spill class regressed" assertion vacuous: it would keep passing
 even with the temptable plant silently broken, leaving the pre-replay
 disk-spill probe as the only real check on that plant. Two stock-default
-differences drive it, so the rig pins both identically on both containers
+differences drive it, so the rig pins both identically on every container
 (and assert-checks the pins before the dataset loads):
 
 - **`character_set_server=latin1` / `collation_server=latin1_swedish_ci`**
   (5.7's stock defaults). Stock 8.0 defaults to
-  `utf8mb4`/`utf8mb4_0900_ai_ci`, and the employees dataset DDL pins no
-  charset, so without the pin the same `CREATE TABLE` produces latin1
-  tables on 5.7 and utf8mb4 tables on 8.0 — and the gb class groups on two
-  VARCHAR name columns, 4x wider under utf8mb4 with a costlier collation.
+  `utf8mb4`/`utf8mb4_0900_ai_ci` (MariaDB 10.6+ likewise defaults to
+  `utf8mb4`, with `utf8mb4_general_ci`), and the employees dataset DDL
+  pins no charset, so without the pin the same `CREATE TABLE` produces
+  latin1 tables on 5.7 and utf8mb4 tables on the candidates — and the gb
+  class groups on two VARCHAR name columns, 4x wider under utf8mb4 (on
+  8.0 with a costlier collation on top).
 - **`tmp_table_size` / `max_heap_table_size = 128M`** (defaults: 16M).
   This is the *larger* effect, and it is easy to misattribute to the
   charset: MySQL creates an internal temp table directly **on disk** when
@@ -127,14 +149,14 @@ Requirements: a Linux host (the scripts use GNU `date +%s%N` and
 `sha256sum`, absent on stock macOS), `docker`, `jq`, `curl`, `tar`, and
 either a prebuilt `target/release/sql-replay` (point `SQL_REPLAY_BIN` at
 another binary) or `cargo` to build one. Expected runtime:
-**~15–25 minutes** (dataset load and the deliberately slow candidate
-replay dominate); ~35 MB download on first run (cached in
-`verify/.cache/`, override with `VERIFY_CACHE`), ~2 GB of docker disk.
-Ports 13306/13307 must be free
-(override with `VERIFY_PORT_57` / `VERIFY_PORT_80`; `VERIFY_SEED`,
-`VERIFY_SESSIONS`, `VERIFY_REPEAT`, `VERIFY_THRESHOLD_PCT` and
-`VERIFY_MIN_COUNT` are also
-overridable). Set `KEEP_CONTAINERS=1` to leave the two MySQL servers up
+**~20–30 minutes** (dataset loads and the deliberately slow candidate
+replays dominate); ~35 MB download on first run (cached in
+`verify/.cache/`, override with `VERIFY_CACHE`), ~3 GB of docker disk.
+Ports 13306/13307/13308 must be free
+(override with `VERIFY_PORT_57` / `VERIFY_PORT_80` / `VERIFY_PORT_MARIA`;
+`VERIFY_SEED`, `VERIFY_SESSIONS`, `VERIFY_REPEAT`, `VERIFY_THRESHOLD_PCT`
+and `VERIFY_MIN_COUNT` are also
+overridable). Set `KEEP_CONTAINERS=1` to leave the three servers up
 for post-mortem poking.
 
 ## Reading a failure
@@ -144,9 +166,9 @@ for post-mortem poking.
   is wrong with sql-replay itself. Check the probe timings printed just
   above, and whether the MySQL images changed behavior.
 - **`FAIL planted ... class regressed`** — the whole point: sql-replay
-  failed to detect a regression that is really there. Open
-  `verify/out/report.json` and find the class's fingerprint under
-  `stable`/`improvements` to see the measured p95s.
+  failed to detect a regression that is really there. Open the failing
+  candidate's `verify/out/report{,-maria}.json` and find the class's
+  fingerprint under `stable`/`improvements` to see the measured p95s.
 - **`FAIL control ... is NOT a regression`** — a false positive on an
   untouched query class. Look at the class's p95s in the report; if the
   candidate really was 2x slower, suspect environmental asymmetry
@@ -157,6 +179,10 @@ for post-mortem poking.
   (session SQL files and their outputs, slow log, capture, per-pass run
   reports) for inspection.
 
-The four query classes live in `verify/workload.sh` (SQL text) and
+The six query classes live in `verify/workload.sh` (SQL text) and
 `verify/run.sh` (`FP_*` fingerprint constants); they must stay in sync —
-the run.json per-fingerprint count assertions catch drift loudly.
+the run.json per-fingerprint count assertions catch drift loudly. The xml
+sessions are deliberately *not* SLEEP-gated: the class is never planted
+and both servers fetch identical bytes, so its load perturbs baseline and
+candidate symmetrically, whereas gating it would land it amid the planted
+classes' asymmetric CPU burn (see the gate rationale above).

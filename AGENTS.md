@@ -101,6 +101,14 @@ tests, which are the executable spec):
   are ordinary captured statements.
 - Slow logs can contain invalid UTF-8 inside queries — capture reads raw
   bytes and converts lossily.
+- The `mariadb` dialect label comes ONLY from a restart banner naming
+  MariaDB: banner-less MariaDB logs are not reliably distinguishable from
+  Percona/old-MySQL (legacy `# Time:`, shared `# Thread_id: .. Schema: ..
+  QC_hit:` line) and honestly stay `mysql-5.6-or-older`. MariaDB's
+  `log_slow_verbosity` annotation lines (`# Rows_affected:`,
+  `# Full_scan:`, `# explain:` with tab-separated plan rows, bare `#`)
+  are ignored header lines; `tests/corpus/mariadb-10.11.log` is a
+  verbatim container log pinning all of this.
 
 ## pcap capture source (M4)
 
@@ -306,7 +314,18 @@ is `#[serde(default)]`, keep it that way. An aborted (Ctrl-C/SIGTERM) replay exi
 reports; `compare` warns when an input run is `aborted`. Target settings are read with
 `SHOW VARIABLES LIKE` (returns no row instead of erroring on unknown
 variables); the 5.7 `tx_isolation` / 8.0 `transaction_isolation` rename is
-canonicalized to `transaction_isolation`.
+canonicalized to `transaction_isolation` (this also covers MariaDB 10.11,
+which has only `tx_isolation` — `transaction_isolation` arrived in 11.1).
+
+MariaDB targets are first-class: `compare::server_family()` classifies
+`target_server_version` (contains "MariaDB" ⇒ MariaDB, else MySQL; the
+`5.5.5-` wire-compat prefix is stripped for display only), and a
+cross-engine pair adds a "target engine families differ" comparability
+warning — informational, never gates the exit code. The settings snapshot
+and `--checksum` digests are engine-agnostic by construction (proven by a
+live 5.7→10.11 run and the rig's MariaDB leg). MariaDB's sql_mode default
+differs from 5.7's (no ONLY_FULL_GROUP_BY etc.) — that diff is honest,
+don't suppress it.
 
 ## Capture format
 
@@ -331,9 +350,11 @@ Keep the dep tree free of OpenSSL/system libs or the static build breaks
 
 `verify/run.sh` + `verify/workload.sh` + `.github/workflows/real-verify.yml`
 (docs: `verify/README.md`): ground-truth detection-quality check on the
-real employees dataset against mysql:5.7/8.0 containers — plants two big
-regressions on the 8.0 side, asserts `compare` flags exactly those and
-neither control class. Manual/weekly CI job, deliberately not per-PR.
+real employees dataset against mysql:5.7/8.0 and mariadb:10.11 containers
+— plants the same two big regressions on each candidate (8.0 AND MariaDB;
+never the 5.7 baseline), asserts `compare` flags exactly those and
+no control class, per candidate. Manual/weekly CI job, deliberately
+not per-PR.
 Gotchas baked into it (relearn them from its comments before changing it):
 
 - The mysql client sends `select @@version_comment limit 1` on EVERY
@@ -356,7 +377,14 @@ Gotchas baked into it (relearn them from its comments before changing it):
   honest, unsabotaged 8.0 regresses the join+GROUP BY class past the 100%
   threshold, making the compare-level temptable-plant assertion vacuous.
   Rationale + measurements in verify/README.md ("Why the server config is
-  pinned").
+  pinned"). The pins apply to the MariaDB container too (MariaDB 10.6+
+  also defaults to utf8mb4).
+- MariaDB has no TempTable engine / `temptable_max_ram`: its temp-table
+  plant floors `tmp_table_size=1K` + `max_heap_table_size=16K` instead
+  (spills to on-disk Aria; measured ~9x on the gb probe). The mariadb
+  image keeps `mysql`/`mysqladmin` shims, so `mrun`/`wait_ready` work
+  unchanged; the empty-root-password env var is
+  `MARIADB_ALLOW_EMPTY_ROOT_PASSWORD`.
 
 ## Fuzzing (`fuzz/`)
 

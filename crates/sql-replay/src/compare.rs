@@ -1,6 +1,7 @@
 //! The `compare` subcommand: diff two `replay --out run.json` reports to
 //! find per-fingerprint latency regressions (baseline vs candidate, e.g.
-//! MySQL 5.7 vs 8.0).
+//! MySQL 5.7 vs 8.0, or cross-engine MySQL 5.7 vs MariaDB — see
+//! [`server_family`]).
 //!
 //! Fingerprints are matched by normalized text (not id), so runs from
 //! different captures still line up where the workload overlaps — with
@@ -179,10 +180,12 @@ impl RunMeta {
 
     /// The server version for display: recorded baselines have none (the
     /// slow log doesn't know it), so show their provenance instead of a
-    /// blank.
+    /// blank. MariaDB's replication-compat `5.5.5-` prefix (seen when the
+    /// version string comes through a proxy that forwards the wire
+    /// greeting) is stripped — `5.5.5-10.11.18-MariaDB` is not a version.
     pub fn display_server_version(&self) -> String {
         if !self.target_server_version.is_empty() {
-            self.target_server_version.clone()
+            strip_maria_compat_prefix(&self.target_server_version).to_string()
         } else if self.is_recorded() {
             "recorded (slow log)".to_string()
         } else {
@@ -206,6 +209,31 @@ impl RunMeta {
             target_settings: r.target_settings.clone(),
         }
     }
+}
+
+/// Engine family of a `SELECT VERSION()` string. MariaDB servers report
+/// versions like `10.11.18-MariaDB-ubu2204`; anything else nonempty is
+/// MySQL-family (Percona included — it tracks MySQL behavior). `None` for
+/// the empty string (recorded baselines carry no version).
+pub fn server_family(version: &str) -> Option<&'static str> {
+    if version.is_empty() {
+        None
+    } else if version.contains("MariaDB") {
+        Some("MariaDB")
+    } else {
+        Some("MySQL")
+    }
+}
+
+/// Strip MariaDB's `5.5.5-` replication-compat prefix (prepended to the
+/// wire-protocol greeting for old clients; a proxy can surface it in the
+/// version string). Real versions never have it, so only strip when the
+/// remainder names MariaDB.
+fn strip_maria_compat_prefix(version: &str) -> &str {
+    version
+        .strip_prefix("5.5.5-")
+        .filter(|rest| rest.contains("MariaDB"))
+        .unwrap_or(version)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +367,24 @@ pub fn compare_runs(
             "capture dialects differ ({} vs {})",
             baseline.capture_dialect, candidate.capture_dialect
         ));
+    }
+    // Cross-engine comparison (MySQL -> MariaDB migration validation) is a
+    // supported workflow, but the reader should know the settings diff and
+    // behavior deltas below span an engine boundary, not just a version
+    // bump.
+    if let (Some(bf), Some(cf)) = (
+        server_family(&baseline.target_server_version),
+        server_family(&candidate.target_server_version),
+    ) {
+        if bf != cf {
+            warnings.push(format!(
+                "target engine families differ: {bf} (baseline) vs {cf} (candidate) — \
+                 engine defaults (sql_mode, collations, optimizer behavior) differ by \
+                 design; entries in the settings diff may reflect differing engine \
+                 defaults rather than misconfiguration, but they still change behavior \
+                 and are worth reviewing for a migration"
+            ));
+        }
     }
     // One recorded side + one replayed side is the tool's intended
     // production-baseline workflow, but the measurement planes differ
@@ -1406,6 +1452,63 @@ mod tests {
         let rep = compare_runs("a", &base, "b", &cand, OPTS);
         assert!(rep.settings_diff.is_empty());
         assert!(rep.comparability_warnings.is_empty());
+    }
+
+    #[test]
+    fn server_family_classifies_version_strings() {
+        assert_eq!(server_family("5.7.44"), Some("MySQL"));
+        assert_eq!(server_family("8.0.46"), Some("MySQL"));
+        assert_eq!(server_family("5.7.44-48-log"), Some("MySQL")); // Percona
+        assert_eq!(server_family("10.11.18-MariaDB-ubu2204"), Some("MariaDB"));
+        assert_eq!(server_family("5.5.5-10.11.18-MariaDB"), Some("MariaDB"));
+        assert_eq!(server_family("5.5.68-MariaDB"), Some("MariaDB"));
+        assert_eq!(server_family(""), None);
+    }
+
+    #[test]
+    fn display_version_strips_the_maria_compat_prefix_only() {
+        let mut m = RunMeta::from_report("f", &run("5.5.5-10.11.18-MariaDB-log", vec![]));
+        assert_eq!(m.display_server_version(), "10.11.18-MariaDB-log");
+        // A genuine (ancient) MySQL 5.5.5 must not be mangled...
+        m.target_server_version = "5.5.5-log".to_string();
+        assert_eq!(m.display_server_version(), "5.5.5-log");
+        // ...and the prefix-less MariaDB string passes through untouched.
+        m.target_server_version = "10.11.18-MariaDB-ubu2204".to_string();
+        assert_eq!(m.display_server_version(), "10.11.18-MariaDB-ubu2204");
+    }
+
+    #[test]
+    fn cross_engine_targets_warn_same_engine_does_not() {
+        let base = run("5.7.44", vec![fp("q", 10, 0, 10_000)]);
+        let cand = run("10.11.18-MariaDB-ubu2204", vec![fp("q", 10, 0, 10_500)]);
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        let w = rep
+            .comparability_warnings
+            .iter()
+            .find(|w| w.contains("engine families differ"))
+            .expect("cross-engine warning present");
+        assert!(w.contains("MySQL (baseline)"));
+        assert!(w.contains("MariaDB (candidate)"));
+        // The warning is informational: it must not gate the exit code.
+        assert!(!rep.regressed);
+
+        // Same family (a 5.7 -> 8.0 upgrade): no engine warning.
+        let cand = run("8.0.46", vec![fp("q", 10, 0, 10_500)]);
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert!(!rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("engine families differ")));
+
+        // A recorded baseline has no version — nothing to compare families
+        // against, no warning.
+        let base = recorded_run(vec![fp("q", 10, 0, 10_000)]);
+        let cand = run("10.11.18-MariaDB-ubu2204", vec![fp("q", 10, 0, 10_500)]);
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert!(!rep
+            .comparability_warnings
+            .iter()
+            .any(|w| w.contains("engine families differ")));
     }
 
     /// A `sql-replay baseline` report: recorded latencies, no target.

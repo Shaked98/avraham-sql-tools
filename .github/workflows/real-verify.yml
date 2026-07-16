@@ -1,8 +1,9 @@
 # Real-data detection-quality verification for sql-replay: loads the real
-# employees dataset into mysql:5.7 and mysql:8.0, plants two large
-# regressions on the 8.0 side only, and asserts that
-# capture -> replay -> compare flags exactly those and neither control
-# class. See verify/README.md.
+# employees dataset into mysql:5.7, mysql:8.0 and mariadb:10.11, plants
+# two large regressions on each candidate (never the 5.7 baseline), and
+# asserts that capture -> replay -> compare flags exactly those and
+# no control class — on the same-engine 5.7 -> 8.0 pair and on the
+# cross-engine 5.7 -> MariaDB migration pair. See verify/README.md.
 #
 # Deliberately NOT per-PR: it downloads a ~35 MB dataset and runs minutes
 # of load. Trigger manually (workflow_dispatch) or let the weekly schedule
@@ -21,7 +22,7 @@ jobs:
   real-verify:
     name: planted-regression detection on the employees dataset
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75 # third dataset load + the extra MariaDB replay leg
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -38,8 +39,11 @@ jobs:
           path: |
             verify/out/report.html
             verify/out/report.json
+            verify/out/report-maria.html
+            verify/out/report-maria.json
             verify/out/run-*.json
             verify/out/capture-summary.txt
             verify/out/compare-stdout.txt
+            verify/out/compare-stdout-maria.txt
             verify/out/capture.jsonl.zst
           if-no-files-found: warn
