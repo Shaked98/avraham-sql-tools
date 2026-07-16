@@ -16,6 +16,17 @@ Replay real production load captured on MySQL 5.7 against MySQL 8.0,
 MariaDB, or any other MySQL-protocol target to find performance
 regressions before cutover.
 
+### How it works
+
+![sql-replay workflow: capture production load from the slow query log or a tcpdump pcap into one canonical capture file; replay it against a candidate MySQL 8.0 / MariaDB server (or derive a recorded baseline straight from the capture); compare the two runs into per-fingerprint and per-size-decade regression verdicts, a settings diff, an HTML report, and CI-friendly exit codes](docs/architecture.svg)
+
+Three subcommands move left to right: `capture` turns a slow query log or
+a tcpdump pcap into one canonical capture file, `replay` runs it against
+the candidate at the original concurrency (`baseline` derives a
+recorded-latency baseline instead when the source *is* production), and
+`compare` diffs the two runs into regression verdicts and an exit code CI
+can gate on.
+
 ### Installation
 
 Prebuilt binaries are published on the

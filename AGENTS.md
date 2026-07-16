@@ -13,6 +13,13 @@ came from really running the commands against the pinned release binary
 change, re-execute the walkthrough (and bump the pinned version when a
 new release ships) instead of hand-editing the outputs.
 
+`docs/architecture.svg` is a hand-written, self-contained SVG workflow
+diagram (Cantrill-style: white canvas rect, soft-fill rounded boxes,
+dashed zone containers) embedded near the top of the README and linked
+from the quickstart. No external refs/fonts — keep it that way so GitHub
+renders it in both themes; update it when subcommands, artifacts, or the
+pipeline shape change.
+
 ## Build / test
 
 ```sh

@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 660" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <!-- sql-replay workflow diagram. Hand-written SVG; self-contained (no
+       external fonts, images, or scripts) so it renders identically on
+       GitHub, in browsers, and offline. -->
+  <defs>
+    <marker id="ah-pink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#DD344C"/>
+    </marker>
+    <marker id="ah-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#7AA116"/>
+    </marker>
+    <marker id="ah-orange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#ED7100"/>
+    </marker>
+  </defs>
+
+  <!-- canvas -->
+  <rect x="0" y="0" width="1200" height="660" fill="#FFFFFF"/>
+
+  <!-- ============ header ============ -->
+  <rect x="36" y="18" width="38" height="38" rx="9" fill="#8C4FFF"/>
+  <g stroke="#FFFFFF" stroke-width="2.2" fill="none">
+    <ellipse cx="55" cy="30" rx="9" ry="3.6"/>
+    <path d="M46 30 V44 A9 3.6 0 0 0 64 44 V30"/>
+  </g>
+  <text x="88" y="40" font-size="22" font-weight="700" fill="#111827">sql-replay &#8212; capture &#183; replay &#183; compare</text>
+  <text x="88" y="60" font-size="13" fill="#6B7280">gate a MySQL 5.7 &#8594; 8.0 migration on real production load</text>
+  <text x="1164" y="38" font-size="12" fill="#9CA3AF" text-anchor="end">github.com/Shaked98/avraham-sql-tools</text>
+  <line x1="32" y1="74" x2="1168" y2="74" stroke="#E5E7EB" stroke-width="1.5"/>
+
+  <!-- ============ zone containers ============ -->
+  <rect x="32"  y="92" width="352" height="540" rx="14" fill="none" stroke="#ED7100" stroke-width="2" stroke-dasharray="7 7"/>
+  <rect x="408" y="92" width="384" height="540" rx="14" fill="none" stroke="#0073BB" stroke-width="2" stroke-dasharray="7 7"/>
+  <rect x="816" y="92" width="352" height="540" rx="14" fill="none" stroke="#7AA116" stroke-width="2" stroke-dasharray="7 7"/>
+
+  <g font-weight="700">
+    <rect x="48" y="106" width="26" height="26" rx="7" fill="#FFFFFF" stroke="#ED7100" stroke-width="2"/>
+    <text x="61" y="124.5" font-size="14" fill="#ED7100" text-anchor="middle">1</text>
+    <text x="86" y="125" font-size="16" fill="#ED7100" letter-spacing="2">CAPTURE</text>
+
+    <rect x="424" y="106" width="26" height="26" rx="7" fill="#FFFFFF" stroke="#0073BB" stroke-width="2"/>
+    <text x="437" y="124.5" font-size="14" fill="#0073BB" text-anchor="middle">2</text>
+    <text x="462" y="125" font-size="16" fill="#0073BB" letter-spacing="2">REPLAY</text>
+
+    <rect x="832" y="106" width="26" height="26" rx="7" fill="#FFFFFF" stroke="#7AA116" stroke-width="2"/>
+    <text x="845" y="124.5" font-size="14" fill="#7AA116" text-anchor="middle">3</text>
+    <text x="870" y="125" font-size="16" fill="#7AA116" letter-spacing="2">ANALYZE</text>
+  </g>
+
+  <!-- ============ arrows (under nodes) ============ -->
+  <g fill="none" stroke-width="3">
+    <!-- prod server -> two capture inputs -->
+    <path d="M192 220 V240 H123 V262" stroke="#ED7100" marker-end="url(#ah-orange)"/>
+    <path d="M192 220 V240 H291 V262" stroke="#ED7100" marker-end="url(#ah-orange)"/>
+    <!-- inputs -> capture verb -->
+    <path d="M123 324 V346 H192 V362" stroke="#DD344C" marker-end="url(#ah-pink)"/>
+    <path d="M291 324 V346 H192" stroke="#DD344C"/>
+    <!-- capture verb -> capture file -->
+    <path d="M192 414 V438" stroke="#DD344C" marker-end="url(#ah-pink)"/>
+    <!-- capture file -> replay / baseline -->
+    <path d="M312 476 H396" stroke="#DD344C"/>
+    <path d="M396 476 V179 H418" stroke="#DD344C" marker-end="url(#ah-pink)"/>
+    <path d="M396 476 V491 H418" stroke="#DD344C" marker-end="url(#ah-pink)"/>
+    <!-- replay <-> candidate server -->
+    <path d="M596 172 H626" stroke="#7AA116" marker-end="url(#ah-green)"/>
+    <path d="M632 190 H602" stroke="#DD344C" marker-end="url(#ah-pink)"/>
+    <!-- replay -> run.json -->
+    <path d="M508 202 V244" stroke="#DD344C" marker-end="url(#ah-pink)"/>
+    <!-- baseline verb -> baseline.json -->
+    <path d="M516 514 V534" stroke="#DD344C" marker-end="url(#ah-pink)"/>
+    <!-- run.json / baseline.json -> compare -->
+    <path d="M624 286 H804 V322 H886" stroke="#DD344C" marker-end="url(#ah-pink)"/>
+    <path d="M624 572 H804 V340 H886" stroke="#DD344C" marker-end="url(#ah-pink)"/>
+    <!-- compare -> outputs -->
+    <path d="M992 354 V388" stroke="#7AA116" marker-end="url(#ah-green)"/>
+    <path d="M992 486 V504" stroke="#7AA116" marker-end="url(#ah-green)"/>
+    <path d="M992 564 V578" stroke="#7AA116" marker-end="url(#ah-green)"/>
+  </g>
+  <g font-size="11" fill="#6B7280">
+    <text x="611" y="162" text-anchor="middle">SQL</text>
+    <text x="617" y="206" text-anchor="middle">rows</text>
+    <text x="712" y="280" text-anchor="middle">candidate run</text>
+    <text x="712" y="566" text-anchor="middle">baseline run</text>
+  </g>
+
+  <!-- ============ zone 1: CAPTURE ============ -->
+  <!-- production server -->
+  <rect x="72" y="156" width="240" height="64" rx="10" fill="#FBEAD2" stroke="#ED7100" stroke-width="2"/>
+  <g stroke="#ED7100" stroke-width="2" fill="#FFFFFF">
+    <ellipse cx="102" cy="175" rx="11" ry="4.5"/>
+    <path d="M91 175 V196 A11 4.5 0 0 0 113 196 V175"/>
+  </g>
+  <text x="128" y="184" font-size="14.5" font-weight="700" fill="#111827">Production MySQL 5.7</text>
+  <text x="128" y="203" font-size="11.5" fill="#6B7280">the live workload</text>
+
+  <!-- capture inputs -->
+  <rect x="48" y="268" width="150" height="56" rx="10" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.5"/>
+  <text x="123" y="291" font-size="13" font-weight="700" fill="#111827" text-anchor="middle">slow query log</text>
+  <text x="123" y="309" font-size="10.5" fill="#6B7280" text-anchor="middle" font-family="ui-monospace, Menlo, Consolas, monospace">long_query_time=0</text>
+
+  <rect x="216" y="268" width="150" height="56" rx="10" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.5"/>
+  <text x="291" y="291" font-size="13" font-weight="700" fill="#111827" text-anchor="middle">tcpdump .pcap</text>
+  <text x="291" y="309" font-size="10.5" fill="#6B7280" text-anchor="middle">wire capture (plaintext)</text>
+
+  <!-- capture verb -->
+  <rect x="102" y="368" width="180" height="46" rx="10" fill="#F3EFFE" stroke="#8C4FFF" stroke-width="2"/>
+  <text x="192" y="396" font-size="13" font-weight="700" fill="#7C3AED" text-anchor="middle" font-family="ui-monospace, Menlo, Consolas, monospace">sql-replay capture</text>
+
+  <!-- capture artifact -->
+  <rect x="72" y="444" width="240" height="64" rx="10" fill="#FFFFFF" stroke="#4B5563" stroke-width="1.8"/>
+  <path d="M92 462 h12 l6 6 v14 h-18 z M104 462 v6 h6" fill="none" stroke="#6B7280" stroke-width="1.6"/>
+  <text x="202" y="472" font-size="14" font-weight="700" fill="#111827" text-anchor="middle" font-family="ui-monospace, Menlo, Consolas, monospace">capture.jsonl.zst</text>
+  <text x="202" y="491" font-size="11" fill="#6B7280" text-anchor="middle">fingerprinted events &#183; zstd JSONL</text>
+
+  <text x="192" y="546" font-size="11.5" fill="#6B7280" text-anchor="middle">one capture format for both sources &#8212;</text>
+  <text x="192" y="562" font-size="11.5" fill="#6B7280" text-anchor="middle">replay, baseline &amp; compare don&#8217;t care</text>
+
+  <!-- ============ zone 2: REPLAY ============ -->
+  <!-- replay verb -->
+  <rect x="424" y="150" width="168" height="46" rx="10" fill="#F3EFFE" stroke="#8C4FFF" stroke-width="2"/>
+  <text x="508" y="178" font-size="13" font-weight="700" fill="#7C3AED" text-anchor="middle" font-family="ui-monospace, Menlo, Consolas, monospace">sql-replay replay</text>
+
+  <!-- candidate server -->
+  <rect x="632" y="146" width="148" height="88" rx="10" fill="#FBEAD2" stroke="#ED7100" stroke-width="2"/>
+  <g stroke="#ED7100" stroke-width="2" fill="#FFFFFF">
+    <ellipse cx="706" cy="163" rx="11" ry="4.5"/>
+    <path d="M695 163 V180 A11 4.5 0 0 0 717 180 V163"/>
+  </g>
+  <text x="706" y="205" font-size="13" font-weight="700" fill="#111827" text-anchor="middle">MySQL 8.0</text>
+  <text x="706" y="222" font-size="13" font-weight="700" fill="#111827" text-anchor="middle">MariaDB 10.11</text>
+  <text x="706" y="252" font-size="11" fill="#6B7280" text-anchor="middle">the migration candidate</text>
+
+  <!-- run.json artifact -->
+  <rect x="424" y="250" width="200" height="72" rx="10" fill="#FFFFFF" stroke="#4B5563" stroke-width="1.8"/>
+  <text x="524" y="277" font-size="14" font-weight="700" fill="#111827" text-anchor="middle" font-family="ui-monospace, Menlo, Consolas, monospace">run-8.0.json</text>
+  <text x="524" y="295" font-size="10.5" fill="#6B7280" text-anchor="middle">latency + result-set byte stats</text>
+  <text x="524" y="310" font-size="10.5" fill="#6B7280" text-anchor="middle">per fingerprint &#183; per size decade</text>
+
+  <!-- replay properties -->
+  <g font-size="12" fill="#6B7280">
+    <text x="424" y="356">&#8226; one session per captured connection</text>
+    <text x="424" y="376">&#8226; memory bounded via on-disk spool</text>
+    <text x="424" y="396">&#8226; <tspan font-family="ui-monospace, Menlo, Consolas, monospace">--speed</tspan> paces the captured timeline</text>
+    <text x="424" y="416">&#8226; <tspan font-family="ui-monospace, Menlo, Consolas, monospace">--checksum</tspan> digests every result set</text>
+  </g>
+
+  <!-- baseline lane -->
+  <rect x="424" y="468" width="184" height="46" rx="10" fill="#F3EFFE" stroke="#8C4FFF" stroke-width="2"/>
+  <text x="516" y="496" font-size="12.5" font-weight="700" fill="#7C3AED" text-anchor="middle" font-family="ui-monospace, Menlo, Consolas, monospace">sql-replay baseline</text>
+  <text x="626" y="486" font-size="11" fill="#6B7280">when 5.7 IS production</text>
+  <text x="626" y="501" font-size="11" fill="#6B7280">and can&#8217;t be replayed</text>
+
+  <rect x="424" y="538" width="200" height="64" rx="10" fill="#FFFFFF" stroke="#4B5563" stroke-width="1.8"/>
+  <text x="524" y="565" font-size="14" font-weight="700" fill="#111827" text-anchor="middle" font-family="ui-monospace, Menlo, Consolas, monospace">baseline.json</text>
+  <text x="524" y="584" font-size="10.5" fill="#6B7280" text-anchor="middle">recorded Query_time &#8212; no target</text>
+
+  <!-- ============ zone 3: ANALYZE ============ -->
+  <!-- compare verb -->
+  <rect x="892" y="308" width="200" height="46" rx="10" fill="#F3EFFE" stroke="#8C4FFF" stroke-width="2"/>
+  <text x="992" y="336" font-size="13" font-weight="700" fill="#7C3AED" text-anchor="middle" font-family="ui-monospace, Menlo, Consolas, monospace">sql-replay compare</text>
+
+  <!-- verdicts -->
+  <rect x="872" y="392" width="240" height="94" rx="10" fill="#F1F6E6" stroke="#7AA116" stroke-width="2"/>
+  <text x="992" y="416" font-size="13" font-weight="700" fill="#55700F" text-anchor="middle">Regression verdicts</text>
+  <text x="992" y="435" font-size="11" fill="#374151" text-anchor="middle">per-fingerprint p50/p95/p99 deltas</text>
+  <text x="992" y="451" font-size="11" fill="#374151" text-anchor="middle">per size-decade (big-row) splits</text>
+  <text x="992" y="467" font-size="11" fill="#374151" text-anchor="middle">settings diff &#183; result correctness</text>
+
+  <!-- html report artifact -->
+  <rect x="872" y="508" width="240" height="52" rx="10" fill="#FFFFFF" stroke="#4B5563" stroke-width="1.8"/>
+  <text x="992" y="530" font-size="12" font-weight="700" fill="#111827" text-anchor="middle" font-family="ui-monospace, Menlo, Consolas, monospace">report.html &#183; report.json</text>
+  <text x="992" y="548" font-size="10.5" fill="#6B7280" text-anchor="middle">self-contained &#8212; renders offline</text>
+
+  <!-- exit code chips -->
+  <rect x="864" y="582" width="112" height="30" rx="15" fill="#EAF3E3" stroke="#7AA116" stroke-width="2"/>
+  <text x="920" y="601.5" font-size="12" font-weight="700" fill="#55700F" text-anchor="middle">exit 0 &#8212; pass</text>
+  <rect x="986" y="582" width="140" height="30" rx="15" fill="#FBE7E9" stroke="#DD344C" stroke-width="2"/>
+  <text x="1056" y="601.5" font-size="12" font-weight="700" fill="#B91C3C" text-anchor="middle">exit 2 &#8212; regressed</text>
+  <text x="995" y="626" font-size="11" fill="#6B7280" text-anchor="middle">CI gates on the exit code</text>
+</svg>
