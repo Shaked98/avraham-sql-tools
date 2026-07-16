@@ -1,0 +1,140 @@
+mariadbd, Version: 10.11.18-MariaDB-ubu2204 (mariadb.org binary distribution). started with:
+Tcp port: 3306  Unix socket: /run/mysqld/mysqld.sock
+Time		    Id Command	Argument
+# Time: 260716 11:10:21
+# User@Host: root[root] @ localhost []
+# Thread_id: 12  Schema: shop  QC_hit: No
+# Query_time: 0.000118  Lock_time: 0.000050  Rows_sent: 1  Rows_examined: 1
+# Rows_affected: 0  Bytes_sent: 307
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	const	PRIMARY	PRIMARY	4	const	1	NULL	100.00	NULL	
+#
+use `shop`;
+SET timestamp=1784200221;
+SELECT id, name, price, added, note FROM items WHERE id = 3;
+# User@Host: root[root] @ localhost []
+# Thread_id: 13  Schema: shop  QC_hit: No
+# Query_time: 0.000079  Lock_time: 0.000027  Rows_sent: 6  Rows_examined: 10
+# Rows_affected: 0  Bytes_sent: 194
+# Full_scan: Yes  Full_join: No  Tmp_table: No  Tmp_table_on_disk: No
+# Filesort: No  Filesort_on_disk: No  Merge_passes: 0  Priority_queue: No
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	index	NULL	PRIMARY	4	NULL	10	10.00	100.00	60.00	Using where
+#
+SET timestamp=1784200221;
+SELECT id, note FROM items WHERE note IS NOT NULL ORDER BY id;
+# User@Host: root[root] @ localhost []
+# Thread_id: 12  Schema: shop  QC_hit: No
+# Query_time: 0.000043  Lock_time: 0.000010  Rows_sent: 10  Rows_examined: 20
+# Rows_affected: 0  Bytes_sent: 355
+# Full_scan: Yes  Full_join: No  Tmp_table: No  Tmp_table_on_disk: No
+# Filesort: Yes  Filesort_on_disk: No  Merge_passes: 0  Priority_queue: No
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	ALL	NULL	NULL	NULL	NULL	10	10.00	100.00	100.00	Using filesort
+#
+SET timestamp=1784200221;
+SELECT id, name, price FROM items ORDER BY price DESC;
+# User@Host: root[root] @ localhost []
+# Thread_id: 13  Schema: shop  QC_hit: No
+# Query_time: 0.000040  Lock_time: 0.000015  Rows_sent: 1  Rows_examined: 1
+# Rows_affected: 0  Bytes_sent: 307
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	const	PRIMARY	PRIMARY	4	const	1	NULL	100.00	NULL	
+#
+SET timestamp=1784200221;
+SELECT id, name, price, added, note FROM items WHERE id = 9;
+# User@Host: root[root] @ localhost []
+# Thread_id: 13  Schema: shop  QC_hit: No
+# Query_time: 0.000066  Lock_time: 0.000022  Rows_sent: 1  Rows_examined: 10
+# Rows_affected: 0  Bytes_sent: 109
+# Full_scan: Yes  Full_join: No  Tmp_table: No  Tmp_table_on_disk: No
+# Filesort: No  Filesort_on_disk: No  Merge_passes: 0  Priority_queue: No
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	ALL	NULL	NULL	NULL	NULL	10	10.00	100.00	60.00	Using where
+#
+SET timestamp=1784200221;
+SELECT SUM(price), COUNT(*) FROM items WHERE added >= '2022-01-01';
+# User@Host: root[root] @ localhost []
+# Thread_id: 12  Schema: shop  QC_hit: No
+# Query_time: 0.000063  Lock_time: 0.000021  Rows_sent: 1  Rows_examined: 10
+# Rows_affected: 0  Bytes_sent: 152
+# Full_scan: Yes  Full_join: No  Tmp_table: No  Tmp_table_on_disk: No
+# Filesort: No  Filesort_on_disk: No  Merge_passes: 0  Priority_queue: No
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	ALL	NULL	NULL	NULL	NULL	10	10.00	100.00	100.00	
+#
+SET timestamp=1784200221;
+SELECT COUNT(*), MIN(price), MAX(price) FROM items;
+# User@Host: root[root] @ localhost []
+# Thread_id: 13  Schema: shop  QC_hit: No
+# Query_time: 0.000033  Lock_time: 0.000012  Rows_sent: 1  Rows_examined: 1
+# Rows_affected: 0  Bytes_sent: 304
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	const	PRIMARY	PRIMARY	4	const	1	NULL	100.00	NULL	
+#
+SET timestamp=1784200221;
+SELECT id, name, price, added, note FROM items WHERE id = 5;
+# User@Host: root[root] @ localhost []
+# Thread_id: 12  Schema: shop  QC_hit: No
+# Query_time: 0.000041  Lock_time: 0.000014  Rows_sent: 1  Rows_examined: 1
+# Rows_affected: 0  Bytes_sent: 301
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	const	PRIMARY	PRIMARY	4	const	1	NULL	100.00	NULL	
+#
+SET timestamp=1784200221;
+SELECT id, name, price, added, note FROM items WHERE id = 7;
+# User@Host: root[root] @ localhost []
+# Thread_id: 14  Schema: shop  QC_hit: No
+# Query_time: 0.000118  Lock_time: 0.000046  Rows_sent: 4  Rows_examined: 10
+# Rows_affected: 0  Bytes_sent: 188
+# Full_scan: Yes  Full_join: No  Tmp_table: No  Tmp_table_on_disk: No
+# Filesort: No  Filesort_on_disk: No  Merge_passes: 0  Priority_queue: No
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	index	NULL	PRIMARY	4	NULL	10	10.00	100.00	40.00	Using where
+#
+SET timestamp=1784200221;
+SELECT name, price FROM items WHERE price > 50.00 ORDER BY id;
+# User@Host: root[root] @ localhost []
+# Thread_id: 14  Schema: shop  QC_hit: No
+# Query_time: 0.000075  Lock_time: 0.000013  Rows_sent: 10  Rows_examined: 30
+# Rows_affected: 0  Bytes_sent: 273
+# Tmp_tables: 1  Tmp_disk_tables: 0  Tmp_table_sizes: 1572800
+# Full_scan: Yes  Full_join: No  Tmp_table: Yes  Tmp_table_on_disk: No
+# Filesort: Yes  Filesort_on_disk: No  Merge_passes: 0  Priority_queue: No
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	ALL	NULL	NULL	NULL	NULL	10	10.00	100.00	100.00	Using temporary; Using filesort
+#
+SET timestamp=1784200221;
+SELECT added, COUNT(*) AS n FROM items GROUP BY added ORDER BY added;
+# User@Host: root[root] @ localhost []
+# Thread_id: 14  Schema: shop  QC_hit: No
+# Query_time: 0.000029  Lock_time: 0.000009  Rows_sent: 1  Rows_examined: 1
+# Rows_affected: 0  Bytes_sent: 304
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	const	PRIMARY	PRIMARY	4	const	1	NULL	100.00	NULL	
+#
+SET timestamp=1784200221;
+SELECT id, name, price, added, note FROM items WHERE id = 1;
+# User@Host: root[root] @ localhost []
+# Thread_id: 14  Schema: shop  QC_hit: No
+# Query_time: 0.000084  Lock_time: 0.000022  Rows_sent: 1  Rows_examined: 10
+# Rows_affected: 0  Bytes_sent: 75
+# Full_scan: Yes  Full_join: No  Tmp_table: No  Tmp_table_on_disk: No
+# Filesort: No  Filesort_on_disk: No  Merge_passes: 0  Priority_queue: No
+#
+# explain: id	select_type	table	type	possible_keys	key	key_len	ref	rows	r_rows	filtered	r_filtered	Extra
+# explain: 1	SIMPLE	items	ALL	NULL	NULL	NULL	NULL	10	10.00	100.00	40.00	Using where
+#
+SET timestamp=1784200221;
+SELECT AVG(price) FROM items WHERE note IS NULL;

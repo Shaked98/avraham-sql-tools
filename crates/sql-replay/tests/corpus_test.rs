@@ -248,6 +248,40 @@ fn eof_inside_open_string_literal() {
 }
 
 #[test]
+fn mariadb_10_11_container_log() {
+    // Verbatim slow log from a mariadb:10.11 container with
+    // log_slow_verbosity=query_plan,explain: the restart banner names
+    // MariaDB (dialect evidence), every entry carries the
+    // `# Thread_id: N Schema: db QC_hit:` line, and the annotation lines
+    // (`# Rows_affected:`, `# Full_scan:`, `# Tmp_tables:`, `# explain:`
+    // with tab-separated plan columns, bare `#` separators) must be
+    // consumed as headers without producing or dropping events.
+    let cap = capture_corpus("mariadb-10.11.log");
+    assert_eq!(cap.summary.event_count, 12);
+    assert_eq!(cap.summary.session_count, 3);
+    assert_eq!(cap.summary.source_dialect, "mariadb");
+
+    let e = &cap.events[0];
+    assert_eq!(e.session_id, 12);
+    assert_eq!(e.db.as_deref(), Some("shop"));
+    assert_eq!(e.ts_micros, 1_784_200_221_000_000);
+    assert_eq!(e.orig_query_time_s, 0.000118);
+    assert_eq!(
+        e.query,
+        "SELECT id, name, price, added, note FROM items WHERE id = 3"
+    );
+
+    // Every event belongs to one of the three client threads and none of
+    // the annotation lines leaked into statement text.
+    for e in &cap.events {
+        assert!((12..=14).contains(&e.session_id), "{}", e.session_id);
+        assert_eq!(e.db.as_deref(), Some("shop"));
+        assert!(!e.query.contains("explain"), "{}", e.query);
+        assert!(e.query.starts_with("SELECT"), "{}", e.query);
+    }
+}
+
+#[test]
 fn multi_megabyte_single_statement() {
     // Generated rather than committed: a multi-MB file has no place in git
     // history when 30 lines of code reproduce it deterministically.

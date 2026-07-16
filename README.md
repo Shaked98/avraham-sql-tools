@@ -88,6 +88,21 @@ diffing** (`replay --checksum` + a correctness section in `compare`).
 fingerprint, so `compare` can flag a regression that only affects big
 rows instead of averaging it away inside a mixed-size fingerprint.
 
+### Supported source and target servers
+
+Capture reads MySQL-family slow logs (5.6/5.7/8.0, Percona, MariaDB) and
+pcap captures of the MySQL wire protocol. Replay targets anything that
+speaks the MySQL protocol; **MySQL 5.7, MySQL 8.0 and MariaDB (verified
+against 10.11 LTS, the RHEL 8 AppStream migration candidate)** are
+exercised by the test suite and the real-data verification rig — for
+MariaDB that includes `--checksum` result-correctness diffing and the
+planted-regression detection ground truth, cross-engine. The settings
+snapshot tolerates engine differences (variables absent on one side are
+simply not recorded; MariaDB's `tx_isolation` is canonicalized to
+`transaction_isolation` like 5.7's), and `compare` labels a cross-engine
+pair with a "target engine families differ" comparability warning so
+settings deltas read as engine defaults to review, not noise.
+
 ### Capturing load on the source server
 
 `capture` reads a MySQL **slow query log** that contains *every* query. On
@@ -110,11 +125,16 @@ captured 6 events / 4 sessions / 5 fingerprints (dialect: mysql-5.7, admin comma
 Both the legacy (`# Time: YYMMDD HH:MM:SS`, written by MySQL 5.6/older and
 MariaDB) and modern (RFC 3339 `# Time:`, written since MySQL 5.7.2, plus the
 8.0 `log_slow_extra` fields) slow-log dialects are parsed, as are
-Percona-style `# Thread_id: ... Schema: ...` lines. The recorded dialect
-label comes from the server-restart banner when the log contains one;
+Percona/MariaDB-style `# Thread_id: ... Schema: ...` lines and MariaDB's
+`log_slow_verbosity` annotation lines (`# Rows_affected:`, `# Full_scan:`,
+`# explain:`). The recorded dialect
+label comes from the server-restart banner when the log contains one (a
+banner naming MariaDB labels the log `mariadb`);
 otherwise it is inferred from the timestamp format (`mysql-5.6-or-older` /
 `mysql-5.7-or-newer`, refined to `mysql-8.0` when `log_slow_extra` fields
-are present), and `--dialect` overrides the label either way. The capture file is zstd-compressed
+are present — MariaDB kept the legacy format, so a banner-less MariaDB
+log honestly reports the `mysql-5.6-or-older` bound), and `--dialect`
+overrides the label either way. The capture file is zstd-compressed
 JSONL: a header record, one event per query
 (`ts_micros`, `session_id`, `user`, `db`, `query`, `orig_query_time_s`,
 `fingerprint_id`), and a summary record with the fingerprint table
@@ -559,13 +579,16 @@ doubles as fuzz seeds.
 Beyond the unit/CI suites, `verify/run.sh` is a single-command,
 end-to-end **detection-quality** check on real data: it loads the
 canonical [employees dataset](https://github.com/datacharmer/test_db)
-into real `mysql:5.7` and `mysql:8.0` containers, plants two large
-regressions on the 8.0 side only (a dropped secondary index and a
-temp-table-to-disk spill via `temptable_max_ram`), runs a seeded
+into real `mysql:5.7`, `mysql:8.0` and `mariadb:10.11` containers, plants
+two large regressions on each candidate only (a dropped secondary index
+and a temp-table-to-disk spill — via `temptable_max_ram` on 8.0,
+`tmp_table_size` on MariaDB), runs a seeded
 concurrent workload through the full capture → replay → compare loop, and
-asserts that `compare` flags exactly the two planted classes while the
-untouched control classes stay clean. Runs locally on any docker-equipped
-Linux machine (~15–25 min) or in CI via the manually-triggered / weekly
+asserts that `compare` flags exactly the two planted classes — on the
+same-engine 5.7 → 8.0 pair and the cross-engine 5.7 → MariaDB pair —
+while the untouched control classes stay clean. Runs locally on any
+docker-equipped Linux machine (~20–30 min) or in CI via the
+manually-triggered / weekly
 `real-verify` workflow. See [`verify/README.md`](verify/README.md).
 
 ## License

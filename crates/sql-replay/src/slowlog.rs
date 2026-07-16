@@ -7,10 +7,12 @@
 //! fields.
 //!
 //! The reported dialect label prefers hard evidence: a restart banner's
-//! version string is authoritative; otherwise the label is inferred from
-//! the `# Time:` format (`mysql-5.6-or-older` vs `mysql-5.7-or-newer`),
-//! refined to `mysql-8.0` when `log_slow_extra` fields appear in the
-//! `# Query_time:` line.
+//! version string is authoritative (a version naming MariaDB labels the
+//! log `mariadb`); otherwise the label is inferred from the `# Time:`
+//! format (`mysql-5.6-or-older` vs `mysql-5.7-or-newer`), refined to
+//! `mysql-8.0` when `log_slow_extra` fields appear in the
+//! `# Query_time:` line. MariaDB kept the legacy `# Time:` format, so a
+//! banner-less MariaDB log honestly stays `mysql-5.6-or-older`.
 //!
 //! Notable behaviors:
 //! - `use <db>;` metadata lines are **log-global**, not per-thread: the
@@ -35,6 +37,10 @@ use time::format_description::well_known::Rfc3339;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     /// Legacy `YYMMDD HH:MM:SS` timestamps: MySQL 5.6/older or MariaDB.
+    /// Without a restart banner the two are not reliably distinguishable
+    /// (MariaDB kept the legacy format, and its `# Thread_id: .. Schema: ..
+    /// QC_hit:` line is shared with Percona Server), so the label stays
+    /// this honest bound unless a banner names MariaDB.
     Mysql56OrOlder,
     /// Exact version known from a restart banner.
     Mysql57,
@@ -42,6 +48,13 @@ pub enum Dialect {
     Mysql57OrNewer,
     /// Restart banner, or RFC 3339 plus `log_slow_extra` fields.
     Mysql80,
+    /// Restart banner names a MariaDB server (`... Version:
+    /// 10.11.18-MariaDB-ubu2204 (mariadb.org binary distribution). started
+    /// with:`). MariaDB uses the legacy `# Time:` format plus
+    /// `# Thread_id: N Schema: db QC_hit: ...` per-entry lines; its extra
+    /// annotation lines (`# Rows_affected:`, `# Full_scan:`, `# explain:`
+    /// under `log_slow_verbosity`) are ignored header lines.
+    MariaDb,
 }
 
 impl Dialect {
@@ -51,6 +64,7 @@ impl Dialect {
             Dialect::Mysql57 => "mysql-5.7",
             Dialect::Mysql57OrNewer => "mysql-5.7-or-newer",
             Dialect::Mysql80 => "mysql-8.0",
+            Dialect::MariaDb => "mariadb",
         }
     }
 }
@@ -285,7 +299,11 @@ impl SlowLogParser {
             self.set_ts_micros = None;
             if let Some(pos) = line.find(", Version: ") {
                 let ver = &line[pos + ", Version: ".len()..];
-                if ver.starts_with("5.7") {
+                // MariaDB before the numeric prefixes: MariaDB 5.x version
+                // strings also start with '5'.
+                if ver.contains("MariaDB") {
+                    self.observe_banner_dialect(Dialect::MariaDb);
+                } else if ver.starts_with("5.7") {
                     self.observe_banner_dialect(Dialect::Mysql57);
                 } else if ver.starts_with('5') {
                     self.observe_banner_dialect(Dialect::Mysql56OrOlder);
@@ -788,6 +806,81 @@ SELECT 1;
         let (qs, _, dialect) = parse_all(log);
         assert_eq!(qs.len(), 1);
         assert_eq!(dialect, Some(Dialect::Mysql57));
+    }
+
+    #[test]
+    fn mariadb_banner_sets_mariadb_dialect() {
+        // Verbatim shape of a mariadb:10.11 container log (including the
+        // verbosity annotation lines and a bare `#` separator).
+        let log = "\
+mariadbd, Version: 10.11.18-MariaDB-ubu2204 (mariadb.org binary distribution). started with:
+Tcp port: 3306  Unix socket: /run/mysqld/mysqld.sock
+Time\t\t    Id Command\tArgument
+# Time: 260716 11:10:21
+# User@Host: root[root] @ localhost []
+# Thread_id: 12  Schema: shop  QC_hit: No
+# Query_time: 0.000118  Lock_time: 0.000050  Rows_sent: 1  Rows_examined: 1
+# Rows_affected: 0  Bytes_sent: 307
+# Full_scan: Yes  Full_join: No  Tmp_table: No  Tmp_table_on_disk: No
+# Filesort: No  Filesort_on_disk: No  Merge_passes: 0  Priority_queue: No
+#
+# explain: id\tselect_type\ttable\ttype\tpossible_keys\tkey\tkey_len\tref\trows\tr_rows\tfiltered\tr_filtered\tExtra
+# explain: 1\tSIMPLE\titems\tconst\tPRIMARY\tPRIMARY\t4\tconst\t1\tNULL\t100.00\tNULL\t
+#
+use `shop`;
+SET timestamp=1784200221;
+SELECT id, name, price, added, note FROM items WHERE id = 3;
+";
+        let (qs, stats, dialect) = parse_all(log);
+        assert_eq!(dialect, Some(Dialect::MariaDb));
+        assert_eq!(stats.restarts, 1);
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].thread_id, 12);
+        assert_eq!(qs[0].db.as_deref(), Some("shop"));
+        assert_eq!(qs[0].query_time_s, 0.000118);
+        assert_eq!(
+            qs[0].query,
+            "SELECT id, name, price, added, note FROM items WHERE id = 3"
+        );
+    }
+
+    #[test]
+    fn mariadb_55_banner_beats_the_5x_prefix_guess() {
+        // MariaDB 5.5 version strings start with '5' like old MySQL; the
+        // MariaDB name must win over the numeric prefix.
+        let log = "\
+/usr/sbin/mysqld, Version: 5.5.68-MariaDB (MariaDB Server). started with:
+Tcp port: 3306  Unix socket: /var/lib/mysql/mysql.sock
+Time                 Id Command    Argument
+# Time: 230901 12:00:01
+# User@Host: u[u] @ h []
+# Thread_id: 3  Schema: shop  QC_hit: No
+# Query_time: 0.1  Lock_time: 0.0  Rows_sent: 1  Rows_examined: 1
+SET timestamp=1693569601;
+SELECT 1;
+";
+        let (qs, _, dialect) = parse_all(log);
+        assert_eq!(dialect, Some(Dialect::MariaDb));
+        assert_eq!(qs.len(), 1);
+    }
+
+    #[test]
+    fn bannerless_mariadb_log_stays_the_honest_legacy_bound() {
+        // Without a banner, MariaDB entries are indistinguishable from
+        // Percona/old-MySQL ones — the label must not guess mariadb.
+        let log = "\
+# Time: 260716 11:10:21
+# User@Host: root[root] @ localhost []
+# Thread_id: 12  Schema: shop  QC_hit: No
+# Query_time: 0.000118  Lock_time: 0.000050  Rows_sent: 1  Rows_examined: 1
+# Rows_affected: 0  Bytes_sent: 307
+SET timestamp=1784200221;
+SELECT 1;
+";
+        let (qs, _, dialect) = parse_all(log);
+        assert_eq!(dialect, Some(Dialect::Mysql56OrOlder));
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].thread_id, 12);
     }
 
     #[test]
