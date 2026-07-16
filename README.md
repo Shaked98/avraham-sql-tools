@@ -586,7 +586,10 @@ and a temp-table-to-disk spill — via `temptable_max_ram` on 8.0,
 concurrent workload through the full capture → replay → compare loop, and
 asserts that `compare` flags exactly the two planted classes — on the
 same-engine 5.7 → 8.0 pair and the cross-engine 5.7 → MariaDB pair —
-while the untouched control classes stay clean. Runs locally on any
+while the untouched control classes (PK lookups, INSERTs, and
+big-LONGTEXT `xmldata` point/`IN` fetches spanning five result-size
+decades, which also pin the byte stats and size-decade buckets on real
+big rows) stay clean. Runs locally on any
 docker-equipped Linux machine (~20–30 min) or in CI via the
 manually-triggered / weekly
 `real-verify` workflow. See [`verify/README.md`](verify/README.md).

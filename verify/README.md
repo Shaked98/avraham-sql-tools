@@ -29,11 +29,18 @@ there and stays quiet about queries that did not change.
      (no TempTable engine, no `temptable_max_ram`): `tmp_table_size=1K` /
      `max_heap_table_size=16K` (the variables' floors) → on-disk Aria
      temp tables.
-   The PK-lookup and INSERT classes are left untouched as the
-   **no-false-positive control group**.
-4. Runs a deterministic, seeded 12-session concurrent workload
+   The PK-lookup, INSERT, and two big-LONGTEXT xml-fetch classes are left
+   untouched as the **no-false-positive control group**.
+4. Runs a deterministic, seeded 14-session concurrent workload
    (`verify/workload.sh`) against 5.7 with the slow log capturing
-   (`long_query_time=0`), >= 200 executions per class.
+   (`long_query_time=0`), >= 200 executions per class. Two sessions fetch
+   big LONGTEXT `xmldata` rows (point lookups and 4-id `IN` fetches from a
+   seeded 300-row table spanning five size decades, ~1 KB to ~254 KB per
+   row) — they measure how each target handles large-text lookups and
+   fetches, and they pin the per-fingerprint byte stats and size-decade
+   buckets on real big rows (each run report must spread the point-fetch
+   class across >= 3 decades, and compare must carry its result-bytes
+   delta).
 5. `sql-replay capture` the slow log, `replay --warmup --repeat 3` against
    **all three** servers (baseline first, sequentially, so the runs never
    share CPU), then `compare` each candidate's median report against the
@@ -169,6 +176,10 @@ for post-mortem poking.
   (session SQL files and their outputs, slow log, capture, per-pass run
   reports) for inspection.
 
-The four query classes live in `verify/workload.sh` (SQL text) and
+The six query classes live in `verify/workload.sh` (SQL text) and
 `verify/run.sh` (`FP_*` fingerprint constants); they must stay in sync —
-the run.json per-fingerprint count assertions catch drift loudly.
+the run.json per-fingerprint count assertions catch drift loudly. The xml
+sessions are deliberately *not* SLEEP-gated: the class is never planted
+and both servers fetch identical bytes, so its load perturbs baseline and
+candidate symmetrically, whereas gating it would land it amid the planted
+classes' asymmetric CPU burn (see the gate rationale above).

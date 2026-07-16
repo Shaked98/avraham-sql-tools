@@ -19,12 +19,14 @@
 #               (b) tmp_table_size=1K (floor)    -> the join+GROUP BY class
 #                   + max_heap_table_size=16K       spills to on-disk Aria
 #                                                   temp tables
-#             On every candidate the PK-lookup and INSERT classes stay
-#             untouched as the no-false-positive control group. The MariaDB
-#             leg proves cross-engine detection for the 5.7 -> MariaDB
-#             migration path.
+#             On every candidate the PK-lookup, INSERT, and big-LONGTEXT
+#             xml-fetch classes (point and IN-list fetches of 1 KB..254 KB
+#             xmldata rows — they also pin the size-decade byte stats on
+#             real big rows) stay untouched as the no-false-positive
+#             control group. The MariaDB leg proves cross-engine detection
+#             for the 5.7 -> MariaDB migration path.
 #
-# A seeded 12-session workload (verify/workload.sh) runs against 5.7 with
+# A seeded 14-session workload (verify/workload.sh) runs against 5.7 with
 # the slow log capturing; the log is captured, replayed with
 # --warmup --repeat 3 against ALL servers, and each candidate's median
 # report is compared against the 5.7 one. The rig exits non-zero unless,
@@ -41,7 +43,7 @@ cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------- knobs
 SEED=${VERIFY_SEED:-42}
-SESSIONS=${VERIFY_SESSIONS:-12}
+SESSIONS=${VERIFY_SESSIONS:-14}
 REPEAT=${VERIFY_REPEAT:-3}
 THRESHOLD_PCT=${VERIFY_THRESHOLD_PCT:-100} # compare gate: p95 must double
 MIN_COUNT=${VERIFY_MIN_COUNT:-50}
@@ -59,24 +61,30 @@ DATASET_SHA256=c44c140f352f35d47fdb65df60f52b779ef552822fad6c4efcfa7b134c3faf84
 
 # Session roles and per-session class volumes (see verify/workload.sh:
 # planted classes get dedicated SLEEP-gated sessions so the control
-# classes run on a quiet box; the rest are fast control sessions).
+# classes run on a quiet box; xml sessions are ungated big-LONGTEXT
+# fetchers whose load is symmetric; the rest are fast control sessions).
 GB_SESSIONS=4
 HIRE_SESSIONS=4
+XML_SESSIONS=2
 HEAVY_SESSIONS=$((GB_SESSIONS + HIRE_SESSIONS))
-FAST_SESSIONS=$((SESSIONS - HEAVY_SESSIONS))
+FAST_SESSIONS=$((SESSIONS - HEAVY_SESSIONS - XML_SESSIONS))
 PK_PER_SESSION=160 HIRE_PER_SESSION=90 GB_PER_SESSION=50 INS_PER_SESSION=120
+XML_PT_PER_SESSION=100 XML_IN_PER_SESSION=100
 TOTAL_PK=$((PK_PER_SESSION * FAST_SESSIONS))
 TOTAL_HIRE=$((HIRE_PER_SESSION * HIRE_SESSIONS))
 TOTAL_GB=$((GB_PER_SESSION * GB_SESSIONS))
 TOTAL_INS=$((INS_PER_SESSION * FAST_SESSIONS))
-TOTAL_EVENTS=$((TOTAL_PK + TOTAL_HIRE + TOTAL_GB + TOTAL_INS))
+TOTAL_XMLPT=$((XML_PT_PER_SESSION * XML_SESSIONS))
+TOTAL_XMLIN=$((XML_IN_PER_SESSION * XML_SESSIONS))
+TOTAL_EVENTS=$((TOTAL_PK + TOTAL_HIRE + TOTAL_GB + TOTAL_INS + TOTAL_XMLPT + TOTAL_XMLIN))
 # Beyond the generated statements, every session's mysql client sends
 # `select @@version_comment limit 1` on connect (batch mode included), and
-# every heavy session opens with its SELECT SLEEP gate event.
+# every planted-class (gated) session opens with its SELECT SLEEP gate
+# event.
 TOTAL_EXECUTED=$((TOTAL_EVENTS + SESSIONS + HEAVY_SESSIONS))
 ((FAST_SESSIONS >= 1)) || {
-  printf '\nFAIL: VERIFY_SESSIONS=%s leaves no control sessions: the %s heavy planted-class sessions are fixed, so it must be at least %s\n' \
-    "$SESSIONS" "$HEAVY_SESSIONS" "$((HEAVY_SESSIONS + 1))" >&2
+  printf '\nFAIL: VERIFY_SESSIONS=%s leaves no control sessions: the %s planted-class and %s xml sessions are fixed, so it must be at least %s\n' \
+    "$SESSIONS" "$HEAVY_SESSIONS" "$XML_SESSIONS" "$((HEAVY_SESSIONS + XML_SESSIONS + 1))" >&2
   exit 1
 }
 ((SESSIONS < MIN_COUNT)) || {
@@ -92,6 +100,8 @@ FP_PK='select emp_no, first_name, last_name, gender from employees where emp_no 
 FP_HIRE='select count(*), min(emp_no), max(emp_no) from employees where hire_date = ?'
 FP_GB='select e.first_name, e.last_name, count(*) as cnt, avg(s.salary) as avg_sal from employees e join salaries s on s.emp_no = e.emp_no where e.emp_no between ? and ? group by e.first_name, e.last_name order by avg_sal desc limit ?'
 FP_INS='insert into verify_audit (actor, action, note) values (?+)'
+FP_XMLPT='select xmldata from verify_xmldoc where id = ?'
+FP_XMLIN='select id, xmldata from verify_xmldoc where id in (?+)'
 # Incidental fingerprints, both deliberately below --min-count so they
 # land in the report's low_sample bucket, never the ranking: the mysql
 # client's own startup query and the heavy sessions' SLEEP gate.
@@ -276,7 +286,11 @@ for c in "$C57" "$C80" "$CMARIA"; do
 done
 echo "row counts match the canonical employees dataset on all servers"
 
-stage "common setup on all servers (index, audit table, ANALYZE)"
+stage "common setup on all servers (index, audit + xmldoc tables, ANALYZE)"
+# verify_xmldoc: 300 big-LONGTEXT rows for the xml fetch classes. id % 5
+# picks one of five deterministic size decades (~1 KB, ~4 KB, ~16 KB,
+# ~63 KB, ~254 KB — a ~20 MB table), generated server-side from the
+# employees PK range so the content is bit-identical on every server.
 SETUP_SQL="ALTER TABLE employees ADD INDEX idx_hire_date (hire_date);
 CREATE TABLE verify_audit (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -285,10 +299,31 @@ CREATE TABLE verify_audit (
   note VARCHAR(64) NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
-ANALYZE TABLE employees, salaries;"
+CREATE TABLE verify_xmldoc (
+  id INT NOT NULL PRIMARY KEY,
+  xmldata LONGTEXT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO verify_xmldoc (id, xmldata)
+SELECT emp_no - 10000,
+       CONCAT('<doc id=\"', emp_no, '\"><body>',
+              REPEAT('<item><name>lorem ipsum dolor</name><qty>42</qty></item>',
+                     16 * POW(4, (emp_no - 10001) % 5)),
+              '</body></doc>')
+FROM employees WHERE emp_no BETWEEN 10001 AND 10300;
+ANALYZE TABLE employees, salaries, verify_xmldoc;"
 mrun "$C57" "$SETUP_SQL" employees >/dev/null
 mrun "$C80" "$SETUP_SQL" employees >/dev/null
 mrun "$CMARIA" "$SETUP_SQL" employees >/dev/null
+# The xml ground truth needs identical payloads everywhere: pin the row
+# count and total decoded bytes to the 5.7 reference on every server.
+XMLREF=$(mrun "$C57" "SELECT COUNT(*), SUM(LENGTH(xmldata)) FROM verify_xmldoc" employees)
+[[ "$XMLREF" == 300$'\t'* ]] || die "verify_xmldoc seeding produced unexpected shape on 5.7: $XMLREF"
+echo "verify_xmldoc: $XMLREF (rows, total bytes)"
+for c in "$C80" "$CMARIA"; do
+  got=$(mrun "$c" "SELECT COUNT(*), SUM(LENGTH(xmldata)) FROM verify_xmldoc" employees)
+  [[ "$got" == "$XMLREF" ]] ||
+    die "verify_xmldoc differs on $c (got: $got, want: $XMLREF) — xml classes need identical payloads"
+done
 # Dedicated workload user on the capture side, so replay can --filter-user
 # and the rig's own admin statements never become replayed events.
 mrun "$C57" "CREATE USER 'verify'@'%' IDENTIFIED BY 'verify';
@@ -373,8 +408,10 @@ SET GLOBAL long_query_time = 0;
 SET GLOBAL slow_query_log = ON;"
 WORKLOAD_OUT="$OUT" WORKLOAD_SEED="$SEED" WORKLOAD_SESSIONS="$SESSIONS" \
   WORKLOAD_GB_SESSIONS="$GB_SESSIONS" WORKLOAD_HIRE_SESSIONS="$HIRE_SESSIONS" \
+  WORKLOAD_XML_SESSIONS="$XML_SESSIONS" \
   WORKLOAD_PK="$PK_PER_SESSION" WORKLOAD_HIRE="$HIRE_PER_SESSION" \
   WORKLOAD_GB="$GB_PER_SESSION" WORKLOAD_INS="$INS_PER_SESSION" \
+  WORKLOAD_XML_PT="$XML_PT_PER_SESSION" WORKLOAD_XML_IN="$XML_IN_PER_SESSION" \
   WORKLOAD_CONTAINER="$C57" verify/workload.sh all
 mrun "$C57" "SET GLOBAL slow_query_log = OFF; SET GLOBAL long_query_time = 10;"
 docker cp "$C57:/var/lib/mysql/verify-slow.log" "$OUT/verify-slow.log"
@@ -410,12 +447,20 @@ assert_run() { # assert_run <run.json>
     die "$1: expected $SESSIONS sessions, got $(jq '.totals.sessions' "$1")"
   local fp want
   for spec in "$FP_PK|$TOTAL_PK" "$FP_HIRE|$TOTAL_HIRE" "$FP_GB|$TOTAL_GB" \
-    "$FP_INS|$TOTAL_INS" "$FP_VER|$SESSIONS" "$FP_SLEEP|$HEAVY_SESSIONS"; do
+    "$FP_INS|$TOTAL_INS" "$FP_XMLPT|$TOTAL_XMLPT" "$FP_XMLIN|$TOTAL_XMLIN" \
+    "$FP_VER|$SESSIONS" "$FP_SLEEP|$HEAVY_SESSIONS"; do
     fp=${spec%|*} want=${spec##*|}
     jq -e --arg fp "$fp" --argjson want "$want" \
       '[.fingerprints[] | select(.fingerprint == $fp) | .count] == [$want]' "$1" >/dev/null ||
       die "$1: fingerprint '$fp' does not have exactly $want executions"
   done
+  # The xml rows span five size decades by construction, so the byte-stat
+  # machinery must spread the point-fetch class across several
+  # size-decade buckets in every run report — a real-data pin of the
+  # 0.4.0 result-size stats on every target engine.
+  jq -e --arg fp "$FP_XMLPT" \
+    '[.fingerprints[] | select(.fingerprint == $fp) | (.size_buckets | length)] | .[0] >= 3' "$1" >/dev/null ||
+    die "$1: xml point-fetch class does not span >= 3 result-size decades"
 }
 replay "mysql://root@127.0.0.1:$PORT57/employees" "$OUT/run-baseline-57.json"
 assert_run "$OUT/run-baseline-57.json"
@@ -475,10 +520,24 @@ ground_truth() {
     '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_PK"
   check "control insert class is NOT a regression" \
     '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_INS"
+  check "control xml point-fetch class is NOT a regression" \
+    '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_XMLPT"
+  check "control xml IN-fetch class is NOT a regression" \
+    '[.regressions[].fingerprint] | index($fp) == null' --arg fp "$FP_XMLIN"
   check "control pk-lookup class present with a full sample (stable or improved)" \
     '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_PK"
   check "control insert class present with a full sample (stable or improved)" \
     '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_INS"
+  check "control xml point-fetch class present with a full sample (stable or improved)" \
+    '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_XMLPT"
+  check "control xml IN-fetch class present with a full sample (stable or improved)" \
+    '[(.stable + .improvements)[].fingerprint] | index($fp) != null' --arg fp "$FP_XMLIN"
+  # Both runs carry byte stats for the xml classes, so compare must report
+  # the per-fingerprint result-bytes delta (identical payloads => tiny
+  # mean shift) instead of degrading to a size_note.
+  check "xml point-fetch class carries a result-bytes delta in compare" \
+    '[(.regressions + .improvements + .stable + .low_sample)[] | select(.fingerprint == $fp) | .result_bytes] | .[0] != null' \
+    --arg fp "$FP_XMLPT"
   check "low-sample bucket holds only the client startup query and the SLEEP gate" \
     '([.low_sample[].fingerprint] | sort) == ([$fpver, $fpsleep] | sort)' \
     --arg fpver "$FP_VER" --arg fpsleep "$FP_SLEEP"
@@ -509,6 +568,8 @@ verdicts() { # verdicts <report.json> <candidate-label>
   row "group-by (temptable spill)" "$FP_GB"
   row "pk-lookup (control)" "$FP_PK"
   row "insert (control)" "$FP_INS"
+  row "xml point-fetch (control)" "$FP_XMLPT"
+  row "xml IN-fetch (control)" "$FP_XMLIN"
 }
 
 stage "compare 5.7 -> 8.0 (threshold ${THRESHOLD_PCT}% p95, min-count $MIN_COUNT) — expecting exit 2"
