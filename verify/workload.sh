@@ -83,13 +83,14 @@ gen_hire() {
 }
 
 gen_gb() {
-  # emp_no 200000..499999 is a dense block; a 50000-wide slice joins to
-  # ~330k salary rows and produces ~30k (first_name, last_name) groups —
-  # a several-MiB internal temp table, comfortably above the 2 MiB
-  # temptable_max_ram planted on the candidate yet far below the 128 MiB
-  # in-memory temp-table ceiling the rig pins on both servers (see the
-  # container start in verify/run.sh). (The spill probe in verify/run.sh
-  # asserts both sides of that window before replaying.)
+  # emp_no 200000..499999 holds two dense 100k blocks (200000-299999 and
+  # 400000-499999, a hole between them); a 50000-wide slice inside a dense
+  # block joins to ~470k salary rows and produces ~50k (first_name,
+  # last_name) groups — a several-MiB internal temp table, comfortably
+  # above the 2 MiB temptable_max_ram planted on the candidate yet far
+  # below the 128 MiB in-memory temp-table ceiling the rig pins on both
+  # servers (see the container start in verify/run.sh). (The spill probe
+  # in verify/run.sh asserts both sides of that window before replaying.)
   local a
   rnd 240001
   a=$((200000 + R))
