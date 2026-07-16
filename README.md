@@ -183,8 +183,10 @@ What the table says at a glance:
   collations don't exist there — pin `sql_mode` and charset/collation
   explicitly when migrating.
 - Cross-engine **result correctness was clean**: `--checksum` digests
-  were identical between 5.7 and MariaDB on every one of the 16
-  deterministic workload fingerprints (0 mismatches), including 15MB
+  were identical between 5.7 and MariaDB on all 14 deterministic
+  workload fingerprints (0 mismatches; of 16 checked, the other 2 are
+  the expected nondeterministic `select @@version_comment` advisory,
+  whose digests differ between engines by design), including 15MB
   LONGTEXT bodies and decimal `AVG` aggregates.
 
 Footnotes — read before quoting any number:
