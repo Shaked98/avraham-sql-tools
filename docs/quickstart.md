@@ -612,8 +612,9 @@ these are the knobs that start mattering:
   ["Why the server config is pinned"](../verify/README.md#why-the-server-config-is-pinned-on-every-container)
   for the measurements — and the executed
   [benchmark writeups](benchmarks/2026-07-16-mysql80-general.md) for
-  what stock defaults cost on a real workload (the charset change alone
-  made a GROUP BY class ~5x slower on 8.0).
+  what stock defaults cost on a real workload (stock defaults made a
+  GROUP BY class ~5x slower on 8.0 — the utf8mb4 default widening the
+  grouping keys, compounded by 8.0's temp-table spill behavior).
   `compare`'s settings diff (it records `sql_mode`,
   charset/collation, buffer pool size, and transaction isolation from
   each target) is your safety net when something slips through — read
