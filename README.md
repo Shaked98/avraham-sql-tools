@@ -1,5 +1,8 @@
 # avraham-sql-tools
 
+[![CI](https://github.com/Shaked98/avraham-sql-tools/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Shaked98/avraham-sql-tools/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Modern SQL tooling.
 
 - **sql-replay** — multi-threaded MySQL query-replay benchmarking tool for
@@ -10,6 +13,63 @@ Modern SQL tooling.
 
 Replay real production load captured on MySQL 5.7 against MySQL 8.0 (or any
 other target) to find performance regressions before cutover.
+
+### Installation
+
+Prebuilt binaries are published on the
+[GitHub releases page](https://github.com/Shaked98/avraham-sql-tools/releases).
+Each release carries a fully static `x86_64-unknown-linux-musl` tarball
+(runs on any x86_64 Linux — no glibc, OpenSSL, or other runtime
+dependency), a prebuilt RPM for RHEL 8-family hosts, and a `SHA256SUMS`
+file. This README documents the code on `main`; check a release's notes
+for what its tag includes.
+
+```console
+$ VERSION=0.2.0   # the latest release tag, without the leading v
+$ curl -LO https://github.com/Shaked98/avraham-sql-tools/releases/download/v$VERSION/sql-replay-$VERSION-x86_64-unknown-linux-musl.tar.gz
+$ curl -LO https://github.com/Shaked98/avraham-sql-tools/releases/download/v$VERSION/SHA256SUMS
+$ sha256sum --check --ignore-missing SHA256SUMS
+$ tar xzf sql-replay-$VERSION-x86_64-unknown-linux-musl.tar.gz
+$ sudo install -m755 sql-replay-$VERSION-x86_64-unknown-linux-musl/sql-replay /usr/local/bin/
+```
+
+On RHEL/Rocky/Alma/Oracle 8+ the RPM works too:
+
+```console
+$ sudo dnf install ./sql-replay-$VERSION-1.x86_64.rpm
+```
+
+To build from source instead, install stable Rust (plus a C compiler —
+zstd is the tree's one C dependency) and run:
+
+```console
+$ cargo build --release          # binary at target/release/sql-replay
+```
+
+### Quickstart
+
+Capture production load on the source server, replay it against the
+migration target, and diff the two runs:
+
+```console
+$ # 1. convert a slow query log (or a tcpdump .pcap) into a capture file
+$ sql-replay capture --input /var/lib/mysql/slow.log --out capture.jsonl.zst
+
+$ # 2. replay the capture against each server
+$ sql-replay replay --capture capture.jsonl.zst \
+    --url mysql://bench@mysql57-host:3306/ --out run-5.7.json
+$ sql-replay replay --capture capture.jsonl.zst \
+    --url mysql://bench@mysql80-host:3306/ --out run-8.0.json
+
+$ # 3. rank per-fingerprint latency regressions (exit code 2 = regression)
+$ sql-replay compare --baseline run-5.7.json --candidate run-8.0.json \
+    --out report.html
+```
+
+When the source server can't be replayed against (it *is* production),
+`sql-replay baseline` builds the baseline report from the capture's
+recorded latencies instead — see below. The rest of this document covers
+each step in depth.
 
 ### Scope
 
@@ -465,3 +525,21 @@ asserts that `compare` flags exactly the two planted classes while the
 untouched control classes stay clean. Runs locally on any docker-equipped
 Linux machine (~15–25 min) or in CI via the manually-triggered / weekly
 `real-verify` workflow. See [`verify/README.md`](verify/README.md).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
