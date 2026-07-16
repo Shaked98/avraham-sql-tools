@@ -1,0 +1,1 @@
+INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y'), (3, "z\"q")

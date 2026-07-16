@@ -1,0 +1,8 @@
+    old_col = 'value from an entry truncated by log rotation',
+    other = 42
+WHERE id IN (1, 2, 3);
+# Time: 2024-03-01T02:00:00.000000Z
+# User@Host: u[u] @ h []  Id:   401
+# Query_time: 0.010000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709258400;
+SELECT 'first complete entry';

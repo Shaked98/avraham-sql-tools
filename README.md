@@ -153,6 +153,9 @@ $ sql-replay replay \
   `EXPLAIN ANALYZE` over DML (8.0 actually executes the statement),
   `SELECT ... INTO OUTFILE`/`DUMPFILE` (writes files on the server), and
   multi-statement text (a `;` followed by more SQL) also count as writes.
+  MySQL executes the contents of `/*! ... */` version-conditional comments,
+  so they are classified as real content (`/*!50700 UPDATE ... */` is a
+  write); ordinary comments stay inert.
   `--read-only` makes the default explicit (and conflicts with
   `--allow-writes`). Replay against a disposable target when using
   `--allow-writes`.
@@ -414,6 +417,16 @@ through the full pcap → capture → replay → baseline path, and exercises
 clean, and a planted `UPDATE` must be detected with exit code 2. A
 dedicated job builds the static musl binary, verifies it is statically
 linked, and smoke-builds the RPM from `packaging/sql-replay.spec`.
+
+Every external-input surface (slow-log parser, fingerprint normalizer,
+write-gate classifier, capture reader) is also fuzzed: [`fuzz/`](fuzz/) is
+a standalone cargo-fuzz workspace (nightly-only tooling, kept outside the
+stable root workspace) with a weekly/manual `fuzz-smoke` CI workflow — see
+[`fuzz/README.md`](fuzz/README.md). A committed corpus of adversarial slow
+logs under `crates/sql-replay/tests/corpus/` (header lookalikes inside
+string literals, invalid UTF-8, rotation seams, CRLF, dialect mixtures, …)
+is pinned by expected-outcome tests in the normal `cargo test` run and
+doubles as fuzz seeds.
 
 ### Real-data verification rig
 

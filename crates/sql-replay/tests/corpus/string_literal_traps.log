@@ -1,0 +1,23 @@
+# Time: 2024-03-01T00:10:00.000000Z
+# User@Host: u[u] @ h []  Id:   201
+# Query_time: 0.100000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709251800;
+SELECT * FROM msgs WHERE body = 'fake headers follow
+# Time: 2024-03-01T09:09:09.000000Z
+# User@Host: fake[fake] @ evil []  Id: 999
+# Query_time: 99.9  Lock_time: 0.0 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1;
+still inside via escaped quote \' and a backslash pair \\
+'' doubled quote keeps the literal open
+end of literal';
+# User@Host: u[u] @ h []  Id:   202
+# Query_time: 0.200000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709251801;
+SELECT a, '/* not a comment' AS c1, "double \" quoted # not a header" AS c2
+-- line comment hides this unbalanced quote: '
+# a real mysql # comment line with a stray " quote
+FROM t WHERE x = `back``tick # id` AND y = 2;
+# User@Host: u[u] @ h []  Id:   203
+# Query_time: 0.300000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709251802;
+SELECT 3;

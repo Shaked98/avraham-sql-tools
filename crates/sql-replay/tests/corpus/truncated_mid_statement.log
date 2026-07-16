@@ -1,0 +1,9 @@
+# Time: 2024-03-01T06:00:00.000000Z
+# User@Host: u[u] @ h []  Id:   801
+# Query_time: 0.700000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709272800;
+SELECT ok_entry;
+# User@Host: u[u] @ h []  Id:   802
+# Query_time: 0.800000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709272801;
+UPDATE t SET body = 'this literal is cut off by EOF

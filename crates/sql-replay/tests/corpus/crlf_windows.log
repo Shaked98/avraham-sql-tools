@@ -1,0 +1,11 @@
+# Time: 2024-03-01T05:30:00.000000Z
+# User@Host: win[win] @ desktop []  Id:   651
+# Query_time: 0.020000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709271000;
+SELECT * FROM t WHERE body = 'a literal
+# Time: fake header inside CRLF literal
+spanning lines' AND id = 7;
+# User@Host: win[win] @ desktop []  Id:   652
+# Query_time: 0.030000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709271001;
+SELECT 'second crlf entry';

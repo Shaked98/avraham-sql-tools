@@ -1,0 +1,10 @@
+# Time: 240301 05:00:00
+# Query_time: 0.300000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+# User@Host: u[u] @ h []  Id:   701
+SELECT reordered_headers;
+# User@Host: u[u] @ h []  Id:   702
+# User@Host: u2[u2] @ h []  Id:   703
+# Time: 240301 05:00:01
+# Query_time: 0.400000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+# Unknown_header: whatever  Also_unknown: 1
+SELECT duplicated_headers;

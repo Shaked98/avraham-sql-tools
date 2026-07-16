@@ -1,0 +1,3 @@
+# Corpus files are byte-exact test inputs: some deliberately contain CRLF
+# line endings or invalid UTF-8. Never normalize them.
+*.log -text

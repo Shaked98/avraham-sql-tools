@@ -1,0 +1,1 @@
+SELECT ';' AS s; DROP TABLE t

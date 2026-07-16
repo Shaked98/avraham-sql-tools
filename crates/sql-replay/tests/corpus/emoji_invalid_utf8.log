@@ -1,0 +1,9 @@
+# Time: 2024-03-01T01:00:00.000000Z
+# User@Host: u[u] @ h []  Id:   301
+# Query_time: 0.050000  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1709254800;
+INSERT INTO names VALUES ('héllo 🦀 emoji', 'latin1 bytes: ��� end', 'ステータス');
+# User@Host: u[u] @ h []  Id:   302
+# Query_time: 0.010000  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1709254801;
+SELECT '🎉';

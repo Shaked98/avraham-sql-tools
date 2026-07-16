@@ -1,0 +1,66 @@
+# Short-budget fuzz smoke for sql-replay's input-parsing surfaces: each
+# libFuzzer target in fuzz/ runs for a bounded minute over the committed
+# seeds plus whatever new coverage it finds. This catches regressions that
+# reintroduce panics on adversarial input; deep exploration is the job of
+# the longer local campaigns documented in fuzz/README.md.
+#
+# Deliberately NOT per-PR: sanitizer builds are slow and a 5x60s fuzz adds
+# little signal per commit. Trigger manually (workflow_dispatch) or let the
+# weekly schedule catch drift. Any crash artifact is a real bug: reproduce
+# it locally with `cargo +nightly fuzz run <target> <artifact>`.
+name: fuzz smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 4 * * 2" # Tuesdays 04:41 UTC
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz-smoke:
+    name: bounded libFuzzer run per target
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: fuzz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz
+          workspaces: fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: build fuzz targets
+        run: cargo +nightly fuzz build
+      - name: run each target for 60s
+        run: |
+          set -eux
+          mkdir -p corpus/slowlog_parse
+          # The nasty-log corpus doubles as slowlog seeds alongside
+          # fuzz/seeds/; targets without a seeds dir start from scratch.
+          run_one() {
+            target=$1; shift
+            mkdir -p "corpus/$target"
+            cargo +nightly fuzz run "$target" "corpus/$target" "$@" -- \
+              -max_total_time=60 -timeout=20 -rss_limit_mb=3072
+          }
+          run_one slowlog_parse seeds/slowlog_parse ../crates/sql-replay/tests/corpus
+          run_one slowlog_structured
+          run_one fingerprint seeds/fingerprint
+          run_one classify seeds/classify
+          run_one capture_reader seeds/capture_reader
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: warn

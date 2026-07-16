@@ -213,11 +213,21 @@ fn has_trailing_statement(sql: &str) -> bool {
     while i < n {
         let c = b[i];
         if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
+            // MySQL executes the contents of /*! ... */ version-conditional
+            // comments, so their interior is real content; only the opener
+            // and optional version digits are inert.
+            if i + 2 < n && b[i + 2] == b'!' {
+                i += 3;
+                while i < n && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+            } else {
+                i += 2;
+                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
             }
-            i = (i + 2).min(n);
         } else if c == b'#'
             || (c == b'-'
                 && i + 1 < n
@@ -285,11 +295,20 @@ impl<'a> TokenScanner<'a> {
                     self.i = skip_quoted(b, self.i);
                 }
                 b'/' if self.i + 1 < n && b[self.i + 1] == b'*' => {
-                    self.i += 2;
-                    while self.i + 1 < n && !(b[self.i] == b'*' && b[self.i + 1] == b'/') {
-                        self.i += 1;
+                    // /*! ... */ contents execute on MySQL: tokenize the
+                    // interior, skipping only the opener and version digits.
+                    if self.i + 2 < n && b[self.i + 2] == b'!' {
+                        self.i += 3;
+                        while self.i < n && b[self.i].is_ascii_digit() {
+                            self.i += 1;
+                        }
+                    } else {
+                        self.i += 2;
+                        while self.i + 1 < n && !(b[self.i] == b'*' && b[self.i + 1] == b'/') {
+                            self.i += 1;
+                        }
+                        self.i = (self.i + 2).min(n);
                     }
-                    self.i = (self.i + 2).min(n);
                 }
                 b'-' if self.i + 1 < n
                     && b[self.i + 1] == b'-'
@@ -421,6 +440,26 @@ mod tests {
             "",
         ] {
             assert_eq!(classify(q), QueryClass::Write, "misclassified: {q}");
+        }
+    }
+
+    #[test]
+    fn version_conditional_comments_are_executable() {
+        for q in [
+            "/*! UPDATE t SET x=1 */ SELECT 1",
+            "/*!50700 UPDATE t SET x=1 */ SELECT 1",
+            "/*!50110 INSERT INTO t VALUES (1) */",
+            "SELECT 1 /*!; DROP TABLE t */",
+        ] {
+            assert_eq!(classify(q), QueryClass::Write, "misclassified: {q}");
+        }
+        for q in [
+            "/* UPDATE */ SELECT 1",
+            "/*! SELECT 1 */",
+            "/*!50700 SELECT 1 */",
+            "SELECT /*!40001 SQL_NO_CACHE */ * FROM t",
+        ] {
+            assert_eq!(classify(q), QueryClass::Read, "misclassified: {q}");
         }
     }
 
