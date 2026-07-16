@@ -122,6 +122,40 @@ fn fixture_pair_flags_only_in_one_counts_errors_and_settings() {
 }
 
 #[test]
+fn fixture_pair_flags_the_size_decade_regression_the_ranking_missed() {
+    let rep = fixture_compare();
+
+    // "show variables like ?" is stable fingerprint-wide (+5% p95), but its
+    // 1KB-10KB decade regressed +200%. The 10KB-100KB decade (+400%) stays
+    // out: count 2 < min_count. orders' decades regressed too but the
+    // fingerprint is already in the headline regressions — not re-listed.
+    assert!(rep.size_regressed);
+    assert_eq!(rep.size_regressions.len(), 1);
+    let d = &rep.size_regressions[0];
+    assert_eq!(d.fingerprint, "show variables like ?");
+    assert_eq!(d.bucket, "1KB-10KB");
+    assert_eq!(d.p95.delta_pct, Some(200.0));
+    assert_eq!((d.baseline_count, d.candidate_count), (5, 5));
+    // Eligible decade pairs: orders 100KB-1MB + 1MB-10MB, show <1KB + 1KB-10KB.
+    assert_eq!(rep.size_buckets_checked, 4);
+    assert!(rep.size_note.is_none());
+
+    // Per-fingerprint byte columns: present where both sides record them,
+    // absent (n/a downstream) where neither does.
+    let orders = &rep.regressions[0];
+    let bytes = orders.result_bytes.as_ref().expect("orders bytes");
+    assert_eq!(bytes.baseline_mean, 524288.0);
+    assert_eq!(bytes.mean_delta_pct, Some(0.0));
+    assert!(rep.improvements[0].result_bytes.is_none());
+
+    let text = rep.render_stdout(10);
+    assert!(text.contains("Result-size decade regressions"));
+    assert!(text.contains("1KB-10KB"));
+    assert!(text.contains("512.0KB→512.0KB"));
+    assert!(text.contains("n/a"));
+}
+
+#[test]
 fn json_report_round_trips() {
     let rep = fixture_compare();
     let json = serde_json::to_string_pretty(&rep).unwrap();
@@ -129,6 +163,21 @@ fn json_report_round_trips() {
     assert_eq!(back.regressions.len(), rep.regressions.len());
     assert_eq!(back.regressed, rep.regressed);
     assert_eq!(back.settings_diff.len(), rep.settings_diff.len());
+    assert_eq!(back.size_regressions.len(), rep.size_regressions.len());
+    assert_eq!(back.size_regressed, rep.size_regressed);
+    assert_eq!(back.size_buckets_checked, rep.size_buckets_checked);
+    assert_eq!(
+        back.regressions[0]
+            .result_bytes
+            .as_ref()
+            .unwrap()
+            .baseline_mean,
+        rep.regressions[0]
+            .result_bytes
+            .as_ref()
+            .unwrap()
+            .baseline_mean
+    );
 }
 
 #[test]
@@ -183,6 +232,13 @@ fn html_report_is_self_contained_and_escaped() {
     assert!(html.contains("select /* new */ ? from dual"));
     // The count-mismatch badge renders on the mismatched regression row.
     assert!(html.contains("count mismatch"));
+    // Result-size sections: the decade verdict, the decade table, and the
+    // per-fingerprint bytes columns (n/a where a side records none).
+    assert!(html.contains("result-size decade(s) regressed"));
+    assert!(html.contains("Result-size decade regressions (1"));
+    assert!(html.contains("1KB-10KB"));
+    assert!(html.contains("512.0KB"));
+    assert!(html.contains("n/a"));
 }
 
 #[test]

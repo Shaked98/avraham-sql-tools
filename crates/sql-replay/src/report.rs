@@ -154,6 +154,95 @@ pub struct FingerprintReport {
     /// (0.3.0; serde default keeps older reports loading).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<ChecksumReport>,
+    /// Result-set byte stats over the executed instances (0.4.0; serde
+    /// default keeps older reports loading). Absent when nothing executed
+    /// or the latencies are recorded rather than replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_bytes: Option<ResultBytesReport>,
+    /// Latency stats split by result-size decade (0.4.0), non-empty
+    /// decades only, in decade order. Absent under the same conditions as
+    /// `result_bytes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub size_buckets: Vec<SizeBucketReport>,
+}
+
+/// Result-size decade boundaries (binary units): a result set of `b` bytes
+/// falls in the first decade whose bound exceeds it, or the last decade
+/// (`>=10MB`) when none does. `<1KB` includes statements that returned no
+/// result set (0 bytes).
+pub const SIZE_BUCKET_BOUNDS: [u64; 5] = [1 << 10, 10 << 10, 100 << 10, 1 << 20, 10 << 20];
+
+/// Labels of the result-size decades, index-aligned with the decade order
+/// (and with [`SIZE_BUCKET_BOUNDS`], which holds the upper bounds of all
+/// but the open-ended last decade).
+pub const SIZE_BUCKET_LABELS: [&str; 6] = [
+    "<1KB",
+    "1KB-10KB",
+    "10KB-100KB",
+    "100KB-1MB",
+    "1MB-10MB",
+    ">=10MB",
+];
+
+/// Decade index (into [`SIZE_BUCKET_LABELS`]) of a result-set byte count.
+pub fn size_bucket_index(bytes: u64) -> usize {
+    SIZE_BUCKET_BOUNDS
+        .iter()
+        .position(|bound| bytes < *bound)
+        .unwrap_or(SIZE_BUCKET_LABELS.len() - 1)
+}
+
+/// Human-readable byte count for report tables ("1.5KB", "12.3MB").
+pub fn fmt_bytes(b: f64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if b < KB {
+        format!("{b:.0}B")
+    } else if b < MB {
+        format!("{:.1}KB", b / KB)
+    } else if b < GB {
+        format!("{:.1}MB", b / MB)
+    } else {
+        format!("{:.1}GB", b / GB)
+    }
+}
+
+/// Per-fingerprint result-set byte statistics (0.4.0), measured while
+/// draining rows on the streaming replay path. Bytes are the canonical
+/// decoded cell sizes (`target::value_bytes`) — payload, not wire framing —
+/// so they are comparable only between runs of this tool. `total`, `min`,
+/// `max`, and `mean` are exact; `p50`/`p95` come from a histogram with two
+/// significant digits. Absent on recorded baselines (the capture carries no
+/// result sizes) and on pre-0.4.0 reports.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResultBytesReport {
+    pub total: u64,
+    pub min: u64,
+    pub max: u64,
+    pub mean: f64,
+    pub p50: u64,
+    pub p95: u64,
+}
+
+/// Latency stats of one result-size decade of a fingerprint (0.4.0).
+/// Fingerprinting collapses literals, so one fingerprint can mix result
+/// sizes spanning orders of magnitude (a `WHERE id = ?` against a document
+/// table fetches 100KB and 15MB rows alike); the per-decade split lets
+/// `compare` flag a regression that only affects one size class instead of
+/// averaging it away in the fingerprint-wide percentiles.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SizeBucketReport {
+    /// Decade label, one of [`SIZE_BUCKET_LABELS`].
+    pub bucket: String,
+    /// Successfully executed instances whose result size fell in this
+    /// decade (errors have no known result size and are not counted).
+    pub count: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub mean_us: f64,
+    pub max_us: u64,
+    pub bytes_total: u64,
 }
 
 /// Per-fingerprint result-set checksum aggregate (`replay --checksum`).
@@ -279,18 +368,22 @@ impl RunReport {
 
         out.push_str(&format!("Top {top} fingerprints by p95 latency:\n"));
         out.push_str(&format!(
-            "{:>8} {:>6} {:>10} {:>10} {:>10} {:>10}  {}\n",
-            "count", "errs", "p50(ms)", "p95(ms)", "p99(ms)", "max(ms)", "fingerprint"
+            "{:>8} {:>6} {:>10} {:>10} {:>10} {:>10} {:>9}  {}\n",
+            "count", "errs", "p50(ms)", "p95(ms)", "p99(ms)", "max(ms)", "res/query", "fingerprint"
         ));
         for fp in self.fingerprints.iter().filter(|f| f.count > 0).take(top) {
             out.push_str(&format!(
-                "{:>8} {:>6} {:>10.3} {:>10.3} {:>10.3} {:>10.3}  {}\n",
+                "{:>8} {:>6} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>9}  {}\n",
                 fp.count,
                 fp.errors,
                 fp.p50_us as f64 / 1000.0,
                 fp.p95_us as f64 / 1000.0,
                 fp.p99_us as f64 / 1000.0,
                 fp.max_us as f64 / 1000.0,
+                fp.result_bytes
+                    .as_ref()
+                    .map(|b| fmt_bytes(b.mean))
+                    .unwrap_or_else(|| "-".to_string()),
                 truncate_chars(&fp.fingerprint, 80),
             ));
         }
@@ -347,6 +440,36 @@ pub fn redact_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_bucket_boundaries_are_half_open() {
+        // Each decade is [lower, upper): the bound value itself belongs to
+        // the next decade up.
+        assert_eq!(size_bucket_index(0), 0); // no result set
+        assert_eq!(size_bucket_index(1023), 0);
+        assert_eq!(size_bucket_index(1024), 1);
+        assert_eq!(size_bucket_index(10 * 1024 - 1), 1);
+        assert_eq!(size_bucket_index(10 * 1024), 2);
+        assert_eq!(size_bucket_index(100 * 1024 - 1), 2);
+        assert_eq!(size_bucket_index(100 * 1024), 3);
+        assert_eq!(size_bucket_index(1024 * 1024 - 1), 3);
+        assert_eq!(size_bucket_index(1024 * 1024), 4);
+        assert_eq!(size_bucket_index(10 * 1024 * 1024 - 1), 4);
+        assert_eq!(size_bucket_index(10 * 1024 * 1024), 5);
+        assert_eq!(size_bucket_index(u64::MAX), 5);
+        // Labels and bounds stay index-aligned.
+        assert_eq!(SIZE_BUCKET_LABELS.len(), SIZE_BUCKET_BOUNDS.len() + 1);
+        assert_eq!(SIZE_BUCKET_LABELS[size_bucket_index(5 << 20)], "1MB-10MB");
+    }
+
+    #[test]
+    fn bytes_format_picks_the_readable_unit() {
+        assert_eq!(fmt_bytes(0.0), "0B");
+        assert_eq!(fmt_bytes(999.0), "999B");
+        assert_eq!(fmt_bytes(1536.0), "1.5KB");
+        assert_eq!(fmt_bytes(15.0 * 1024.0 * 1024.0), "15.0MB");
+        assert_eq!(fmt_bytes(2.5 * 1024.0 * 1024.0 * 1024.0), "2.5GB");
+    }
 
     #[test]
     fn redacts_password() {

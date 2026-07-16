@@ -80,6 +80,29 @@ pub struct CompareReport {
     /// (a wrong answer is worse than a slow one).
     #[serde(default)]
     pub correctness_failed: bool,
+    /// Result-size-decade regressions (0.4.0): matched fingerprints whose
+    /// *decade sub-population* p95 regressed at/beyond the threshold while
+    /// the fingerprint-wide p95 did not — the "regression only on big
+    /// rows, averaged away by the mixed-size percentiles" case.
+    /// Fingerprints already in `regressions` are not repeated here (their
+    /// per-decade split is in the run reports' `size_buckets`). Worst
+    /// first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub size_regressions: Vec<BucketDelta>,
+    /// Matched (fingerprint, decade) pairs whose sub-populations were big
+    /// enough to compare (count >= min_count in both runs).
+    #[serde(default)]
+    pub size_buckets_checked: u64,
+    /// Present when the byte/size-decade comparison was skipped because at
+    /// least one run records no result-set byte stats (a pre-0.4.0 report
+    /// or a recorded baseline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_note: Option<String>,
+    /// True when `size_regressions` is non-empty. Drives exit code 2 like
+    /// `regressed` (which stays fingerprint-level for compatibility with
+    /// existing consumers).
+    #[serde(default)]
+    pub size_regressed: bool,
 }
 
 /// Result-correctness section: matched fingerprints whose result-set
@@ -239,6 +262,41 @@ pub struct FpDelta {
     pub p95: MetricDelta,
     pub p99: MetricDelta,
     pub mean: MetricDelta,
+    /// Result-set bytes per executed statement, present when both runs
+    /// record byte stats for this fingerprint (0.4.0). A large shift is
+    /// itself a signal: the two targets returned differently-sized data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_bytes: Option<BytesDelta>,
+}
+
+/// Result-set byte stats of one fingerprint compared across the runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BytesDelta {
+    pub baseline_mean: f64,
+    pub candidate_mean: f64,
+    /// `None` when the baseline mean is zero.
+    pub mean_delta_pct: Option<f64>,
+    pub baseline_total: u64,
+    pub candidate_total: u64,
+}
+
+/// One regressed result-size decade of a matched fingerprint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketDelta {
+    pub fingerprint: String,
+    /// Decade label ([`crate::report::SIZE_BUCKET_LABELS`]).
+    pub bucket: String,
+    pub baseline_count: u64,
+    pub candidate_count: u64,
+    /// The decade's populations differ in size — result sizes shifted
+    /// between the runs (or coverage differs), so the latency comparison
+    /// is weaker.
+    pub count_mismatch: bool,
+    pub p50: MetricDelta,
+    pub p95: MetricDelta,
+    pub mean: MetricDelta,
+    pub baseline_bytes_total: u64,
+    pub candidate_bytes_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,12 +458,46 @@ pub fn compare_runs(
             .to_string(),
     });
 
+    // Result-set byte stats exist only on replayed 0.4.0+ reports; when a
+    // side has none the byte columns show n/a and the decade comparison is
+    // skipped with a note rather than a spurious verdict.
+    let has_bytes = |r: &RunReport| r.fingerprints.iter().any(|f| f.result_bytes.is_some());
+    let no_bytes_side = |r: &RunReport| {
+        if r.is_recorded() {
+            "records no result-set byte stats (recorded latencies — the capture \
+             carries no result sizes)"
+        } else {
+            "records no result-set byte stats (pre-0.4.0 report)"
+        }
+    };
+    let size_note = match (has_bytes(baseline), has_bytes(candidate)) {
+        (true, true) => None,
+        (false, false) => Some(
+            "result-set byte and size-decade comparison skipped: neither run records \
+             byte stats"
+                .to_string(),
+        ),
+        (b_has, _) => {
+            let (side, run) = if !b_has {
+                ("baseline", baseline)
+            } else {
+                ("candidate", candidate)
+            };
+            Some(format!(
+                "result-set byte and size-decade comparison skipped: the {side} run {}",
+                no_bytes_side(run)
+            ))
+        }
+    };
+
     let mut regressions = Vec::new();
     let mut improvements = Vec::new();
     let mut stable = Vec::new();
     let mut low_sample = Vec::new();
     let mut only_in_baseline = Vec::new();
     let mut count_mismatches = 0u64;
+    let mut size_regressions: Vec<BucketDelta> = Vec::new();
+    let mut size_buckets_checked = 0u64;
 
     for b in &baseline.fingerprints {
         let Some(c) = cand_by_text.get(b.fingerprint.as_str()) else {
@@ -460,9 +552,20 @@ pub fn compare_runs(
             p95: MetricDelta::new(b.p95_us as f64, c.p95_us as f64),
             p99: MetricDelta::new(b.p99_us as f64, c.p99_us as f64),
             mean: MetricDelta::new(b.mean_us, c.mean_us),
+            result_bytes: match (&b.result_bytes, &c.result_bytes) {
+                (Some(bb), Some(cb)) => Some(BytesDelta {
+                    baseline_mean: bb.mean,
+                    candidate_mean: cb.mean,
+                    mean_delta_pct: pct_change(bb.mean, cb.mean),
+                    baseline_total: bb.total,
+                    candidate_total: cb.total,
+                }),
+                _ => None,
+            },
         };
         // Zero-count sides carry no latency population, so they can never
         // enter the headline ranking regardless of --min-count.
+        let mut fp_regressed = false;
         if b.count == 0
             || c.count == 0
             || b.count < options.min_count
@@ -471,12 +574,66 @@ pub fn compare_runs(
             low_sample.push(delta);
         } else {
             match delta.p95.delta_pct {
-                Some(p) if p >= options.threshold_pct => regressions.push(delta),
+                Some(p) if p >= options.threshold_pct => {
+                    fp_regressed = true;
+                    regressions.push(delta);
+                }
                 Some(p) if p <= -options.threshold_pct => improvements.push(delta),
                 // A zero baseline yields no percentage, but any nonzero
                 // candidate is an unbounded regression, not noise.
-                None if delta.p95.candidate_us > 0.0 => regressions.push(delta),
+                None if delta.p95.candidate_us > 0.0 => {
+                    fp_regressed = true;
+                    regressions.push(delta);
+                }
                 _ => stable.push(delta),
+            }
+        }
+
+        // Size-decade sub-populations: the same threshold and min-count
+        // rules, applied per decade, so a regression confined to one size
+        // class can't hide inside a stable mixed-size percentile. A decade
+        // present on only one side is skipped (its events moved decades —
+        // the byte columns already surface that).
+        let cand_buckets: HashMap<&str, &crate::report::SizeBucketReport> = c
+            .size_buckets
+            .iter()
+            .map(|s| (s.bucket.as_str(), s))
+            .collect();
+        for bb in &b.size_buckets {
+            let Some(cb) = cand_buckets.get(bb.bucket.as_str()) else {
+                continue;
+            };
+            if bb.count == 0
+                || cb.count == 0
+                || bb.count < options.min_count
+                || cb.count < options.min_count
+            {
+                continue;
+            }
+            size_buckets_checked += 1;
+            if fp_regressed {
+                // Already flagged at the fingerprint level; the per-decade
+                // split lives in the run reports' size_buckets.
+                continue;
+            }
+            let p95 = MetricDelta::new(bb.p95_us as f64, cb.p95_us as f64);
+            let bucket_regressed = match p95.delta_pct {
+                Some(p) => p >= options.threshold_pct,
+                None => p95.candidate_us > 0.0,
+            };
+            if bucket_regressed {
+                size_regressions.push(BucketDelta {
+                    fingerprint: b.fingerprint.clone(),
+                    bucket: bb.bucket.clone(),
+                    baseline_count: bb.count,
+                    candidate_count: cb.count,
+                    count_mismatch: bb.count != cb.count,
+                    p50: MetricDelta::new(bb.p50_us as f64, cb.p50_us as f64),
+                    p95,
+                    mean: MetricDelta::new(bb.mean_us, cb.mean_us),
+                    baseline_bytes_total: bb.bytes_total,
+                    candidate_bytes_total: cb.bytes_total,
+                });
             }
         }
     }
@@ -507,6 +664,12 @@ pub fn compare_runs(
             .then(a.p95.delta_us.total_cmp(&b.p95.delta_us))
     });
     low_sample.sort_by(|a, b| pct(b).total_cmp(&pct(a)));
+    let bucket_pct = |d: &BucketDelta| d.p95.delta_pct.unwrap_or(f64::INFINITY);
+    size_regressions.sort_by(|a, b| {
+        bucket_pct(b)
+            .total_cmp(&bucket_pct(a))
+            .then(b.p95.delta_us.total_cmp(&a.p95.delta_us))
+    });
     only_in_baseline.sort_by_key(|o| std::cmp::Reverse(o.count));
     only_in_candidate.sort_by_key(|o| std::cmp::Reverse(o.count));
 
@@ -547,6 +710,7 @@ pub fn compare_runs(
     let bt = &baseline.totals;
     let ct = &candidate.totals;
     let regressed = !regressions.is_empty();
+    let size_regressed = !size_regressions.is_empty();
     CompareReport {
         tool: "sql-replay".to_string(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -580,6 +744,10 @@ pub fn compare_runs(
         regressed,
         correctness,
         correctness_failed,
+        size_regressions,
+        size_buckets_checked,
+        size_note,
+        size_regressed,
     }
 }
 
@@ -676,17 +844,32 @@ fn truncate_chars(s: &str, max: usize) -> String {
 impl CompareReport {
     fn push_fp_table(out: &mut String, rows: &[FpDelta], top: usize) {
         out.push_str(&format!(
-            "{:>12} {:>12} {:>9} {:>9} {:>11}  {}\n",
-            "p95 base(ms)", "p95 cand(ms)", "Δp95", "Δmean", "count b/c", "fingerprint"
+            "{:>12} {:>12} {:>9} {:>9} {:>11} {:>15}  {}\n",
+            "p95 base(ms)",
+            "p95 cand(ms)",
+            "Δp95",
+            "Δmean",
+            "count b/c",
+            "res/query b→c",
+            "fingerprint"
         ));
         for d in rows.iter().take(top) {
+            let bytes = match &d.result_bytes {
+                Some(b) => format!(
+                    "{}→{}",
+                    crate::report::fmt_bytes(b.baseline_mean),
+                    crate::report::fmt_bytes(b.candidate_mean)
+                ),
+                None => "n/a".to_string(),
+            };
             out.push_str(&format!(
-                "{:>12} {:>12} {:>9} {:>9} {:>11}  {}{}\n",
+                "{:>12} {:>12} {:>9} {:>9} {:>11} {:>15}  {}{}\n",
                 fmt_ms(d.p95.baseline_us),
                 fmt_ms(d.p95.candidate_us),
                 fmt_pct(d.p95.delta_pct),
                 fmt_pct(d.mean.delta_pct),
                 format!("{}/{}", d.baseline_count, d.candidate_count),
+                bytes,
                 truncate_chars(&d.fingerprint, 70),
                 if d.count_mismatch {
                     "  [count mismatch]"
@@ -836,6 +1019,47 @@ impl CompareReport {
         }
         out.push('\n');
 
+        if let Some(note) = &self.size_note {
+            out.push_str(&format!("Result-size decades: {note}\n\n"));
+        } else {
+            out.push_str(&format!(
+                "Result-size decade regressions (p95 {:+.0}% or worse inside one decade of a \
+                 fingerprint the ranking above did not flag; {} decade pair(s) checked): {}\n",
+                self.threshold_pct,
+                self.size_buckets_checked,
+                self.size_regressions.len()
+            ));
+            if !self.size_regressions.is_empty() {
+                out.push_str(&format!(
+                    "{:>10} {:>12} {:>12} {:>9} {:>11}  {}\n",
+                    "decade", "p95 base(ms)", "p95 cand(ms)", "Δp95", "count b/c", "fingerprint"
+                ));
+                for d in self.size_regressions.iter().take(top) {
+                    out.push_str(&format!(
+                        "{:>10} {:>12} {:>12} {:>9} {:>11}  {}{}\n",
+                        d.bucket,
+                        fmt_ms(d.p95.baseline_us),
+                        fmt_ms(d.p95.candidate_us),
+                        fmt_pct(d.p95.delta_pct),
+                        format!("{}/{}", d.baseline_count, d.candidate_count),
+                        truncate_chars(&d.fingerprint, 60),
+                        if d.count_mismatch {
+                            "  [count mismatch]"
+                        } else {
+                            ""
+                        },
+                    ));
+                }
+                if self.size_regressions.len() > top {
+                    out.push_str(&format!(
+                        "  … and {} more\n",
+                        self.size_regressions.len() - top
+                    ));
+                }
+            }
+        }
+        out.push('\n');
+
         out.push_str(&format!(
             "Improvements (p95 -{:.0}% or better): {}\n",
             self.threshold_pct,
@@ -929,6 +1153,8 @@ mod tests {
             max_us: p95_us * 3,
             mean_us: p95_us as f64 / 2.0,
             checksum: None,
+            result_bytes: None,
+            size_buckets: Vec::new(),
         }
     }
 
@@ -1380,6 +1606,153 @@ mod tests {
             rep.settings_note.as_deref(),
             Some("settings diff skipped: neither run records target settings")
         );
+    }
+
+    /// Attach byte stats to a fingerprint: a mean plus per-decade
+    /// (label, count, p95_us) sub-populations.
+    fn with_bytes(
+        mut f: FingerprintReport,
+        mean: f64,
+        buckets: &[(&str, u64, u64)],
+    ) -> FingerprintReport {
+        let total = (mean * f.count as f64) as u64;
+        f.result_bytes = Some(crate::report::ResultBytesReport {
+            total,
+            min: 1,
+            max: total,
+            mean,
+            p50: mean as u64,
+            p95: total,
+        });
+        f.size_buckets = buckets
+            .iter()
+            .map(|(label, count, p95_us)| crate::report::SizeBucketReport {
+                bucket: label.to_string(),
+                count: *count,
+                p50_us: p95_us / 2,
+                p95_us: *p95_us,
+                mean_us: *p95_us as f64 / 2.0,
+                max_us: p95_us * 2,
+                bytes_total: total,
+            })
+            .collect();
+        f
+    }
+
+    #[test]
+    fn size_decade_regression_is_flagged_even_when_the_fingerprint_is_stable() {
+        // Fingerprint-wide p95 moves +5% (stable), but the >=10MB decade —
+        // 10 of 40 events — regresses +150%: exactly the averaged-away case.
+        let base = run(
+            "5.7.42",
+            vec![with_bytes(
+                fp("q_docs", 40, 0, 10_000),
+                1_000_000.0,
+                &[("<1KB", 30, 500), (">=10MB", 10, 20_000)],
+            )],
+        );
+        let cand = run(
+            "8.0.46",
+            vec![with_bytes(
+                fp("q_docs", 40, 0, 10_500),
+                1_000_000.0,
+                &[("<1KB", 30, 510), (">=10MB", 10, 50_000)],
+            )],
+        );
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert!(!rep.regressed, "fingerprint-wide p95 is within threshold");
+        assert!(rep.size_regressed);
+        assert_eq!(rep.size_buckets_checked, 2);
+        assert_eq!(rep.size_regressions.len(), 1);
+        let d = &rep.size_regressions[0];
+        assert_eq!(d.fingerprint, "q_docs");
+        assert_eq!(d.bucket, ">=10MB");
+        assert_eq!(d.p95.delta_pct, Some(150.0));
+        assert!(!d.count_mismatch);
+        assert!(rep.size_note.is_none());
+        // Per-fingerprint byte columns are populated.
+        let bytes = rep.stable[0].result_bytes.as_ref().expect("bytes delta");
+        assert_eq!(bytes.baseline_mean, 1_000_000.0);
+        assert_eq!(bytes.mean_delta_pct, Some(0.0));
+        // Rendering mentions the section and the decade.
+        let text = rep.render_stdout(10);
+        assert!(text.contains("Result-size decade regressions"));
+        assert!(text.contains(">=10MB"));
+    }
+
+    #[test]
+    fn size_decades_skip_low_sample_buckets_and_already_regressed_fingerprints() {
+        // q_reg regresses fingerprint-wide: its decades are not re-listed.
+        // q_small's regressed decade has count 2 < min_count: not flagged.
+        let base = run(
+            "5.7.42",
+            vec![
+                with_bytes(fp("q_reg", 20, 0, 10_000), 100.0, &[("<1KB", 20, 10_000)]),
+                with_bytes(
+                    fp("q_small", 20, 0, 1_000),
+                    100.0,
+                    &[("<1KB", 18, 1_000), ("1KB-10KB", 2, 1_000)],
+                ),
+            ],
+        );
+        let cand = run(
+            "8.0.46",
+            vec![
+                with_bytes(fp("q_reg", 20, 0, 30_000), 100.0, &[("<1KB", 20, 30_000)]),
+                with_bytes(
+                    fp("q_small", 20, 0, 1_010),
+                    100.0,
+                    &[("<1KB", 18, 1_010), ("1KB-10KB", 2, 9_000)],
+                ),
+            ],
+        );
+        let rep = compare_runs("a", &base, "b", &cand, OPTS);
+        assert_eq!(rep.regressions.len(), 1);
+        assert!(rep.size_regressions.is_empty());
+        assert!(!rep.size_regressed);
+        // q_reg's decade pair was population-eligible and counted; q_small's
+        // small decade was not.
+        assert_eq!(rep.size_buckets_checked, 2);
+    }
+
+    #[test]
+    fn missing_byte_stats_degrade_to_notes_never_verdicts() {
+        // The candidate regresses (+100%) so the regression table renders —
+        // with an n/a bytes column, since the baseline records no bytes.
+        let with = run(
+            "8.0.46",
+            vec![with_bytes(
+                fp("q", 10, 0, 2_000),
+                100.0,
+                &[("<1KB", 10, 2_000)],
+            )],
+        );
+        let without = run("5.7.42", vec![fp("q", 10, 0, 1_000)]);
+
+        // Baseline lacks byte stats (older report): note names the side,
+        // no decade verdict, per-fp bytes are None.
+        let rep = compare_runs("old.json", &without, "new.json", &with, OPTS);
+        assert!(!rep.size_regressed);
+        assert!(rep.size_regressions.is_empty());
+        let note = rep.size_note.as_deref().expect("size note");
+        assert!(note.contains("baseline"), "{note}");
+        assert!(note.contains("pre-0.4.0"), "{note}");
+        assert!(rep.regressions[0].result_bytes.is_none());
+        let text = rep.render_stdout(10);
+        assert!(text.contains("Result-size decades:"));
+        assert!(text.contains("n/a"));
+
+        // Recorded baselines say so instead of claiming an old report.
+        let recorded = recorded_run(vec![fp("q", 10, 0, 1_000)]);
+        let rep = compare_runs("base.json", &recorded, "new.json", &with, OPTS);
+        let note = rep.size_note.as_deref().expect("size note");
+        assert!(note.contains("recorded"), "{note}");
+
+        // Neither side records bytes: quiet note, nothing compared.
+        let rep = compare_runs("a", &without, "b", &without, OPTS);
+        let note = rep.size_note.as_deref().expect("size note");
+        assert!(note.contains("neither run"), "{note}");
+        assert_eq!(rep.size_buckets_checked, 0);
     }
 
     #[test]

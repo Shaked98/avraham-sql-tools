@@ -38,7 +38,12 @@
       "id": 1,
       "fingerprint": "select * from orders where id = ?",
       "count": 100, "errors": 0, "first_error": null, "skipped": 0, "not_run": 0,
-      "p50_us": 5000, "p95_us": 10000, "p99_us": 20000, "max_us": 30000, "mean_us": 5500.0
+      "p50_us": 5000, "p95_us": 10000, "p99_us": 20000, "max_us": 30000, "mean_us": 5500.0,
+      "result_bytes": { "total": 52428800, "min": 102400, "max": 15728640, "mean": 524288.0, "p50": 122880, "p95": 15204352 },
+      "size_buckets": [
+        { "bucket": "100KB-1MB", "count": 90, "p50_us": 4000, "p95_us": 9000, "mean_us": 4500.0, "max_us": 20000, "bytes_total": 27428800 },
+        { "bucket": "1MB-10MB", "count": 10, "p50_us": 9000, "p95_us": 10000, "mean_us": 9500.0, "max_us": 30000, "bytes_total": 25000000 }
+      ]
     },
     {
       "id": 2,
@@ -56,7 +61,13 @@
       "id": 4,
       "fingerprint": "show variables like ?",
       "count": 40, "errors": 0, "first_error": null, "skipped": 0, "not_run": 0,
-      "p50_us": 500, "p95_us": 1000, "p99_us": 2000, "max_us": 3000, "mean_us": 550.0
+      "p50_us": 500, "p95_us": 1000, "p99_us": 2000, "max_us": 3000, "mean_us": 550.0,
+      "result_bytes": { "total": 92000, "min": 200, "max": 40960, "mean": 2300.0, "p50": 400, "p95": 4096 },
+      "size_buckets": [
+        { "bucket": "<1KB", "count": 33, "p50_us": 450, "p95_us": 900, "mean_us": 500.0, "max_us": 1200, "bytes_total": 9900 },
+        { "bucket": "1KB-10KB", "count": 5, "p50_us": 5000, "p95_us": 10000, "mean_us": 5500.0, "max_us": 12000, "bytes_total": 20480 },
+        { "bucket": "10KB-100KB", "count": 2, "p50_us": 800, "p95_us": 1000, "mean_us": 900.0, "max_us": 1000, "bytes_total": 61620 }
+      ]
     },
     {
       "id": 5,

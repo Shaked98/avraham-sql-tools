@@ -4,7 +4,8 @@
 
 use std::fmt::Write as _;
 
-use crate::compare::{ChecksumDelta, CompareReport, FpDelta, OnlyIn, RunMeta};
+use crate::compare::{BucketDelta, ChecksumDelta, CompareReport, FpDelta, OnlyIn, RunMeta};
+use crate::report::fmt_bytes;
 
 fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -48,6 +49,22 @@ fn fp_rows(out: &mut String, rows: &[FpDelta], class: &str) {
         } else {
             ""
         };
+        let (bbytes_v, bbytes, cbytes_v, cbytes, bytespct) = match &d.result_bytes {
+            Some(b) => (
+                b.baseline_mean,
+                fmt_bytes(b.baseline_mean),
+                b.candidate_mean,
+                fmt_bytes(b.candidate_mean),
+                pct_cell(b.mean_delta_pct),
+            ),
+            None => (
+                0.0,
+                "n/a".to_string(),
+                0.0,
+                "n/a".to_string(),
+                r#"<td class="num" data-v="0">n/a</td>"#.to_string(),
+            ),
+        };
         let _ = write!(
             out,
             r#"<tr><td>{class}</td><td class="fp">{fp}{mismatch}</td>
@@ -56,6 +73,7 @@ fn fp_rows(out: &mut String, rows: &[FpDelta], class: &str) {
 <td class="num" data-v="{bp50}">{bp50_ms}</td><td class="num" data-v="{cp50}">{cp50_ms}</td>{p50pct}
 <td class="num" data-v="{bp99}">{bp99_ms}</td><td class="num" data-v="{cp99}">{cp99_ms}</td>{p99pct}
 <td class="num" data-v="{bmean}">{bmean_ms}</td><td class="num" data-v="{cmean}">{cmean_ms}</td>{meanpct}
+<td class="num" data-v="{bbytes_v}">{bbytes}</td><td class="num" data-v="{cbytes_v}">{cbytes}</td>{bytespct}
 <td class="num" data-v="{be}">{be}</td><td class="num" data-v="{ce}">{ce}</td></tr>
 "#,
             fp = esc(&d.fingerprint),
@@ -144,6 +162,52 @@ fn checksum_table(out: &mut String, title: &str, list: &[ChecksumDelta], failure
             cr = d.candidate_rows,
             be = d.baseline_events,
             ce = d.candidate_events,
+        );
+    }
+    out.push_str("</tbody></table>\n");
+}
+
+fn size_bucket_rows(out: &mut String, rows: &[BucketDelta]) {
+    if rows.is_empty() {
+        return;
+    }
+    out.push_str(
+        "<table><thead><tr><th>decade</th><th>fingerprint</th><th>count b</th><th>count c</th>\
+<th>p95 b (ms)</th><th>p95 c (ms)</th><th>Δp95</th>\
+<th>p50 b (ms)</th><th>p50 c (ms)</th><th>Δp50</th>\
+<th>mean b (ms)</th><th>mean c (ms)</th><th>Δmean</th>\
+<th>bytes b</th><th>bytes c</th></tr></thead><tbody>\n",
+    );
+    for d in rows {
+        let mismatch = if d.count_mismatch {
+            r#" <span class="badge">count mismatch</span>"#
+        } else {
+            ""
+        };
+        let _ = write!(
+            out,
+            r#"<tr class="differs"><td>{bucket}</td><td class="fp">{fp}{mismatch}</td>
+<td class="num">{bc}</td><td class="num">{cc}</td>
+<td class="num">{bp95}</td><td class="num">{cp95}</td>{p95pct}
+<td class="num">{bp50}</td><td class="num">{cp50}</td>{p50pct}
+<td class="num">{bmean}</td><td class="num">{cmean}</td>{meanpct}
+<td class="num">{bb}</td><td class="num">{cb}</td></tr>
+"#,
+            bucket = esc(&d.bucket),
+            fp = esc(&d.fingerprint),
+            bc = d.baseline_count,
+            cc = d.candidate_count,
+            bp95 = fmt_ms(d.p95.baseline_us),
+            cp95 = fmt_ms(d.p95.candidate_us),
+            p95pct = pct_cell(d.p95.delta_pct),
+            bp50 = fmt_ms(d.p50.baseline_us),
+            cp50 = fmt_ms(d.p50.candidate_us),
+            p50pct = pct_cell(d.p50.delta_pct),
+            bmean = fmt_ms(d.mean.baseline_us),
+            cmean = fmt_ms(d.mean.candidate_us),
+            meanpct = pct_cell(d.mean.delta_pct),
+            bb = fmt_bytes(d.baseline_bytes_total as f64),
+            cb = fmt_bytes(d.candidate_bytes_total as f64),
         );
     }
     out.push_str("</tbody></table>\n");
@@ -303,17 +367,27 @@ table.sortable th[data-dir="desc"]::after {{ content: " ▼"; }}
             r#"<p><b class="worse">{n} fingerprint(s) returned different data (result checksum mismatch)</b> (exit code 2).</p>"#,
         );
     }
+    if r.size_regressed {
+        let _ = writeln!(
+            out,
+            r#"<p><b class="worse">{} result-size decade(s) regressed ≥ {}% on p95 inside otherwise-stable fingerprints</b> (exit code 2).</p>"#,
+            r.size_regressions.len(),
+            r.threshold_pct
+        );
+    }
     let verdict = if r.regressed {
         format!(
             r#"<p><b class="worse">{} fingerprint(s) regressed ≥ {}% on p95</b> (exit code 2).</p>"#,
             r.regressions.len(),
             r.threshold_pct
         )
-    } else {
+    } else if !r.size_regressed && !r.correctness_failed {
         format!(
             r#"<p><b class="better">No regressions at/beyond the {}% threshold</b> (exit code 0).</p>"#,
             r.threshold_pct
         )
+    } else {
+        String::new()
     };
     out.push_str(&verdict);
 
@@ -396,6 +470,25 @@ table.sortable th[data-dir="desc"]::after {{ content: " ▼"; }}
         );
     }
 
+    if let Some(note) = &r.size_note {
+        let _ = writeln!(
+            out,
+            "<h2>Result-size decades</h2>\n<p class=\"muted\">{}</p>",
+            esc(note)
+        );
+    } else {
+        let _ = write!(
+            out,
+            "<h2>Result-size decade regressions ({n}; {checked} decade pair(s) checked)</h2>\n\
+<p class=\"muted\">Per-decade p95 regressions inside fingerprints the fingerprint-level \
+verdict did not flag — regressions that only affect one result-size class and would \
+otherwise be averaged away by the mixed-size percentiles.</p>\n",
+            n = r.size_regressions.len(),
+            checked = r.size_buckets_checked,
+        );
+        size_bucket_rows(&mut out, &r.size_regressions);
+    }
+
     let matched = r.regressions.len() + r.improvements.len() + r.stable.len() + r.low_sample.len();
     let _ = write!(
         out,
@@ -414,6 +507,7 @@ table.sortable th[data-dir="desc"]::after {{ content: " ▼"; }}
 <th>p50 b (ms)</th><th>p50 c (ms)</th><th>Δp50</th>\
 <th>p99 b (ms)</th><th>p99 c (ms)</th><th>Δp99</th>\
 <th>mean b (ms)</th><th>mean c (ms)</th><th>Δmean</th>\
+<th>res/q b</th><th>res/q c</th><th>Δres</th>\
 <th>errs b</th><th>errs c</th></tr></thead><tbody>\n",
     );
     fp_rows(&mut out, &r.regressions, "regressed");

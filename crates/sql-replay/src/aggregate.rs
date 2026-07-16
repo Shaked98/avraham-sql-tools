@@ -13,7 +13,8 @@
 use std::collections::BTreeMap;
 
 use crate::report::{
-    AggregationInfo, FingerprintReport, PacingReport, RunReport, SaturationReport, Totals,
+    AggregationInfo, FingerprintReport, PacingReport, ResultBytesReport, RunReport,
+    SaturationReport, SizeBucketReport, Totals, SIZE_BUCKET_LABELS,
 };
 
 fn median_u64(mut v: Vec<u64>) -> u64 {
@@ -37,6 +38,64 @@ fn median_f64(mut v: Vec<f64>) -> f64 {
     } else {
         (v[n / 2 - 1] + v[n / 2]) / 2.0
     }
+}
+
+/// Median result-byte stats over the passes in which the fingerprint
+/// recorded any (`None` when none did — a recorded baseline or a
+/// fingerprint that never executed).
+fn aggregate_result_bytes(fps: &[&FingerprintReport]) -> Option<ResultBytesReport> {
+    let present: Vec<&ResultBytesReport> =
+        fps.iter().filter_map(|f| f.result_bytes.as_ref()).collect();
+    if present.is_empty() {
+        return None;
+    }
+    let m =
+        |f: &dyn Fn(&ResultBytesReport) -> u64| median_u64(present.iter().map(|b| f(b)).collect());
+    Some(ResultBytesReport {
+        total: m(&|b| b.total),
+        min: m(&|b| b.min),
+        max: m(&|b| b.max),
+        mean: median_f64(present.iter().map(|b| b.mean).collect()),
+        p50: m(&|b| b.p50),
+        p95: m(&|b| b.p95),
+    })
+}
+
+/// Per-decade medians: union of decades across passes (in practice
+/// identical — every pass replays the same spool against the same data),
+/// each metric the median over the passes in which the decade appears,
+/// emitted in decade order (unknown labels from future formats last).
+fn aggregate_size_buckets(fps: &[&FingerprintReport]) -> Vec<SizeBucketReport> {
+    let mut by_label: BTreeMap<(usize, &str), Vec<&SizeBucketReport>> = BTreeMap::new();
+    for f in fps {
+        for b in &f.size_buckets {
+            let order = SIZE_BUCKET_LABELS
+                .iter()
+                .position(|l| *l == b.bucket)
+                .unwrap_or(SIZE_BUCKET_LABELS.len());
+            by_label
+                .entry((order, b.bucket.as_str()))
+                .or_default()
+                .push(b);
+        }
+    }
+    by_label
+        .into_iter()
+        .map(|((_, label), bs)| {
+            let m = |f: &dyn Fn(&SizeBucketReport) -> u64| {
+                median_u64(bs.iter().map(|b| f(b)).collect())
+            };
+            SizeBucketReport {
+                bucket: label.to_string(),
+                count: m(&|b| b.count),
+                p50_us: m(&|b| b.p50_us),
+                p95_us: m(&|b| b.p95_us),
+                mean_us: median_f64(bs.iter().map(|b| b.mean_us).collect()),
+                max_us: m(&|b| b.max_us),
+                bytes_total: m(&|b| b.bytes_total),
+            }
+        })
+        .collect()
 }
 
 /// Aggregate `passes` (at least one) into a median report.
@@ -90,6 +149,8 @@ pub fn aggregate_median(passes: &[RunReport]) -> RunReport {
                 max_us: mu(&|f| f.max_us),
                 mean_us: median_f64(fps.iter().map(|f| f.mean_us).collect()),
                 checksum,
+                result_bytes: aggregate_result_bytes(&fps),
+                size_buckets: aggregate_size_buckets(&fps),
             }
         })
         .collect();
@@ -179,6 +240,8 @@ mod tests {
             max_us: p95_us + 20,
             mean_us: p95_us as f64 / 2.0,
             checksum: None,
+            result_bytes: None,
+            size_buckets: Vec::new(),
         }
     }
 
@@ -287,6 +350,63 @@ mod tests {
         assert_eq!(agg.fingerprints[0].id, 1);
         assert_eq!(agg.fingerprints[0].p95_us, 9000);
         assert_eq!(agg.fingerprints[1].p95_us, 200);
+    }
+
+    fn with_bytes(mut f: FingerprintReport, mean: f64, p95: u64) -> FingerprintReport {
+        f.result_bytes = Some(ResultBytesReport {
+            total: (mean * f.count as f64) as u64,
+            min: 1,
+            max: p95,
+            mean,
+            p50: mean as u64,
+            p95,
+        });
+        f.size_buckets = vec![SizeBucketReport {
+            bucket: "<1KB".to_string(),
+            count: f.count,
+            p50_us: f.p50_us,
+            p95_us: f.p95_us,
+            mean_us: f.mean_us,
+            max_us: f.max_us,
+            bytes_total: (mean * f.count as f64) as u64,
+        }];
+        f
+    }
+
+    #[test]
+    fn byte_stats_and_buckets_aggregate_per_field_medians() {
+        let passes = vec![
+            pass(1.0, 1.0, vec![with_bytes(fp(0, 900, 30), 100.0, 300)]),
+            pass(1.0, 1.0, vec![with_bytes(fp(0, 500, 30), 200.0, 500)]),
+            pass(1.0, 1.0, vec![with_bytes(fp(0, 700, 30), 150.0, 400)]),
+        ];
+        let agg = aggregate_median(&passes);
+        let b = agg.fingerprints[0].result_bytes.as_ref().expect("bytes");
+        assert_eq!(b.mean, 150.0);
+        assert_eq!(b.p95, 400);
+        assert_eq!(b.total, 150 * 30);
+        let buckets = &agg.fingerprints[0].size_buckets;
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].bucket, "<1KB");
+        assert_eq!(buckets[0].count, 30);
+        assert_eq!(buckets[0].p95_us, 700);
+
+        // A pass without byte stats (older report shape) doesn't poison the
+        // aggregate: medians run over the passes that have them.
+        let passes = vec![
+            pass(1.0, 1.0, vec![fp(0, 900, 30)]),
+            pass(1.0, 1.0, vec![with_bytes(fp(0, 500, 30), 200.0, 500)]),
+        ];
+        let agg = aggregate_median(&passes);
+        assert_eq!(
+            agg.fingerprints[0].result_bytes.as_ref().unwrap().mean,
+            200.0
+        );
+        assert_eq!(agg.fingerprints[0].size_buckets.len(), 1);
+        // And no byte stats anywhere stays None/empty.
+        let agg = aggregate_median(&[pass(1.0, 1.0, vec![fp(0, 900, 30)])]);
+        assert!(agg.fingerprints[0].result_bytes.is_none());
+        assert!(agg.fingerprints[0].size_buckets.is_empty());
     }
 
     #[test]

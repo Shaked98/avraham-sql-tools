@@ -6,11 +6,11 @@
 #
 #   rpmbuild -bb packaging/sql-replay.spec \
 #     --define "_sourcedir $PWD/dist" \
-#     --define "version 0.3.0"
+#     --define "version 0.4.0"
 #
 # where dist/ holds sql-replay-<version>-x86_64-unknown-linux-musl.tar.gz.
 
-%{!?version: %global version 0.3.0}
+%{!?version: %global version 0.4.0}
 
 # The binary is prebuilt and static: no debuginfo to extract, no build-id
 # links, and no automatic library dependencies to scan for.
@@ -55,7 +55,7 @@ install -Dm644 README.md %{buildroot}%{_docdir}/sql-replay/README.md
 %license LICENSE-MIT LICENSE-APACHE
 
 %changelog
-* Wed Jul 15 2026 avraham-sql-tools contributors - 0.3.0-1
+* Wed Jul 15 2026 avraham-sql-tools contributors - 0.4.0-1
 - pcap capture source: `capture --input traffic.pcap` decodes MySQL wire
   traffic recorded with tcpdump (prepared statements expanded, true wire
   timestamps, request->response latencies recorded for `baseline`).

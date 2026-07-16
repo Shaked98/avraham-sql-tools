@@ -162,6 +162,27 @@ requires tcpdump locally). Non-obvious facts baked in:
 - A `--checksum` run's latencies include full result reads — compare
   warns on checksum-flag mismatch and skips the correctness diff.
 
+## Result-set byte stats + size-decade split (0.4.0)
+
+`replay` measures per-fingerprint result-set bytes on the streaming drain
+(`target.rs` `value_bytes` is the canonical cell-size definition — decoded
+payload, NOT wire bytes; `TargetConn::query` returns the drained byte
+count, `ResultChecksum` carries `bytes_total` *outside* the digest so
+0.3.0 digests stay comparable). Always on: `FingerprintReport.result_bytes`
+plus `size_buckets` (latency stats per result-size decade,
+`report::SIZE_BUCKET_LABELS`/`size_bucket_index`, binary units,
+half-open). `compare` applies the same threshold/min-count rules per
+decade so a regression confined to big rows can't be averaged away —
+findings land in `size_regressions`/`size_regressed` (exit 2), kept
+*separate* from `regressions`/`regressed` deliberately: the verify rig
+asserts `.regressions | length == 2` and single-decade fingerprints would
+double-report (fingerprints already regressed at top level are excluded
+from the decade list). Runs without byte data (pre-0.4.0, recorded
+baselines) degrade to a `size_note` + n/a columns.
+`tests/result_bytes_test.rs` is the mock E2E (the mock honors a
+`MOCK_BYTES=<n>` marker); the fixture pair plants a decade-only
+regression in `show variables like ?`.
+
 ## Replay write gate
 
 `crates/sql-replay/src/classify.rs` (its tests are the spec): anything not
@@ -270,10 +291,12 @@ Exit codes: 0 no regression, 2 regression ≥ threshold (`EXIT_REGRESSED`),
 1 tool error — CI gates on this. Older run.json files still load: every
 field added after M1 (`pacing`, `target_settings`, the M3 `aborted`/
 `aggregation`/`filtered`/flag fields, the 0.2.0 `latency_source`/
-`settings_note`, and the 0.3.0 checksum fields — `flags.checksum`,
+`settings_note`, the 0.3.0 checksum fields — `flags.checksum`,
 per-fingerprint `checksum`, compare's `correctness`/`correctness_failed` —
-plus the capture summary's `pcap` block) is `#[serde(default)]`, keep it
-that way. An aborted (Ctrl-C/SIGTERM) replay exits 130 after writing partial
+the 0.4.0 byte-stat fields — per-fingerprint `result_bytes`/
+`size_buckets`, compare's `size_regressions`/`size_buckets_checked`/
+`size_note`/`size_regressed` — plus the capture summary's `pcap` block)
+is `#[serde(default)]`, keep it that way. An aborted (Ctrl-C/SIGTERM) replay exits 130 after writing partial
 reports; `compare` warns when an input run is `aborted`. Target settings are read with
 `SHOW VARIABLES LIKE` (returns no row instead of erroring on unknown
 variables); the 5.7 `tx_isolation` / 8.0 `transaction_isolation` rename is

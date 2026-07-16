@@ -7,15 +7,17 @@
 //!
 //! # Memory: both query paths stream, per row
 //!
-//! Neither path ever materializes a whole result set: `query` drains via
-//! `query_drop` (mysql_async reads, decodes, and drops one row at a
-//! time — its public API has no decode-free drain, so each in-flight
-//! row briefly exists as a wire packet plus a decoded `Row`), and
-//! `query_checksum` folds rows into the O(1) [`ChecksumBuilder`] as they
-//! arrive. Peak replay memory is therefore O(active connections x
-//! largest row) — the retention that used to sit on top of that floor
-//! is removed by [`crate::memtune`], and `tests/blob_memory.rs` is the
-//! regression guard. Don't add `collect()`-style result handling here.
+//! Neither path ever materializes a whole result set: `query` drains row
+//! by row, folding each row's [`value_bytes`] into a running byte count
+//! before dropping it (mysql_async reads, decodes, and drops one row at
+//! a time — its public API has no decode-free drain, so each in-flight
+//! row briefly exists as a wire packet plus a decoded `Row`, exactly as
+//! it did under `query_drop`), and `query_checksum` folds rows into the
+//! O(1) [`ChecksumBuilder`] as they arrive. Peak replay memory is
+//! therefore O(active connections x largest row) — the retention that
+//! used to sit on top of that floor is removed by [`crate::memtune`],
+//! and `tests/blob_memory.rs` is the regression guard. Don't add
+//! `collect()`-style result handling here.
 
 use std::future::Future;
 
@@ -57,6 +59,11 @@ impl std::fmt::Display for TargetError {
 pub struct ResultChecksum {
     pub digest: u64,
     pub row_count: u64,
+    /// Total [`value_bytes`] of the result set — carried for the byte
+    /// stats, deliberately NOT part of the digest (it is derivable from
+    /// the content, and folding it in would break digest comparability
+    /// with pre-0.4.0 runs).
+    pub bytes_total: u64,
     /// Column names of the (first) result set.
     pub columns: Vec<String>,
 }
@@ -68,6 +75,7 @@ pub struct ChecksumBuilder {
     sum: u64,
     xor: u64,
     rows: u64,
+    bytes: u64,
 }
 
 impl ChecksumBuilder {
@@ -82,10 +90,12 @@ impl ChecksumBuilder {
         }
     }
 
-    pub fn add_row_hash(&mut self, h: u64) {
+    /// Fold in one row: its canonical hash and its [`value_bytes`] size.
+    pub fn add_row(&mut self, h: u64, bytes: u64) {
         self.sum = self.sum.wrapping_add(h);
         self.xor ^= h;
         self.rows += 1;
+        self.bytes += bytes;
     }
 
     pub fn finish(self) -> ResultChecksum {
@@ -100,6 +110,7 @@ impl ChecksumBuilder {
         ResultChecksum {
             digest: h.digest(),
             row_count: self.rows,
+            bytes_total: self.bytes,
             columns: self.columns,
         }
     }
@@ -146,9 +157,36 @@ impl RowHasher {
     }
 }
 
-fn hash_row(row: mysql_async::Row) -> u64 {
+/// Canonical decoded size of one cell, in bytes: string/blob cells count
+/// their payload length, fixed-width numerics their binary width, NULL
+/// zero, temporals the length of their canonical text form. This is a
+/// payload measure, not wire bytes (no packet framing or length
+/// prefixes) — comparable only between runs of this tool. Over the text
+/// protocol every non-NULL cell arrives as `Bytes`, so in practice the
+/// count is the text-protocol payload size.
+pub fn value_bytes(v: &Value) -> u64 {
+    match v {
+        Value::NULL => 0,
+        Value::Bytes(b) => b.len() as u64,
+        Value::Int(_) | Value::UInt(_) => 8,
+        Value::Float(_) => 4,
+        Value::Double(_) => 8,
+        // Canonical text forms hashed below: "YYYY-MM-DD HH:MM:SS.ffffff"
+        // and "[-]HHH:MM:SS.ffffff" (26 / at-least-16 bytes).
+        Value::Date(..) => 26,
+        Value::Time(neg, days, hh, _, _, _) => {
+            let hours = format!("{:02}", *days * 24 + *hh as u32).len() as u64;
+            // sign + hours + ":MM:SS.ffffff"
+            u64::from(*neg) + hours + 13
+        }
+    }
+}
+
+fn hash_and_size_row(row: mysql_async::Row) -> (u64, u64) {
     let mut h = RowHasher::new();
+    let mut bytes = 0u64;
     for v in row.unwrap() {
+        bytes += value_bytes(&v);
         match v {
             Value::NULL => h.cell_null(),
             Value::Bytes(b) => h.cell_bytes(&b),
@@ -171,7 +209,11 @@ fn hash_row(row: mysql_async::Row) -> u64 {
             ),
         }
     }
-    h.finish()
+    (h.finish(), bytes)
+}
+
+fn row_bytes(row: mysql_async::Row) -> u64 {
+    row.unwrap().iter().map(value_bytes).sum()
 }
 
 /// Connection factory for a replay target.
@@ -183,7 +225,10 @@ pub trait Target: Clone + Send + Sync + 'static {
 
 /// One live connection to the target.
 pub trait TargetConn: Send + 'static {
-    fn query(&mut self, sql: &str) -> impl Future<Output = Result<(), TargetError>> + Send;
+    /// Execute `sql`, draining (not materializing) any result sets.
+    /// Returns the total [`value_bytes`] of the drained rows (0 when the
+    /// statement returned no result set).
+    fn query(&mut self, sql: &str) -> impl Future<Output = Result<u64, TargetError>> + Send;
 
     /// Execute `sql` and checksum its full result set (`--checksum`).
     /// `Ok(None)` = the statement succeeded but returned no result set
@@ -232,8 +277,26 @@ impl Target for MySqlTarget {
 }
 
 impl TargetConn for Conn {
-    async fn query(&mut self, sql: &str) -> Result<(), TargetError> {
-        self.query_drop(sql).await.map_err(target_err)
+    async fn query(&mut self, sql: &str) -> Result<u64, TargetError> {
+        // Row-by-row drain, exactly like `query_drop` does internally
+        // (same per-row decode, same O(1)-rows-in-flight memory), plus the
+        // running byte count.
+        let mut result = self.query_iter(sql).await.map_err(target_err)?;
+        let mut bytes = 0u64;
+        loop {
+            // `next` yields the rows of the current result set and advances
+            // to the following set (multi-set results count as one stream).
+            match result.next().await {
+                Ok(Some(row)) => bytes += row_bytes(row),
+                Ok(None) => {
+                    if result.is_empty() {
+                        break;
+                    }
+                }
+                Err(e) => return Err(target_err(e)),
+            }
+        }
+        Ok(bytes)
     }
 
     async fn query_checksum(&mut self, sql: &str) -> Result<Option<ResultChecksum>, TargetError> {
@@ -250,7 +313,10 @@ impl TargetConn for Conn {
             // `next` yields the rows of the current result set and advances
             // to the following set (multi-set results hash as one stream).
             match result.next().await {
-                Ok(Some(row)) => builder.add_row_hash(hash_row(row)),
+                Ok(Some(row)) => {
+                    let (hash, bytes) = hash_and_size_row(row);
+                    builder.add_row(hash, bytes);
+                }
                 Ok(None) => {
                     if result.is_empty() {
                         break;
@@ -283,7 +349,7 @@ mod tests {
         let mut b = ChecksumBuilder::new();
         b.set_columns(columns.iter().map(|s| s.to_string()));
         for r in rows {
-            b.add_row_hash(row_hash(r));
+            b.add_row(row_hash(r), r.iter().map(|c| c.len() as u64).sum());
         }
         b.finish()
     }
@@ -342,5 +408,44 @@ mod tests {
         let b = checksum(&["a"], &[&["3"], &["1"], &["2"]]);
         assert_eq!(a, b);
         assert_eq!(a.columns, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn checksum_carries_bytes_without_affecting_the_digest() {
+        let a = checksum(&["v"], &[&["abc"], &["defgh"]]);
+        assert_eq!(a.bytes_total, 8);
+        // Same content hashed with a different claimed byte count digests
+        // identically: bytes ride along, they are not part of the identity.
+        let mut b = ChecksumBuilder::new();
+        b.set_columns(["v".to_string()]);
+        b.add_row(row_hash(&["abc"]), 999);
+        b.add_row(row_hash(&["defgh"]), 0);
+        let b = b.finish();
+        assert_eq!(a.digest, b.digest);
+        assert_eq!(b.bytes_total, 999);
+    }
+
+    #[test]
+    fn value_bytes_counts_payload_not_framing() {
+        assert_eq!(value_bytes(&Value::NULL), 0);
+        assert_eq!(value_bytes(&Value::Bytes(vec![0u8; 15 << 20])), 15 << 20);
+        assert_eq!(value_bytes(&Value::Bytes(Vec::new())), 0);
+        assert_eq!(value_bytes(&Value::Int(-3)), 8);
+        assert_eq!(value_bytes(&Value::UInt(3)), 8);
+        assert_eq!(value_bytes(&Value::Float(1.0)), 4);
+        assert_eq!(value_bytes(&Value::Double(1.0)), 8);
+        // Temporals match their canonical hashed text form's length.
+        assert_eq!(
+            value_bytes(&Value::Date(2026, 7, 16, 12, 0, 0, 0)),
+            "2026-07-16 12:00:00.000000".len() as u64
+        );
+        assert_eq!(
+            value_bytes(&Value::Time(false, 0, 5, 30, 15, 0)),
+            "05:30:15.000000".len() as u64
+        );
+        assert_eq!(
+            value_bytes(&Value::Time(true, 5, 4, 30, 15, 0)),
+            "-124:30:15.000000".len() as u64
+        );
     }
 }

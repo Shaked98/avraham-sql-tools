@@ -114,6 +114,10 @@ pub fn build_baseline(capture_path: &Path, filters: &Filters) -> Result<RunRepor
             max_us: agg.hist.max(),
             mean_us: agg.hist.mean(),
             checksum: None,
+            // The capture records latencies, not result sizes — a recorded
+            // baseline has no byte stats (compare says so and degrades).
+            result_bytes: None,
+            size_buckets: Vec::new(),
         })
         .collect();
     fingerprints.sort_by(|a, b| b.p95_us.cmp(&a.p95_us).then(b.count.cmp(&a.count)));

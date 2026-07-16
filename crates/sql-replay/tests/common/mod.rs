@@ -78,8 +78,25 @@ impl Target for MockTarget {
     }
 }
 
+/// Deterministic mock result-set size: `MOCK_BYTES=<n>` anywhere in the
+/// statement (typically inside a comment, so fingerprinting still merges
+/// differently-sized events) sets it; otherwise the statement text length
+/// stands in.
+pub fn mock_result_bytes(sql: &str) -> u64 {
+    if let Some(pos) = sql.find("MOCK_BYTES=") {
+        let digits: String = sql[pos + "MOCK_BYTES=".len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(n) = digits.parse() {
+            return n;
+        }
+    }
+    sql.len() as u64
+}
+
 impl TargetConn for MockConn {
-    async fn query(&mut self, sql: &str) -> Result<(), TargetError> {
+    async fn query(&mut self, sql: &str) -> Result<u64, TargetError> {
         let n = self.state.queries.fetch_add(1, Ordering::SeqCst) + 1;
         let trigger = self.state.shutdown_after.load(Ordering::SeqCst);
         if trigger != 0 && n == trigger {
@@ -102,11 +119,11 @@ impl TargetConn for MockConn {
                 fatal: false,
             });
         }
-        Ok(())
+        Ok(mock_result_bytes(sql))
     }
 
     async fn query_checksum(&mut self, sql: &str) -> Result<Option<ResultChecksum>, TargetError> {
-        self.query(sql).await?;
+        let bytes = self.query(sql).await?;
         if sql.contains("MOCK_NO_RESULT") {
             return Ok(None);
         }
@@ -119,7 +136,7 @@ impl TargetConn for MockConn {
         let mut row = RowHasher::new();
         row.cell_bytes(sql.as_bytes());
         row.cell_uint(version);
-        b.add_row_hash(row.finish());
+        b.add_row(row.finish(), bytes);
         Ok(Some(b.finish()))
     }
 
