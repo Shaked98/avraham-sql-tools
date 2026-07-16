@@ -435,10 +435,11 @@ FAIL: 1 fingerprint(s) regressed >= 50% on p95 (exit code 2)
 `report.html` is the same data as a **self-contained HTML page** (inline
 CSS/JS, renders offline — safe to email or attach to a ticket) with a
 sortable per-fingerprint table and both runs' metadata side by side;
-`report.json` is the same data for machines. One line of forward-looking
-honesty: the *next* release (per-fingerprint result-set byte stats and
-per-size-decade regression checks) adds byte columns and a size-decade
-section to these reports; v0.3.0 output looks exactly as shown here.
+`report.json` is the same data for machines. One note on version drift:
+v0.4.0 adds per-fingerprint result-set byte stats and per-size-decade
+regression checks, which put byte columns and a size-decade section in
+these reports; the v0.3.0 binary this walkthrough was executed against
+produces output exactly as shown here.
 
 ## 7. No replayable 5.7? Use the recorded baseline
 
