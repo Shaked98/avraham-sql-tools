@@ -28,7 +28,9 @@
 //!   handshake opaque to us, so such connections are skipped and counted.
 //! - `COM_QUERY` carries plain text — unless `CLIENT_QUERY_ATTRIBUTES`
 //!   was negotiated (mysql 8.x CLI does), in which case an attribute
-//!   section precedes the text and must be skipped.
+//!   section precedes the text and must be skipped. Negotiated means set
+//!   by *both* sides: the 8.x CLI sends the flag even to pre-8.0 servers
+//!   whose greeting never advertised it, and then uses the plain form.
 //! - `COM_STMT_PREPARE`'s response carries the statement id and parameter
 //!   count; `COM_STMT_EXECUTE` carries binary-encoded parameter values,
 //!   which are decoded and interpolated into the prepared SQL text
@@ -277,6 +279,8 @@ pub struct ConnDecoder {
     disposition: Disposition,
     /// Client capability flags from the handshake response.
     caps: u32,
+    /// Server capability flags from the greeting.
+    server_caps: u32,
     query_attrs: bool,
     user: Option<String>,
     db: Option<String>,
@@ -300,6 +304,7 @@ impl ConnDecoder {
             server: PacketAssembler::new(),
             disposition: Disposition::Active,
             caps: 0,
+            server_caps: 0,
             query_attrs: false,
             user: None,
             db: None,
@@ -378,9 +383,10 @@ impl ConnDecoder {
         match self.phase {
             Phase::Greeting => {
                 match parse_greeting(&pkt.payload) {
-                    Some((version, thread_id)) => {
+                    Some((version, thread_id, caps)) => {
                         self.server_version = Some(version);
                         self.thread_id = Some(thread_id);
+                        self.server_caps = caps;
                         self.phase = Phase::Login;
                     }
                     None => self.disposition = Disposition::BadHandshake,
@@ -479,7 +485,13 @@ impl ConnDecoder {
             return;
         }
         self.caps = caps;
-        self.query_attrs = caps & CLIENT_QUERY_ATTRIBUTES != 0;
+        // Effective capabilities are the intersection of both sides'.
+        // The mysql 8.x CLI sends CLIENT_QUERY_ATTRIBUTES even to servers
+        // that never advertised it (libmysqlclient only masks off
+        // COMPRESS/SSL/PROTOCOL_41 against server caps) but then uses the
+        // plain COM_QUERY form, so the client flag alone must not enable
+        // attribute parsing.
+        self.query_attrs = caps & self.server_caps & CLIENT_QUERY_ATTRIBUTES != 0;
 
         // Best-effort user/db extraction; failures leave them None but the
         // command phase still works.
@@ -737,15 +749,31 @@ impl Default for ConnDecoder {
 }
 
 /// Server greeting: protocol version 10, server version (NUL-terminated),
-/// thread id.
-fn parse_greeting(p: &[u8]) -> Option<(String, u32)> {
+/// thread id, and the server capability flags (best-effort: 0 bits for
+/// anything past the end of a short greeting).
+fn parse_greeting(p: &[u8]) -> Option<(String, u32, u32)> {
     if p.first() != Some(&10) {
         return None;
     }
     let mut r = Reader::new(&p[1..]);
     let version = r.cstring()?;
     let thread_id = u32::from_le_bytes(r.take(4)?.try_into().ok()?);
-    Some((String::from_utf8_lossy(version).into_owned(), thread_id))
+    // auth-plugin-data-part-1 (8) + filler (1), then the low capability
+    // bytes; charset (1) + status (2) precede the high capability bytes.
+    let mut caps = 0u32;
+    r.skip(8 + 1);
+    if let Some(low) = r.take(2) {
+        caps |= u16::from_le_bytes(low.try_into().expect("2 bytes")) as u32;
+        r.skip(1 + 2);
+        if let Some(high) = r.take(2) {
+            caps |= (u16::from_le_bytes(high.try_into().expect("2 bytes")) as u32) << 16;
+        }
+    }
+    Some((
+        String::from_utf8_lossy(version).into_owned(),
+        thread_id,
+        caps,
+    ))
 }
 
 /// `USE dbname` / `USE \`dbname\`` → the database name.
@@ -1132,12 +1160,24 @@ mod tests {
         out
     }
 
+    /// Greeting advertising every capability (a modern server); tests
+    /// that negotiate a capability in `login` then get it end-to-end.
     fn greeting(version: &str, thread_id: u32) -> Vec<u8> {
+        greeting_with_caps(version, thread_id, u32::MAX)
+    }
+
+    fn greeting_with_caps(version: &str, thread_id: u32, server_caps: u32) -> Vec<u8> {
         let mut p = vec![10u8];
         p.extend_from_slice(version.as_bytes());
         p.push(0);
         p.extend_from_slice(&thread_id.to_le_bytes());
-        p.extend_from_slice(&[0u8; 30]); // salt, caps, filler — unused
+        p.extend_from_slice(&[0u8; 8]); // auth-plugin-data-part-1
+        p.push(0); // filler
+        p.extend_from_slice(&(server_caps as u16).to_le_bytes());
+        p.push(33); // charset
+        p.extend_from_slice(&[0u8; 2]); // status flags
+        p.extend_from_slice(&((server_caps >> 16) as u16).to_le_bytes());
+        p.extend_from_slice(&[0u8; 11]); // auth data len + reserved
         packet(0, &p)
     }
 
@@ -1342,6 +1382,35 @@ mod tests {
         s.client(&packet(0, &p));
         s.server(&ok_packet(1));
         assert_eq!(s.events[1].query, "SELECT 3");
+    }
+
+    #[test]
+    fn query_attrs_client_flag_without_server_support_stays_plain_text() {
+        // The mysql 8.x CLI against a 5.7 server: the client's handshake
+        // response still carries CLIENT_QUERY_ATTRIBUTES (libmysqlclient
+        // doesn't mask it against server caps), but COM_QUERY uses the
+        // plain form because the server never advertised the capability.
+        let mut s = Session {
+            dec: ConnDecoder::new(),
+            events: Vec::new(),
+            ts: 1_000_000,
+        };
+        s.server(&greeting_with_caps("5.7.44", 9, !CLIENT_QUERY_ATTRIBUTES));
+        s.client(&login(CLIENT_QUERY_ATTRIBUTES, "root", None));
+        // 5.7 also auth-switches this client to mysql_native_password;
+        // with an empty password the switch response is a 0-byte packet.
+        let mut switch = vec![0xfe];
+        switch.extend_from_slice(b"mysql_native_password\0");
+        switch.extend_from_slice(&[0u8; 21]);
+        s.server(&packet(2, &switch));
+        s.client(&packet(3, &[]));
+        s.server(&ok_packet(4));
+        s.client(&com_query("select @@version_comment limit 1"));
+        s.server(&ok_packet(1));
+        assert_eq!(s.dec.disposition(), Disposition::Active);
+        assert_eq!(s.events.len(), 1);
+        assert_eq!(s.events[0].query, "select @@version_comment limit 1");
+        assert_eq!(s.dec.stats.commands_ignored, 0);
     }
 
     #[test]

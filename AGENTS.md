@@ -115,6 +115,9 @@ requires tcpdump locally). Non-obvious facts baked in:
   serde-defaulted `format::PcapSummary`) and stderr warnings.
 - The mysql 8.x CLI negotiates CLIENT_QUERY_ATTRIBUTES: COM_QUERY then
   carries an attribute section before the SQL text that must be skipped.
+  But it sends that flag even to pre-8.0 servers that never advertised
+  the capability (and then uses plain COM_QUERY), so the decoder ANDs
+  client and server (greeting) capability flags before trusting it.
 - TCP reassembly maps seqs to u64 relative offsets (wraparound and >4 GiB
   streams); out-of-order data buffers up to 8 MiB per direction, beyond
   that the connection counts as broken. Session id = server thread id
