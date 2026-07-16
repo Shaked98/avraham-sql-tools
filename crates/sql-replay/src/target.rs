@@ -4,6 +4,18 @@
 //! pooling, abort) is generic over [`Target`], so it can be exercised at
 //! scale in tests with a mock target — no MySQL needed. Production replay
 //! uses [`MySqlTarget`]; test mocks live under `tests/`.
+//!
+//! # Memory: both query paths stream, per row
+//!
+//! Neither path ever materializes a whole result set: `query` drains via
+//! `query_drop` (mysql_async reads, decodes, and drops one row at a
+//! time — its public API has no decode-free drain, so each in-flight
+//! row briefly exists as a wire packet plus a decoded `Row`), and
+//! `query_checksum` folds rows into the O(1) [`ChecksumBuilder`] as they
+//! arrive. Peak replay memory is therefore O(active connections x
+//! largest row) — the retention that used to sit on top of that floor
+//! is removed by [`crate::memtune`], and `tests/blob_memory.rs` is the
+//! regression guard. Don't add `collect()`-style result handling here.
 
 use std::future::Future;
 

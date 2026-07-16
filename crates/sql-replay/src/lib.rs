@@ -11,6 +11,7 @@ pub mod compare;
 pub mod compare_html;
 pub mod fingerprint;
 pub mod format;
+pub mod memtune;
 pub mod mysqlproto;
 pub mod pcap;
 pub mod replay;

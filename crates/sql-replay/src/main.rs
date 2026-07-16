@@ -195,6 +195,11 @@ fn pass_report_path(out: &std::path::Path, pass: usize) -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // Before anything else: still single-threaded (it mutates the
+    // environment) and no MySQL connection exists yet (mysql_async reads
+    // its buffer-pool config from the environment exactly once).
+    sql_replay::memtune::tune_process_memory();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
