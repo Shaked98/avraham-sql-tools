@@ -18,6 +18,8 @@ cargo build --release
 SQL_REPLAY_TEST_URL=mysql://root@127.0.0.1:3306/test cargo test -p sql-replay --test replay_integration
 # heavy 1M-event bounded-memory test (CI runs it in the check job):
 cargo test --release -p sql-replay --test scale -- --ignored --nocapture
+# blob-row peak-RSS guard (needs a live server; CI runs it in the integration job):
+SQL_REPLAY_TEST_URL=mysql://root@127.0.0.1:3306/test cargo test --release -p sql-replay --test blob_memory -- --ignored --nocapture
 ```
 
 CI (`.github/workflows/ci.yml`) is the authoritative home of the MySQL

@@ -416,6 +416,7 @@ $ cargo build --release          # binary at target/release/sql-replay
 $ cargo test                     # unit + fixture tests, no database needed
 $ SQL_REPLAY_TEST_URL=mysql://root@127.0.0.1:3306/test cargo test -p sql-replay --test replay_integration
 $ cargo test --release -p sql-replay --test scale -- --ignored  # 1M-event memory-bound evidence
+$ SQL_REPLAY_TEST_URL=... cargo test --release -p sql-replay --test blob_memory -- --ignored  # blob-row peak-RSS guard
 $ cargo build --release --target x86_64-unknown-linux-musl -p sql-replay  # static binary (needs musl-gcc)
 ```
 
@@ -431,7 +432,10 @@ and gate exit codes. The integration job also tcpdumps a real scripted
 workload (binary-protocol prepared statements included) and drives it
 through the full pcap → capture → replay → baseline path, and exercises
 `--checksum` end to end: two replays over identical data must compare
-clean, and a planted `UPDATE` must be detected with exit code 2. A
+clean, and a planted `UPDATE` must be detected with exit code 2. It also
+runs the blob-row memory guard (`tests/blob_memory.rs`, release mode):
+replaying multi-MB LONGTEXT rows must keep the binary's peak RSS under
+the per-connection bounds, dedicated and `--pool 2`. A
 dedicated job builds the static musl binary, verifies it is statically
 linked, and smoke-builds the RPM from `packaging/sql-replay.spec`.
 
