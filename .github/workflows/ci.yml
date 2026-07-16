@@ -312,6 +312,10 @@ jobs:
           jq -e '[.fingerprints[] | select(.fingerprint | contains("sleep")) | select(.p95_us >= 200000)] | length >= 1' pcap-baseline.json
 
       # ---- M4 checksum legs: correctness diffing on live data ----
+      # These legs gate on the correctness section only; sub-millisecond
+      # loopback latencies are scheduler noise on shared runners, so the
+      # latency threshold is set out of reach to keep exit codes
+      # correctness-driven.
       - name: checksum leg — identical data yields zero mismatches
         run: |
           ./target/release/sql-replay replay \
@@ -327,6 +331,7 @@ jobs:
           ./target/release/sql-replay compare \
             --baseline run-cs-base.json \
             --candidate run-cs-same.json \
+            --threshold-pct 100000 \
             --json cs-same-report.json
           jq -e '.correctness.checked >= 3' cs-same-report.json
           jq -e '.correctness.matched == .correctness.checked' cs-same-report.json
@@ -344,6 +349,7 @@ jobs:
           ./target/release/sql-replay compare \
             --baseline run-cs-base.json \
             --candidate run-cs-tampered.json \
+            --threshold-pct 100000 \
             --json cs-tampered-report.json \
             --out cs-tampered-report.html
           code=$?
