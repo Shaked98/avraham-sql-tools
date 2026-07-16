@@ -123,6 +123,98 @@ simply not recorded; MariaDB's `tx_isolation` is canonicalized to
 pair with a "target engine families differ" comparability warning so
 settings deltas read as engine defaults to review, not noise.
 
+### Benchmarks: where a 5.7 workload regresses on 8.0 vs MariaDB 10.11
+
+Three executed benchmark writeups — the tool dogfooding itself against
+real `mysql:5.7`, `mysql:8.0` and `mariadb:10.11` containers — compare
+the same captured 5.7 workloads on both migration candidates:
+
+- [5.7 vs 8.0, general workload](docs/benchmarks/2026-07-16-mysql80-general.md)
+  (stock server defaults — deliberately charset-confounded, see footnote 1)
+- [5.7 vs 8.0, huge-text payloads](docs/benchmarks/2026-07-16-mysql80-hugetext.md)
+  (100KB–15MB LONGTEXT documents, charset pinned)
+- [5.7 vs MariaDB 10.11, both workloads](docs/benchmarks/2026-07-16-mariadb.md)
+  (charset pinned; also the cross-engine `--checksum` correctness run)
+
+Δp95 is the candidate vs that run's own 5.7 baseline, per query class,
+from `compare`'s median-of-3-passes reports. **Bold** = regression
+flagged by `compare`'s gate (p95 ≥ +20%); a negative delta means faster
+than 5.7.
+
+| query class | 5.7 → 8.0, Δp95 | 5.7 → MariaDB 10.11, Δp95 |
+|---|---:|---:|
+| **General workload** — 8.0 vs **latin1-5.7** (stock defaults¹), MariaDB vs **utf8mb4-5.7** · [8.0 writeup](docs/benchmarks/2026-07-16-mysql80-general.md) · [MariaDB writeup](docs/benchmarks/2026-07-16-mariadb.md) | | |
+| join + GROUP BY over VARCHAR keys | **+465%** ¹ | −15% (mean −15%) |
+| pk point lookup | +8% | −3% |
+| hire-date secondary-index lookup | −6% | −4% |
+| short INSERT (audit row) | **+25%** ² (mean +7%) | +5% |
+| **Huge-text full fetches, single stream (C=1)** — charset pinned in both runs · [8.0 writeup](docs/benchmarks/2026-07-16-mysql80-hugetext.md) · [MariaDB writeup](docs/benchmarks/2026-07-16-mariadb.md) | | |
+| full fetch 100KB | −16% | −4% |
+| full fetch 1MB | +5% | −7% |
+| full fetch 5MB | −18% | +5% |
+| full fetch 15MB | +4% | +10% (mean +10%)³ |
+| **Huge-text full fetches, 12 parallel fetchers (C=12)** | | |
+| full fetch 100KB | **+34%** ² | +16% |
+| full fetch 1MB | −5% | **+23%** (mean +18%)³ |
+| full fetch 5MB | −9% | +8% |
+| full fetch 15MB | −9% | +6% |
+
+What the table says at a glance:
+
+- **8.0's one big cliff is the join+GROUP BY / temp-table class: ~5x
+  slower** on stock defaults (p95 202 → 1145 ms), driven by the utf8mb4
+  default charset on the VARCHAR grouping keys plus 8.0's TempTable
+  engine — so it is tunable¹. **MariaDB 10.11 is 15% *faster* than 5.7
+  on the same class** (p95 340 → 289 ms, charset pinned): the cliff is
+  an 8.0 phenomenon, not a "leaving 5.7" phenomenon.
+- **Huge-text transfer is at par on both candidates.** On ≥1MB full
+  fetches 8.0's mean latency is 2–17% *lower* than 5.7's at every
+  concurrency; MariaDB's means stay within single-digit percent either
+  way (one flagged exception³). No payload-size cliff up to 15MB on
+  either engine, and both beat 5.7 at server-side blob reads under
+  concurrency.
+- **8.0's other loss is fixed per-statement overhead on tiny queries**:
+  its flagged sub-millisecond cells (INSERT +25%, 100KB fetch at C=12
+  +34%) are 0.2–0.8 ms absolute — real directionally, scheduler-noise
+  magnitude².
+- **MariaDB's real migration gotcha is behavioral, not performance**:
+  its default `sql_mode` drops `ONLY_FULL_GROUP_BY`, `NO_ZERO_IN_DATE`
+  and `NO_ZERO_DATE` relative to 5.7's, and 8.0's `utf8mb4_0900_*`
+  collations don't exist there — pin `sql_mode` and charset/collation
+  explicitly when migrating.
+- Cross-engine **result correctness was clean**: `--checksum` digests
+  were identical between 5.7 and MariaDB on every one of the 16
+  deterministic workload fingerprints (0 mismatches), including 15MB
+  LONGTEXT bodies and decimal `AVG` aggregates.
+
+Footnotes — read before quoting any number:
+
+1. **The two columns have deliberately different baselines on the
+   general workload.** The 8.0 general run used stock server defaults
+   on both sides — a **latin1-5.7** baseline vs a utf8mb4 8.0, which is
+   what a naive migration actually experiences — so its +465% bundles
+   the charset change with the engine change. The MariaDB run (like the
+   8.0 huge-text run) pins utf8mb4 on both sides (**utf8mb4-5.7**
+   baseline); the charset alone costs 5.7 about +68% p95 on the GROUP
+   BY class (202 → 340 ms baseline). Pinning or deliberately converting
+   the charset shrinks 8.0's cliff accordingly.
+2. Sub-millisecond classes on a virtualized box are scheduler-noise
+   territory at `compare`'s default 20% threshold: the direction (8.0's
+   higher per-statement cost) is consistent across runs, the magnitudes
+   are not trustworthy at 0.2–0.8 ms absolute.
+3. MariaDB watch items to re-measure on real hardware: the 1MB-class
+   fetch tail under high concurrency (+23% p95, mean +18% at C=12) and
+   single-stream ≥5MB transfer (+5–10% mean) — small, plausibly
+   WSL2-flavored, reproducibly flagged by the gate.
+4. **All numbers are same-box, back-to-back WSL2 ratios** (i7-13700KF,
+   Docker containers over loopback) — meaningful as 5.7-vs-candidate
+   ratios, not as production absolutes.
+5. **Absolute MB/s must not be compared between the two huge-text
+   writeups**: the 8.0 run used sql-replay 0.2.0 and the MariaDB run
+   0.4.0, whose memory-model change (buffer caps) roughly halved replay
+   RSS at the cost of ~2x multi-MB fetch latency. Within-run engine
+   ratios are unaffected — both legs of each run used the same binary.
+
 ### Capturing load on the source server
 
 `capture` reads a MySQL **slow query log** that contains *every* query. On
