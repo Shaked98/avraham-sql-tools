@@ -143,6 +143,23 @@ $ sql-replay replay \
   Note the default spool location is the system temp dir, which is tmpfs
   (RAM-backed) on some distros — point `--spool-dir` at real disk there,
   or the spool itself occupies memory.
+- **Memory model on big rows:** result sets are never buffered — rows are
+  read, processed, and dropped one at a time (also under `--checksum`) —
+  but each *connection* mid-fetch briefly holds its current row about
+  three times over (wire packet + decoded row + buffer-growth transients).
+  Peak RSS is therefore roughly
+  `base + concurrent connections x 3 x largest row`
+  (measured: ~170 MiB for 12 sessions concurrently scanning 4 MiB-row
+  result sets; `tests/blob_memory.rs` enforces the bound in CI). For
+  blob-heavy captures with many sessions, **use `--pool N`**: in-flight
+  rows are then bounded by the pool, not the session count (the same
+  12-session workload over `--pool 2` peaks at ~41 MiB). The binary also
+  pins allocator/driver buffer retention (`src/memtune.rs`) so freed
+  multi-MB row buffers return to the OS instead of accumulating —
+  overridable via the `MYSQL_ASYNC_BUFFER_SIZE_CAP` and
+  `MALLOC_MMAP_THRESHOLD_` environment variables; the cost is a page-fault
+  tax of roughly a millisecond per 15 MB row on fetches of multi-MB rows
+  (identical on both sides of a `compare` pair, so ratios are unaffected).
 - If the connection cap cannot fit under the process's open-files limit,
   replay fails up front with the `ulimit -n` / systemd `LimitNOFILE=` value
   to raise.
@@ -220,7 +237,10 @@ $ sql-replay replay --capture capture.jsonl.zst --url mysql://... \
   a dedicated connection, so session state (temp tables, session
   variables, transactions) does not carry across a session's queries, and
   captured `USE` statements are skipped — the per-event database metadata
-  drives `USE` reconciliation on checkout instead. Off by default.
+  drives `USE` reconciliation on checkout instead. Off by default. Also
+  the recommended lever for blob-heavy captures: replay memory scales
+  with connections holding rows in flight (see the memory-model bullet
+  above), and `--pool N` caps that at N regardless of session count.
 
 ### Comparing runs (5.7 vs 8.0 regression gate)
 

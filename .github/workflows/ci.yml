@@ -251,6 +251,13 @@ jobs:
         run: cargo test -p sql-replay --test replay_integration
         env:
           SQL_REPLAY_TEST_URL: mysql://root@127.0.0.1:3306/sqlreplay
+      - name: blob-memory regression guard (peak RSS bounded per connection)
+        # Multi-MB LONGTEXT rows; release mode because the bounds are
+        # calibrated against the release binary (which the earlier build
+        # step already produced).
+        run: cargo test --release -p sql-replay --test blob_memory -- --ignored --nocapture
+        env:
+          SQL_REPLAY_TEST_URL: mysql://root@127.0.0.1:3306/sqlreplay
 
       # ---- M4 pcap leg: tcpdump real wire traffic, capture, replay ----
       - name: tcpdump a scripted wire workload

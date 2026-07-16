@@ -170,6 +170,25 @@ OUTFILE`/`DUMPFILE` writes files on the server; `WITH` is classified by the
 first top-level verb after the CTEs; multi-statement text (a top-level `;`
 followed by more content) is always a write.
 
+## Blob-row memory model (post-M4 hardening)
+
+`crates/sql-replay/src/memtune.rs` + `tests/blob_memory.rs` (docs there
+are the spec; README "Memory model on big rows" is the user story).
+Replay peak RSS ≈ base + connections × ~3× largest result row (packet
+buf + decoded Row + growth transients — mysql_async has no decode-free
+drain; both `query` and `query_checksum` already stream per-row, never
+per-result-set). Two retention mechanisms used to add ~50 MB/session on
+15 MB rows: mysql_async's global buffer pool (128 bufs shrunk only to
+`MYSQL_ASYNC_BUFFER_SIZE_CAP`, default 4 MiB) and glibc's dynamic mmap
+threshold. `memtune::tune_process_memory()` (called first thing in
+`main`, must precede threads and the first connection) defaults both to
+128 KiB, respecting env overrides; musl needs no mallopt (gated out).
+Cost: ~1 ms page-fault tax per 15 MB row. `--pool N` is the documented
+lever for blob-heavy captures (bounds in-flight rows to N). CI's
+integration job runs the guard (`--test blob_memory -- --ignored`,
+release mode — bounds are release-calibrated; it must stay alone in its
+binary and drives the real binary via `CARGO_BIN_EXE` + `wait4` maxrss).
+
 ## Replay ingestion is streamed — keep it that way (M3)
 
 `crates/sql-replay/src/spool.rs` (module docs + tests are the spec):
