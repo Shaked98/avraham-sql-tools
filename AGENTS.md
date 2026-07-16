@@ -7,6 +7,12 @@ usage and milestone scope (M1 capture/replay, M2 pacing + compare, M3
 scale hardening + RHEL 8 packaging, M4 pcap capture + result-correctness
 diffing — the final planned milestone).
 
+`docs/quickstart.md` is an *executed* walkthrough: every shown output
+came from really running the commands against the pinned release binary
+(v0.3.0) and toy mysql:5.7/8.0 containers. If tool output or flags
+change, re-execute the walkthrough (and bump the pinned version when a
+new release ships) instead of hand-editing the outputs.
+
 ## Build / test
 
 ```sh

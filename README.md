@@ -71,6 +71,13 @@ When the source server can't be replayed against (it *is* production),
 recorded latencies instead — see below. The rest of this document covers
 each step in depth.
 
+**New to the tool?** [docs/quickstart.md](docs/quickstart.md) is the
+hands-on 15-minute version of this Quickstart: a complete capture →
+replay → compare session against throwaway Docker containers, with the
+real output of every command, guidance on reading `compare` reports, and
+production notes + first-run troubleshooting for a real 5.7 → 8.0
+migration.
+
 ### Scope
 
 M1 shipped `capture` and `replay`; M2 added faithful-timing pacing
