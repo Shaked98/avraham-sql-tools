@@ -222,8 +222,9 @@ Provenance is `RunReport::latency_source` (`"recorded-slow-log"` vs
 `"replayed"`, serde-defaulted to replayed so pre-0.2.0 run.json loads);
 recorded reports have empty `target_url`/`target_server_version`
 (skip-serialized) and no settings. `compare` handles mixed pairs: a loud
-MEASUREMENT PLANES DIFFER warning (server-side Query_time under live load
-vs client-side replay wall time), replay-knob flag diffs suppressed
+MEASUREMENT PLANES DIFFER warning (recorded latencies — server-side
+slow-log Query_time or pcap request→response wire time — vs client-side
+replay wall time), replay-knob flag diffs suppressed
 (filter flags still compared — they change the workload slice), settings
 diff skipped with `settings_note`, "recorded (slow log)" in the version
 slot. Baseline errors are 0 by definition (the slow log records none) —

@@ -289,13 +289,14 @@ pub fn compare_runs(
             ("candidate", "baseline")
         };
         warnings.push(format!(
-            "MEASUREMENT PLANES DIFFER: the {rec} latencies are server-side Query_time \
-             values recorded in the production slow log (measured under live production \
-             load, including lock waits and contention), while the {rep} latencies are \
-             client-side wall times measured by replay from the test host (including \
-             network round-trip and driver overhead). Deltas mix real server changes \
-             with this measurement gap — use a generous --threshold-pct and treat small \
-             deltas as noise"
+            "MEASUREMENT PLANES DIFFER: the {rec} latencies were recorded in the source \
+             capture — server-side slow-log Query_time (measured under live production \
+             load, including lock waits and contention) or request→response wire time \
+             for pcap captures (server plus the capture-point→server network path) — \
+             while the {rep} latencies are client-side wall times measured by replay \
+             from the test host (including network round-trip and driver overhead). \
+             Deltas mix real server changes with this measurement gap — use a generous \
+             --threshold-pct and treat small deltas as noise"
         ));
     }
     // Replay-execution knobs (speed, connection caps, write gate, ...) only
@@ -1201,7 +1202,8 @@ mod tests {
             .find(|w| w.contains("MEASUREMENT PLANES DIFFER"))
             .expect("measurement-plane warning present");
         assert!(plane.contains("Query_time"));
-        assert!(plane.contains("production slow log"));
+        assert!(plane.contains("source capture"));
+        assert!(plane.contains("pcap"));
         assert!(plane.contains("wall times"));
         assert!(plane.contains("--threshold-pct"));
 
