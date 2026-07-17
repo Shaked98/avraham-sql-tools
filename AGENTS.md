@@ -9,9 +9,14 @@ diffing — the final planned milestone).
 
 `docs/quickstart.md` is an *executed* walkthrough: every shown output
 came from really running the commands against the pinned release binary
-(v0.3.0) and toy mysql:5.7/8.0 containers. If tool output or flags
+(v0.4.0) and toy mysql:5.7/8.0 containers. If tool output or flags
 change, re-execute the walkthrough (and bump the pinned version when a
-new release ships) instead of hand-editing the outputs.
+new release ships) instead of hand-editing the outputs. When
+re-executing: §6's noise lesson needs the sub-ms point-lookup class's
+Δp95 to land between the default (20%) and tuned (50%) thresholds, and
+on this host it swings roughly −11%..+72% run to run — re-run the two
+replay commands (real filenames, keep transcripts) until a pair lands
+in band.
 
 `docs/architecture.svg` is a hand-written, self-contained SVG workflow
 diagram (Cantrill-style: white canvas rect, soft-fill rounded boxes,
