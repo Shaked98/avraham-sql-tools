@@ -355,6 +355,12 @@ unrecorded warm-up pass plus three measured passes with a median-
 aggregated report — both worth using for real measurements; both omitted
 here to keep the toy loop fast.
 
+`--warmup --repeat 3` measures warm steady-state latency. If instead the
+*point* of your test is cold disk I/O (blob-lookup workloads), that recipe
+is wrong — warmup and a warm second pass erase the signal. See the
+[I/O-bound / cold-cache recipe](../README.md#operational-controls-m3) in
+the README for the cold-restart discipline to use there.
+
 ## 6. Compare the runs
 
 ```console

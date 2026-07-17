@@ -1748,14 +1748,14 @@ mod tests {
 
     #[test]
     fn size_decade_regression_is_flagged_even_when_the_fingerprint_is_stable() {
-        // Fingerprint-wide p95 moves +5% (stable), but the >=10MB decade —
+        // Fingerprint-wide p95 moves +5% (stable), but the >=100MB decade —
         // 10 of 40 events — regresses +150%: exactly the averaged-away case.
         let base = run(
             "5.7.42",
             vec![with_bytes(
                 fp("q_docs", 40, 0, 10_000),
                 1_000_000.0,
-                &[("<1KB", 30, 500), (">=10MB", 10, 20_000)],
+                &[("<1KB", 30, 500), (">=100MB", 10, 20_000)],
             )],
         );
         let cand = run(
@@ -1763,7 +1763,7 @@ mod tests {
             vec![with_bytes(
                 fp("q_docs", 40, 0, 10_500),
                 1_000_000.0,
-                &[("<1KB", 30, 510), (">=10MB", 10, 50_000)],
+                &[("<1KB", 30, 510), (">=100MB", 10, 50_000)],
             )],
         );
         let rep = compare_runs("a", &base, "b", &cand, OPTS);
@@ -1773,7 +1773,7 @@ mod tests {
         assert_eq!(rep.size_regressions.len(), 1);
         let d = &rep.size_regressions[0];
         assert_eq!(d.fingerprint, "q_docs");
-        assert_eq!(d.bucket, ">=10MB");
+        assert_eq!(d.bucket, ">=100MB");
         assert_eq!(d.p95.delta_pct, Some(150.0));
         assert!(!d.count_mismatch);
         assert!(rep.size_note.is_none());
@@ -1784,7 +1784,7 @@ mod tests {
         // Rendering mentions the section and the decade.
         let text = rep.render_stdout(10);
         assert!(text.contains("Result-size decade regressions"));
-        assert!(text.contains(">=10MB"));
+        assert!(text.contains(">=100MB"));
     }
 
     #[test]

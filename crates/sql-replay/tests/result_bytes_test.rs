@@ -151,6 +151,50 @@ async fn byte_stats_are_measured_per_fingerprint_and_split_by_decade() {
     assert_eq!(fp(&back, 0).size_buckets, docs.size_buckets);
 }
 
+// New 0.4.x top decades: 10MB-100MB and the open-ended >=100MB. Blob/CLOB
+// results used to all collapse into the former ">=10MB" bucket.
+const MID: u64 = 50 * 1024 * 1024; // 10MB-100MB decade
+const HUGE: u64 = 150 * 1024 * 1024; // >=100MB decade
+
+#[tokio::test]
+async fn big_blob_results_split_into_the_new_top_decades() {
+    let path = temp_path("result-bytes-blob.jsonl.zst");
+    write_capture(
+        &path,
+        &[
+            ev(
+                1,
+                0,
+                0,
+                "SELECT blob FROM docs WHERE id = 1 /* MOCK_BYTES=52428800 */",
+            ),
+            ev(
+                1,
+                1,
+                0,
+                "SELECT blob FROM docs WHERE id = 2 /* MOCK_BYTES=157286400 */",
+            ),
+        ],
+    );
+    let run = replay(&path, false).await;
+    std::fs::remove_file(&path).ok();
+
+    let docs = fp(&run, 0);
+    assert_eq!(docs.count, 2);
+    let bytes = docs.result_bytes.as_ref().expect("byte stats present");
+    assert_eq!(bytes.max, HUGE);
+
+    // Two distinct top decades — no longer both in one ">=10MB" bucket.
+    let buckets = &docs.size_buckets;
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[0].bucket, "10MB-100MB");
+    assert_eq!(buckets[0].count, 1);
+    assert_eq!(buckets[0].bytes_total, MID);
+    assert_eq!(buckets[1].bucket, ">=100MB");
+    assert_eq!(buckets[1].count, 1);
+    assert_eq!(buckets[1].bytes_total, HUGE);
+}
+
 #[tokio::test]
 async fn checksum_path_counts_the_same_bytes_as_the_plain_path() {
     let cap = mixed_capture("checksum");

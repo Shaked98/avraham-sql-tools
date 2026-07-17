@@ -168,20 +168,28 @@ pub struct FingerprintReport {
 
 /// Result-size decade boundaries (binary units): a result set of `b` bytes
 /// falls in the first decade whose bound exceeds it, or the last decade
-/// (`>=10MB`) when none does. `<1KB` includes statements that returned no
+/// (`>=100MB`) when none does. `<1KB` includes statements that returned no
 /// result set (0 bytes).
-pub const SIZE_BUCKET_BOUNDS: [u64; 5] = [1 << 10, 10 << 10, 100 << 10, 1 << 20, 10 << 20];
+///
+/// 0.4.x extends this past the former open-ended `>=10MB` top with two more
+/// binary decades (`10MB-100MB`, `>=100MB`): blob/CLOB workloads pile every
+/// large result into a single bucket, blinding the size-decade regression
+/// gate exactly where big rows live. The six pre-existing decades keep
+/// identical boundaries and semantics — only the former top decade is split.
+pub const SIZE_BUCKET_BOUNDS: [u64; 6] =
+    [1 << 10, 10 << 10, 100 << 10, 1 << 20, 10 << 20, 100 << 20];
 
 /// Labels of the result-size decades, index-aligned with the decade order
 /// (and with [`SIZE_BUCKET_BOUNDS`], which holds the upper bounds of all
 /// but the open-ended last decade).
-pub const SIZE_BUCKET_LABELS: [&str; 6] = [
+pub const SIZE_BUCKET_LABELS: [&str; 7] = [
     "<1KB",
     "1KB-10KB",
     "10KB-100KB",
     "100KB-1MB",
     "1MB-10MB",
-    ">=10MB",
+    "10MB-100MB",
+    ">=100MB",
 ];
 
 /// Decade index (into [`SIZE_BUCKET_LABELS`]) of a result-set byte count.
@@ -456,10 +464,17 @@ mod tests {
         assert_eq!(size_bucket_index(1024 * 1024), 4);
         assert_eq!(size_bucket_index(10 * 1024 * 1024 - 1), 4);
         assert_eq!(size_bucket_index(10 * 1024 * 1024), 5);
-        assert_eq!(size_bucket_index(u64::MAX), 5);
+        assert_eq!(size_bucket_index(100 * 1024 * 1024 - 1), 5);
+        assert_eq!(size_bucket_index(100 * 1024 * 1024), 6);
+        assert_eq!(size_bucket_index(u64::MAX), 6);
         // Labels and bounds stay index-aligned.
         assert_eq!(SIZE_BUCKET_LABELS.len(), SIZE_BUCKET_BOUNDS.len() + 1);
         assert_eq!(SIZE_BUCKET_LABELS[size_bucket_index(5 << 20)], "1MB-10MB");
+        assert_eq!(
+            SIZE_BUCKET_LABELS[size_bucket_index(50 << 20)],
+            "10MB-100MB"
+        );
+        assert_eq!(SIZE_BUCKET_LABELS[size_bucket_index(500 << 20)], ">=100MB");
     }
 
     #[test]
