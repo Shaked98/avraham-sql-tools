@@ -609,8 +609,13 @@ these are the knobs that start mattering:
   additionally pins `tmp_table_size`/`max_heap_table_size` because
   stock 8.0 spills a GROUP BY temp table to disk that 5.7 keeps in
   memory under identical defaults; see
-  ["Why the server config is pinned"](../verify/README.md#why-the-server-config-is-pinned-on-both-containers)
-  for the measurements. `compare`'s settings diff (it records `sql_mode`,
+  ["Why the server config is pinned"](../verify/README.md#why-the-server-config-is-pinned-on-every-container)
+  for the measurements — and the executed
+  [benchmark writeups](benchmarks/2026-07-16-mysql80-general.md) for
+  what stock defaults cost on a real workload (stock defaults made a
+  GROUP BY class ~5x slower on 8.0 — the utf8mb4 default widening the
+  grouping keys, compounded by 8.0's temp-table spill behavior).
+  `compare`'s settings diff (it records `sql_mode`,
   charset/collation, buffer pool size, and transaction isolation from
   each target) is your safety net when something slips through — read
   it before trusting any verdict.
@@ -631,7 +636,9 @@ Every one of these was hit (or nearly hit) while building this guide:
   — 20% of 150µs is scheduler noise, and 8.0's per-query overhead is
   genuinely a little higher than 5.7's. Compare Δp95 against Δmean
   (they'll disagree wildly on noise), and size `--threshold-pct`/
-  `--min-count` so the gate only trips on real pain.
+  `--min-count` so the gate only trips on real pain. The
+  [benchmark writeups](benchmarks/2026-07-16-mysql80-hugetext.md) hit
+  this repeatedly: every flagged sub-ms class was 0.05–0.8 ms absolute.
 - **The capture contains sessions you never wrote** — client startup
   queries (`select @@version_comment limit 1` on every connection) and
   your own admin session. Expected; that's what `--filter-user` is for.

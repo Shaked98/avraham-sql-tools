@@ -20,6 +20,14 @@ from the quickstart. No external refs/fonts — keep it that way so GitHub
 renders it in both themes; update it when subcommands, artifacts, or the
 pipeline shape change.
 
+`docs/benchmarks/` holds three *executed* benchmark writeups (5.7 vs
+8.0 general + huge-text, 5.7 vs MariaDB 10.11) feeding the README
+"Benchmarks" cross-engine table. Every number came from a real run —
+never hand-edit them; a new benchmark run gets a new dated file (and
+the README table updated to match). The README table's footnotes
+(baseline charset labeling, cross-tool-version MB/s caveat) are
+load-bearing — keep them when editing the section.
+
 ## Build / test
 
 ```sh
