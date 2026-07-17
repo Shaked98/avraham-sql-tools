@@ -4,7 +4,7 @@ This is the hands-on, ~15-minute version of the README's
 [Quickstart](../README.md#quickstart): a complete capture → replay →
 compare session you can run on any x86_64 Linux machine with Docker, to
 evaluate sql-replay for a real 5.7 → 8.0 migration. Every command below
-was executed exactly as shown, against the real v0.3.0 release binary and
+was executed exactly as shown, against the real v0.4.0 release binary and
 throwaway MySQL containers; the outputs are real (a few long ones are
 trimmed and marked). Exact latency numbers will differ on your machine —
 the shapes and verdicts should not. For the big picture first, the
@@ -46,11 +46,11 @@ The release binary is fully static (musl) — one file, no runtime
 dependencies, same install on a dev laptop or a RHEL 8 database host:
 
 ```console
-$ VERSION=0.3.0   # the latest release tag, without the leading v
+$ VERSION=0.4.0   # the latest release tag, without the leading v
 $ curl -LO https://github.com/Shaked98/avraham-sql-tools/releases/download/v$VERSION/sql-replay-$VERSION-x86_64-unknown-linux-musl.tar.gz
 $ curl -LO https://github.com/Shaked98/avraham-sql-tools/releases/download/v$VERSION/SHA256SUMS
 $ sha256sum --check --ignore-missing SHA256SUMS
-sql-replay-0.3.0-x86_64-unknown-linux-musl.tar.gz: OK
+sql-replay-0.4.0-x86_64-unknown-linux-musl.tar.gz: OK
 $ tar xzf sql-replay-$VERSION-x86_64-unknown-linux-musl.tar.gz
 $ sudo install -m755 sql-replay-$VERSION-x86_64-unknown-linux-musl/sql-replay /usr/local/bin/
 ```
@@ -60,7 +60,7 @@ self-contained: `install -m755 .../sql-replay ~/.local/bin/`.)
 
 ```console
 $ sql-replay --version
-sql-replay 0.3.0
+sql-replay 0.4.0
 ```
 
 ## 2. Stand up a toy "production" MySQL 5.7
@@ -220,10 +220,10 @@ Convert it into a compressed, replayable capture file:
 
 ```console
 $ sql-replay capture --input demo-slow.log --out capture.jsonl.zst
-captured 104 events / 4 sessions / 5 fingerprints (dialect: mysql-5.7, admin commands ignored: 0) in 0.00s -> capture.jsonl.zst
+captured 104 events / 4 sessions / 5 fingerprints (dialect: mysql-5.7, admin commands ignored: 3) in 0.00s -> capture.jsonl.zst
 ```
 
-Read that summary line carefully — it already teaches three things:
+Read that summary line carefully — it already teaches four things:
 
 - **104 events, not 100.** We wrote 100 statements, but the mysql client
   sends `select @@version_comment limit 1` on every connection (3 more),
@@ -237,6 +237,9 @@ Read that summary line carefully — it already teaches three things:
   same fingerprint, `where id = ?`), whitespace/case normalized, IN/VALUES
   lists collapsed to `?+`. All latency stats and regression verdicts are
   per fingerprint.
+- **3 admin commands ignored.** Connection-level commands the clients
+  sent on disconnect (`Quit`) are logged too; they aren't statements, so
+  they're counted and dropped rather than captured as events.
 
 > **Alternative: capture from the wire (pcap).** If you can't enable the
 > slow log (managed instance, log-volume concerns), record the MySQL
@@ -289,18 +292,18 @@ Replay the capture first against 5.7 (the baseline), then against 8.0
 ```console
 $ sql-replay replay --capture capture.jsonl.zst --url mysql://root@127.0.0.1:23306/ \
     --filter-user app --out run-5.7.json
-2026-07-16T10:59:59.195139Z  INFO sql_replay::replay: capture spooled for replay events=103 filtered=1 sessions=3 spool_mb=0
-Replayed 103 events across 3 sessions in 0.17s — 563.6 QPS
+2026-07-17T09:53:46.620904Z  INFO sql_replay::replay: capture spooled for replay events=103 filtered=1 sessions=3 spool_mb=0
+Replayed 103 events across 3 sessions in 0.20s — 472.4 QPS
   executed: 93  skipped: 10  errors: 0  not run: 0  connect failures: 0
   filtered out before replay: 1 events
 Target: 5.7.44 (mysql://root@127.0.0.1:23306/)
 
 Top 10 fingerprints by p95 latency:
-   count   errs    p50(ms)    p95(ms)    p99(ms)    max(ms)  fingerprint
-      20      0      9.623      9.943     10.207     10.207  select status, count(*) as cnt from orders where customer_id between ? and ? gro…
-      30      0      0.306      0.384      0.470      0.470  select count(*), sum(amount) from orders where order_date = ?
-       3      0      0.138      0.168      0.168      0.168  select @@version_comment limit ?
-      40      0      0.111      0.159      0.196      0.196  select id, name, email from customers where id = ?
+   count   errs    p50(ms)    p95(ms)    p99(ms)    max(ms) res/query  fingerprint
+      20      0      9.759      9.935     10.015     10.015       30B  select status, count(*) as cnt from orders where customer_id between ? and ? gro…
+      30      0      0.320      0.412      0.412      0.412       11B  select count(*), sum(amount) from orders where order_date = ?
+       3      0      0.122      0.215      0.215      0.215       28B  select @@version_comment limit ?
+      40      0      0.119      0.151      0.196      0.196       34B  select id, name, email from customers where id = ?
 wrote run report to run-5.7.json
 ```
 
@@ -315,27 +318,33 @@ The accounting line is the important part:
 - **filtered out before replay: 1** — the root admin session's event,
   excluded by `--filter-user app`.
 
+The `res/query` column is the mean result-set size per execution
+(decoded payload bytes, measured on the same streaming read replay
+already does). It matters later: `compare` also splits each
+fingerprint's latencies by result-size decade, so a regression that only
+hits big rows can't hide inside a small-row average.
+
 Now the candidate:
 
 ```console
 $ sql-replay replay --capture capture.jsonl.zst --url mysql://root@127.0.0.1:23307/ \
     --filter-user app --out run-8.0.json
-2026-07-16T10:59:59.370705Z  INFO sql_replay::replay: capture spooled for replay events=103 filtered=1 sessions=3 spool_mb=0
-Replayed 103 events across 3 sessions in 0.22s — 424.4 QPS
+2026-07-17T09:53:46.826856Z  INFO sql_replay::replay: capture spooled for replay events=103 filtered=1 sessions=3 spool_mb=0
+Replayed 103 events across 3 sessions in 0.22s — 419.0 QPS
   executed: 93  skipped: 10  errors: 0  not run: 0  connect failures: 0
   filtered out before replay: 1 events
 Target: 8.0.46 (mysql://root@127.0.0.1:23307/)
 
 Top 10 fingerprints by p95 latency:
-   count   errs    p50(ms)    p95(ms)    p99(ms)    max(ms)  fingerprint
-      30      0      7.199      7.751      7.915      7.915  select count(*), sum(amount) from orders where order_date = ?
-      20      0      6.391      7.359      8.359      8.359  select status, count(*) as cnt from orders where customer_id between ? and ? gro…
-      40      0      0.112      0.196      0.255      0.255  select id, name, email from customers where id = ?
-       3      0      0.119      0.156      0.156      0.156  select @@version_comment limit ?
+   count   errs    p50(ms)    p95(ms)    p99(ms)    max(ms) res/query  fingerprint
+      30      0      7.347      7.731      7.951      7.951       11B  select count(*), sum(amount) from orders where order_date = ?
+      20      0      6.075      6.667      6.743      6.743       30B  select status, count(*) as cnt from orders where customer_id between ? and ? gro…
+      40      0      0.127      0.223      0.233      0.233       34B  select id, name, email from customers where id = ?
+       3      0      0.112      0.125      0.125      0.125       28B  select @@version_comment limit ?
 wrote run report to run-8.0.json
 ```
 
-The revenue report jumped from 0.38ms to 7.8ms p95 — the dropped index,
+The revenue report jumped from 0.41ms to 7.7ms p95 — the dropped index,
 now scanning 100k rows per query. You could eyeball that here, with five
 fingerprints. `compare` exists because you can't at five hundred.
 
@@ -361,22 +370,24 @@ Comparing runs:
 Target settings diff (baseline -> candidate):
   sql_mode: ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION -> ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
 
-Totals: QPS 563.6 -> 424.4 (-24.7%) | wall 0.17s -> 0.22s (+32.8%) | executed 93 -> 93 | errors 0 -> 0 (+0)
+Totals: QPS 472.4 -> 419.0 (-11.3%) | wall 0.20s -> 0.22s (+12.7%) | executed 93 -> 93 | errors 0 -> 0 (+0)
 Fingerprints: 5 matched (0 within threshold), 0 only in baseline, 0 only in candidate, 0 with executed-count mismatch
 
 Regressions (p95 +20% or worse, count >= 5 in both runs): 2
-p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c  fingerprint
-       0.384        7.751  +1918.5%  +2165.0%       30/30  select count(*), sum(amount) from orders where order_date = ?
-       0.159        0.196    +23.3%     -0.4%       40/40  select id, name, email from customers where id = ?
+p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c   res/query b→c  fingerprint
+       0.412        7.731  +1776.5%  +2165.2%       30/30         11B→11B  select count(*), sum(amount) from orders where order_date = ?
+       0.151        0.223    +47.7%    +16.5%       40/40         34B→34B  select id, name, email from customers where id = ?
+
+Result-size decade regressions (p95 +20% or worse inside one decade of a fingerprint the ranking above did not flag; 3 decade pair(s) checked): 0
 
 Improvements (p95 -20% or better): 1
-p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c  fingerprint
-       9.943        7.359    -26.0%    -20.4%       20/20  select status, count(*) as cnt from orders where customer_id between ?…
+p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c   res/query b→c  fingerprint
+       9.935        6.667    -32.9%    -37.1%       20/20         30B→30B  select status, count(*) as cnt from orders where customer_id between ?…
 
 Low-sample fingerprints (count < 5 in either run, excluded from the ranking): 2
-p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c  fingerprint
-       0.000        0.000       n/a       n/a         0/0  insert into orders (customer_id, status, order_date, amount) values (?…
-       0.168        0.156     -7.1%     -7.1%         3/3  select @@version_comment limit ?
+p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c   res/query b→c  fingerprint
+       0.000        0.000       n/a       n/a         0/0             n/a  insert into orders (customer_id, status, order_date, amount) values (?…
+       0.215        0.125    -41.9%    -14.1%         3/3         28B→28B  select @@version_comment limit ?
 
 wrote JSON report to report.json
 wrote HTML report to report.html
@@ -402,15 +413,21 @@ Walking through it, top to bottom:
   ranked at all; below it a fingerprint drops to the low-sample section,
   which is why the 3-per-run `@@version_comment` and the never-executed
   INSERT class sit there).
-- The planted regression is unmissable: **+1918.5%** on p95.
+- The planted regression is unmissable: **+1776.5%** on p95.
 - The second "regression" is a lesson, not a bug: the point-lookup class
-  "regressed" +23.3% on p95 — which is 37 *microseconds* — while its
-  Δmean is **−0.4%**. Sub-millisecond fingerprints flap at a 20%
-  threshold from scheduler noise alone (and 8.0's per-query overhead is
-  genuinely a bit higher). When Δp95 and Δmean disagree wildly on a
+  "regressed" +47.7% on p95 — which is 72 *microseconds* — while its
+  Δmean moved only **+16.5%**. Sub-millisecond fingerprints flap at a
+  20% threshold from scheduler noise alone (and 8.0's per-query overhead
+  is genuinely a bit higher). When Δp95 and Δmean disagree wildly on a
   sub-ms class, suspect noise; gate on thresholds that represent real
   pain.
-- **Improvements are ranked too** (the GROUP BY got 26% faster on 8.0) —
+- **Result-size decade regressions** re-runs the same threshold check
+  inside each result-size decade of every unflagged fingerprint, so a
+  slowdown confined to a fingerprint's biggest rows can't be averaged
+  away by its small ones. Every result here fits one decade, so there is
+  nothing extra to find; on real workloads with mixed row sizes this
+  section earns its keep.
+- **Improvements are ranked too** (the GROUP BY got 33% faster on 8.0) —
   a migration report is not only bad news.
 - **Exit code 2** is the machine-readable verdict: `0` = no regression
   at/beyond the threshold, `2` = at least one (also used for correctness
@@ -428,8 +445,8 @@ $ sql-replay compare --baseline run-5.7.json --candidate run-8.0.json \
 ```text
 (same shape as above, trimmed to the verdict)
 Regressions (p95 +50% or worse, count >= 10 in both runs): 1
-p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c  fingerprint
-       0.384        7.751  +1918.5%  +2165.0%       30/30  select count(*), sum(amount) from orders where order_date = ?
+p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c   res/query b→c  fingerprint
+       0.412        7.731  +1776.5%  +2165.2%       30/30         11B→11B  select count(*), sum(amount) from orders where order_date = ?
 ...
 FAIL: 1 fingerprint(s) regressed >= 50% on p95 (exit code 2)
 ```
@@ -437,13 +454,10 @@ FAIL: 1 fingerprint(s) regressed >= 50% on p95 (exit code 2)
 `report.html` is the same data as a **self-contained HTML page** (inline
 CSS/JS, renders offline — safe to email or attach to a ticket) with a
 sortable per-fingerprint table and both runs' metadata side by side;
-`report.json` is the same data for machines. One note on version drift:
-v0.4.0 adds per-fingerprint result-set byte stats and per-size-decade
-regression checks, which put a result-bytes column in every fingerprint
-table in this walkthrough (`replay`, `baseline`, and `compare` — terminal
-output and reports alike) and a size-decade section in `compare`'s
-output; the v0.3.0 binary this walkthrough was executed against produces
-output exactly as shown here.
+`report.json` is the same data for machines. If a future release changes
+what these commands print, expect this walkthrough to be re-executed
+against it — every output block here is the verbatim product of the
+release named at the top.
 
 ## 7. No replayable 5.7? Use the recorded baseline
 
@@ -460,12 +474,12 @@ Recorded 103 events across 3 sessions in 0.00s — 0.0 QPS
 Latencies: recorded in the source capture (slow-log Query_time, or request→response wire time for pcap captures; no replay target — the capture carries no error information, so errors are 0 by definition)
 
 Top 10 fingerprints by p95 latency:
-   count   errs    p50(ms)    p95(ms)    p99(ms)    max(ms)  fingerprint
-      20      0      9.327      9.671      9.711      9.711  select status, count(*) as cnt from orders where customer_id between ? and ? gro…
-      30      0      0.349      1.021      1.181      1.181  select count(*), sum(amount) from orders where order_date = ?
-      10      0      0.371      0.998      0.998      0.998  insert into orders (customer_id, status, order_date, amount) values (?+)
-       3      0      0.057      0.063      0.063      0.063  select @@version_comment limit ?
-      40      0      0.023      0.045      0.191      0.191  select id, name, email from customers where id = ?
+   count   errs    p50(ms)    p95(ms)    p99(ms)    max(ms) res/query  fingerprint
+      20      0      5.087      9.447      9.471      9.471         -  select status, count(*) as cnt from orders where customer_id between ? and ? gro…
+      10      0      0.357      1.043      1.043      1.043         -  insert into orders (customer_id, status, order_date, amount) values (?+)
+      30      0      0.365      0.995      1.049      1.049         -  select count(*), sum(amount) from orders where order_date = ?
+      40      0      0.023      0.060      0.406      0.406         -  select id, name, email from customers where id = ?
+       3      0      0.035      0.049      0.049      0.049         -  select @@version_comment limit ?
 wrote baseline report to baseline.json
 ```
 
@@ -475,7 +489,8 @@ inside one second. A real capture shows production's span and QPS. Note
 the INSERT class *is* included here — `baseline` executes nothing
 against any server, so there is no write gate to skip it, and "executed"
 means "aggregated from the recording". Errors are 0 by definition: the
-slow log records none.)
+slow log records none. `res/query` is `-` for the same reason — the
+capture records latencies, not result sizes.)
 
 Comparing recorded-vs-replayed prints the loudest warning in the tool:
 
@@ -492,30 +507,33 @@ Comparing runs:
 
 Target settings: settings diff skipped: the baseline run records no target settings (recorded from the slow log)
 
-Totals: QPS 0.0 -> 424.4 (n/a) | wall 0.00s -> 0.22s (n/a) | executed 103 -> 93 | errors 0 -> 0 (+0)
+Totals: QPS 0.0 -> 419.0 (n/a) | wall 0.00s -> 0.22s (n/a) | executed 103 -> 93 | errors 0 -> 0 (+0)
 Fingerprints: 5 matched (1 within threshold), 0 only in baseline, 0 only in candidate, 1 with executed-count mismatch
 
 Regressions (p95 +50% or worse, count >= 10 in both runs): 2
-p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c  fingerprint
-       1.021        7.751   +659.2%  +1645.0%       30/30  select count(*), sum(amount) from orders where order_date = ?
-       0.045        0.196   +335.6%   +289.0%       40/40  select id, name, email from customers where id = ?
+p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c   res/query b→c  fingerprint
+       0.995        7.731   +677.0%  +1554.9%       30/30             n/a  select count(*), sum(amount) from orders where order_date = ?
+       0.060        0.223   +271.7%   +265.1%       40/40             n/a  select id, name, email from customers where id = ?
+
+Result-size decades: result-set byte and size-decade comparison skipped: the baseline run records no result-set byte stats (recorded latencies — the capture carries no result sizes)
+
 
 Improvements (p95 -50% or better): 0
 
 Low-sample fingerprints (count < 10 in either run, excluded from the ranking): 2
-p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c  fingerprint
-       0.063        0.156   +147.6%   +133.5%         3/3  select @@version_comment limit ?
-       0.998        0.000   -100.0%   -100.0%        10/0  insert into orders (customer_id, status, order_date, amount) values (?…  [count mismatch]
+p95 base(ms) p95 cand(ms)      Δp95     Δmean   count b/c   res/query b→c  fingerprint
+       0.049        0.125   +155.1%   +217.4%         3/3             n/a  select @@version_comment limit ?
+       1.043        0.000   -100.0%   -100.0%        10/0             n/a  insert into orders (customer_id, status, order_date, amount) values (?…  [count mismatch]
 
 FAIL: 2 fingerprint(s) regressed >= 50% on p95 (exit code 2)
 ```
 
 This output *is* the lesson in comparing across measurement planes:
 
-- The planted regression still screams (+659%) — real regressions
+- The planted regression still screams (+677%) — real regressions
   survive the plane change.
-- The point-lookup class shows +335%: recorded server-side time was
-  45µs, replayed client-side wall time is 196µs — the difference is
+- The point-lookup class shows +272%: recorded server-side time was
+  60µs, replayed client-side wall time is 223µs — the difference is
   mostly network round-trip and driver overhead, not the server. This is
   exactly why the warning says to use a generous `--threshold-pct`
   (think 50+, sized so only real pain trips it) and treat small
