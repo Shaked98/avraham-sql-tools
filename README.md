@@ -357,6 +357,10 @@ $ sql-replay replay \
   `MALLOC_MMAP_THRESHOLD_` environment variables; the cost is a page-fault
   tax of roughly a millisecond per 15 MB row on fetches of multi-MB rows
   (identical on both sides of a `compare` pair, so ratios are unaffected).
+- **Sizing `--pool` to a memory budget:** invert the RSS formula — pick
+  `N ≈ budget / (3 x largest row)`. A 512 MiB budget against 15 MiB rows
+  gives `N ≈ 512 / (3 x 15) ≈ 11`, so `--pool 11` keeps peak RSS under the
+  budget (leave headroom for `base`).
 - If the connection cap cannot fit under the process's open-files limit,
   replay fails up front with the `ulimit -n` / systemd `LimitNOFILE=` value
   to raise.
@@ -443,6 +447,29 @@ $ sql-replay replay --capture capture.jsonl.zst --url mysql://... \
   with connections holding rows in flight (see the memory-model bullet
   above), and `--pool N` caps that at N regardless of session count.
 
+> **Recipe: I/O-bound / cold-cache captures (blob-lookup workloads).**
+> `--warmup --repeat 3` measures *warm steady-state* latency and is the
+> right default for CPU/memory-bound work. It is the wrong tool when the
+> point of the test is cold disk I/O (e.g. large-blob point lookups whose
+> cost is the physical read): warmup pre-populates the buffer pool and
+> destroys the very signal you're measuring, and a second `--repeat` pass
+> reads from a now-warm cache, so its latencies aren't comparable to the
+> first. For those runs:
+> - **Cold-restart the server between passes** for a cold buffer pool
+>   (`docker restart <container>`, or restart the service), then run **one**
+>   paced pass per restart.
+> - **Do not use `--warmup`** — it warms the cache you want cold.
+> - **Do not use `--repeat` for cross-pass medians** — the second pass reads
+>   warm and isn't comparable. Run a single `--speed 1.0` pass per cold
+>   restart and compare those instead.
+> - **Force reads to actually reach storage:** set `innodb_buffer_pool_size`
+>   deliberately small relative to the dataset and
+>   `innodb_flush_method=O_DIRECT`, then *verify* I/O-boundedness rather
+>   than trusting it — check the `Innodb_data_reads` delta across the pass
+>   (`SHOW GLOBAL STATUS LIKE 'Innodb_data_reads'` before/after) and confirm
+>   the physical-read ratio is high. A pass that served from cache isn't a
+>   cold-I/O measurement no matter how it was configured.
+
 ### Comparing runs (5.7 vs 8.0 regression gate)
 
 Replay the same capture against both servers, then diff the two run
@@ -502,9 +529,11 @@ free):
   (total/min/max/mean exact, p50/p95 from a 2-significant-digit
   histogram) and `size_buckets`: its latency stats split by
   **result-size decade** — `<1KB`, `1KB-10KB`, `10KB-100KB`, `100KB-1MB`,
-  `1MB-10MB`, `>=10MB` (binary units, lower bound inclusive). Only
-  non-empty decades are stored; the stdout table shows mean result bytes
-  per query.
+  `1MB-10MB`, `10MB-100MB`, `>=100MB` (binary units, lower bound
+  inclusive). Only non-empty decades are stored; the stdout table shows
+  mean result bytes per query. (0.4.x split the former open-ended `>=10MB`
+  into `10MB-100MB` and `>=100MB` so blob/CLOB workloads, where every large
+  result piled into one bucket, still get a per-decade regression signal.)
 - **Bytes are decoded payload, not wire bytes**: the canonical cell sizes
   of every drained row (string/blob cells count their byte length,
   fixed-width numerics their binary width, NULLs zero) — comparable
