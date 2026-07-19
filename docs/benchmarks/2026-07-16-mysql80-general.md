@@ -4,9 +4,12 @@
 **sql-replay:** 0.2.0, built `--release` from commit `8aa0c49` ("test(verify): real-data detection-quality rig for sql-replay (#5)")
 **Servers:** mysql:5.7 → **5.7.44**, mysql:8.0 → **8.0.46** (official Docker images, data on ext4 via Docker's default volume storage — never /mnt/c)
 
-> One of three executed benchmark writeups behind the cross-engine table
+> One of four executed benchmark writeups behind the cross-engine table
 > in the main [README](../../README.md#benchmarks-where-a-57-workload-regresses-on-80-vs-mariadb-1011).
-> Companions: [5.7 vs 8.0 on huge-text payloads](2026-07-16-mysql80-hugetext.md) ·
+> Companions: [5.7 vs parity-pinned 8.0](2026-07-19-mysql80-parity.md)
+> (Run 2 rerun with 5.7 defaults pinned on 8.0 — the +465% gb cliff below
+> comes back to +8%) ·
+> [5.7 vs 8.0 on huge-text payloads](2026-07-16-mysql80-hugetext.md) ·
 > [5.7 vs MariaDB 10.11, both workloads](2026-07-16-mariadb.md).
 
 ## Verdict
