@@ -147,7 +147,9 @@ engine".
 
 **The query cache is gone.** 8.0 removed it entirely — `have_query_cache`
 is the only trace left, and the five `query_cache_*` variables are among
-the 38 removed:
+the 38 removed (this section's transcripts run against
+`parity-80-pinned`, the pinned container stood up in §8 — execution
+order differs from presentation order here):
 
 ```console
 $ docker exec parity-80-pinned mysql -uroot -e "SHOW GLOBAL VARIABLES LIKE 'query_cache%';"
@@ -402,7 +404,8 @@ behavior-relevant and pinnable is left.
 The mechanism the charset pin exists for, made visible — the same
 `CREATE TABLE` (no explicit charset, the
 [quickstart's seed](quickstart.md#2-stand-up-a-toy-production-mysql-57))
-run on all three servers:
+run on all three servers (the `shop` schema was seeded on each of them
+for §9's workload):
 
 ```console
 $ for c in parity-57 parity-80-stock parity-80-pinned; do
@@ -419,10 +422,14 @@ reproduced 5.7's latin1 exactly.
 ## 9. Prove it with the tool: `compare` before vs after
 
 The point of all of the above, seen through sql-replay itself. Seed all
-three servers with the quickstart's deterministic `shop` schema, run the
-quickstart's three-session read workload on 5.7 with the slow log on,
-capture, and replay the same capture against each server (full recipe in
-[the quickstart](quickstart.md), §§2–5):
+three servers with the quickstart's deterministic `shop` schema, then run
+a reads-only variant of the quickstart's three-session workload on 5.7
+with the slow log on — session 1 issues only its point lookups, with the
+10 INSERTs omitted — capture, and replay the same capture against each
+server. The schema and slow-log mechanics are the quickstart's
+([quickstart](quickstart.md), §§2–5); omitting the INSERTs is why this
+capture shows 94 events / 4 fingerprints / 1 admin command ignored where
+the quickstart's shows 104 / 5 / 3:
 
 ```console
 $ sql-replay capture --input parity-slow.log --out capture.jsonl.zst
