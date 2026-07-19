@@ -171,7 +171,7 @@ pub struct FingerprintReport {
 /// (`>=100MB`) when none does. `<1KB` includes statements that returned no
 /// result set (0 bytes).
 ///
-/// 0.4.x extends this past the former open-ended `>=10MB` top with two more
+/// 0.5.0 extends this past the former open-ended `>=10MB` top with two more
 /// binary decades (`10MB-100MB`, `>=100MB`): blob/CLOB workloads pile every
 /// large result into a single bucket, blinding the size-decade regression
 /// gate exactly where big rows live. The six pre-existing decades keep
