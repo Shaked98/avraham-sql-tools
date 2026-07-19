@@ -151,7 +151,7 @@ async fn byte_stats_are_measured_per_fingerprint_and_split_by_decade() {
     assert_eq!(fp(&back, 0).size_buckets, docs.size_buckets);
 }
 
-// New 0.4.x top decades: 10MB-100MB and the open-ended >=100MB. Blob/CLOB
+// New 0.5.0 top decades: 10MB-100MB and the open-ended >=100MB. Blob/CLOB
 // results used to all collapse into the former ">=10MB" bucket.
 const MID: u64 = 50 * 1024 * 1024; // 10MB-100MB decade
 const HUGE: u64 = 150 * 1024 * 1024; // >=100MB decade
