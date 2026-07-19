@@ -639,6 +639,11 @@ these are the knobs that start mattering:
   what stock defaults cost on a real workload (stock defaults made a
   GROUP BY class ~5x slower on 8.0 — the utf8mb4 default widening the
   grouping keys, compounded by 8.0's temp-table spill behavior).
+  For a real 5.7 → 8.0 gate,
+  [docs/parity-5.7-to-8.0.md](parity-5.7-to-8.0.md) is the complete
+  executed treatment: every stock-default drift between the two versions
+  classified, and a ready-to-use `my.cnf` fragment that pins the 8.0
+  candidate back to 5.7 defaults.
   `compare`'s settings diff (it records `sql_mode`,
   charset/collation, buffer pool size, and transaction isolation from
   each target) is your safety net when something slips through — read

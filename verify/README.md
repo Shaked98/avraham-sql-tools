@@ -131,7 +131,10 @@ genuinely pays both, and `compare` surfaces the cue in its comparability
 warning (`character_set_server: latin1 -> utf8mb4`). For a real migration
 assessment, run the comparison twice — once on stock defaults (what you
 will get) and once with the charset and temp-table limits pinned or
-schemas converted deliberately (what the engine change alone costs).
+schemas converted deliberately (what the engine change alone costs). The
+executed [5.7 → 8.0 parity guide](../docs/parity-5.7-to-8.0.md) takes
+that second run to completion: every stock-default drift classified,
+with a ready-to-use pinning `my.cnf` fragment.
 
 ## Running it
 
