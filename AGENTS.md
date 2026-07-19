@@ -9,7 +9,7 @@ diffing — the final planned milestone).
 
 `docs/quickstart.md` is an *executed* walkthrough: every shown output
 came from really running the commands against the pinned release binary
-(v0.4.0) and toy mysql:5.7/8.0 containers. If tool output or flags
+(v0.5.0) and toy mysql:5.7/8.0 containers. If tool output or flags
 change, re-execute the walkthrough (and bump the pinned version when a
 new release ships) instead of hand-editing the outputs. When
 re-executing: §6's noise lesson needs the sub-ms point-lookup class's
