@@ -18,6 +18,15 @@ on this host it swings roughly −11%..+72% run to run — re-run the two
 replay commands (real filenames, keep transcripts) until a pair lands
 in band.
 
+`docs/parity-5.7-to-8.0.md` is likewise *executed* (stock mysql:5.7 /
+mysql:8.0 containers, real `SHOW GLOBAL VARIABLES` diffs, real
+`compare` transcripts): it classifies every 5.7→8.0 default drift and
+ships the pinning `my.cnf` fragment. Its §7 cnf and §8/§9 outputs are
+one artifact — if either the fragment or tool output changes,
+re-execute the container run rather than hand-editing; the compare
+excerpts are deliberately trimmed right after the "Target settings
+diff" section (marked in the doc).
+
 `docs/architecture.svg` is a hand-written, self-contained SVG workflow
 diagram (Cantrill-style: white canvas rect, soft-fill rounded boxes,
 dashed zone containers) embedded near the top of the README and linked

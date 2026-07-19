@@ -91,6 +91,14 @@ real output of every command, guidance on reading `compare` reports, and
 production notes + first-run troubleshooting for a real 5.7 → 8.0
 migration.
 
+**Gating a real 5.7 → 8.0 migration?**
+[docs/parity-5.7-to-8.0.md](docs/parity-5.7-to-8.0.md) is the executed
+companion: the full stock-5.7-vs-stock-8.0 global-variables diff, every
+difference classified (pinnable drift / honest cannot-pin caveats /
+engine-intrinsic changes / noise), and a ready-to-use `my.cnf` fragment
+that pins the 8.0 candidate back to 5.7 defaults — so `compare` measures
+the engine, not config drift.
+
 ### Scope
 
 M1 shipped `capture` and `replay`; M2 added faithful-timing pacing
