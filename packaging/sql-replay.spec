@@ -6,11 +6,11 @@
 #
 #   rpmbuild -bb packaging/sql-replay.spec \
 #     --define "_sourcedir $PWD/dist" \
-#     --define "version 0.4.0"
+#     --define "version 0.5.0"
 #
 # where dist/ holds sql-replay-<version>-x86_64-unknown-linux-musl.tar.gz.
 
-%{!?version: %global version 0.4.0}
+%{!?version: %global version 0.5.0}
 
 # The binary is prebuilt and static: no debuginfo to extract, no build-id
 # links, and no automatic library dependencies to scan for.
@@ -55,6 +55,11 @@ install -Dm644 README.md %{buildroot}%{_docdir}/sql-replay/README.md
 %license LICENSE-MIT LICENSE-APACHE
 
 %changelog
+* Sun Jul 19 2026 avraham-sql-tools contributors - 0.5.0-1
+- The top result-size decade is split into 10 MB - 100 MB and >= 100 MB
+  buckets, so `compare`'s per-decade regression gate distinguishes
+  large-row classes instead of lumping everything past 10 MB together.
+
 * Thu Jul 16 2026 avraham-sql-tools contributors - 0.4.0-1
 - Per-fingerprint result-set byte stats recorded in run.json
   (total/min/max/mean plus p50/p95), measured on the streaming drain.

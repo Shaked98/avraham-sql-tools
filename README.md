@@ -38,7 +38,7 @@ file. This README documents the code on `main`; check a release's notes
 for what its tag includes.
 
 ```console
-$ VERSION=0.4.0   # the latest release tag, without the leading v
+$ VERSION=0.5.0   # the latest release tag, without the leading v
 $ curl -LO https://github.com/Shaked98/avraham-sql-tools/releases/download/v$VERSION/sql-replay-$VERSION-x86_64-unknown-linux-musl.tar.gz
 $ curl -LO https://github.com/Shaked98/avraham-sql-tools/releases/download/v$VERSION/SHA256SUMS
 $ sha256sum --check --ignore-missing SHA256SUMS
@@ -107,6 +107,9 @@ diffing** (`replay --checksum` + a correctness section in `compare`).
 0.4.0 added **result-set byte stats and size-decade splits** per
 fingerprint, so `compare` can flag a regression that only affects big
 rows instead of averaging it away inside a mixed-size fingerprint.
+0.5.0 split the top decade into **`10MB-100MB` and `>=100MB`** so
+blob/CLOB workloads, whose large results all landed in one open-ended
+bucket, keep a per-decade regression signal.
 
 ### Supported source and target servers
 
@@ -531,7 +534,7 @@ free):
   **result-size decade** — `<1KB`, `1KB-10KB`, `10KB-100KB`, `100KB-1MB`,
   `1MB-10MB`, `10MB-100MB`, `>=100MB` (binary units, lower bound
   inclusive). Only non-empty decades are stored; the stdout table shows
-  mean result bytes per query. (0.4.x split the former open-ended `>=10MB`
+  mean result bytes per query. (0.5.0 split the former open-ended `>=10MB`
   into `10MB-100MB` and `>=100MB` so blob/CLOB workloads, where every large
   result piled into one bucket, still get a per-decade regression signal.)
 - **Bytes are decoded payload, not wire bytes**: the canonical cell sizes
