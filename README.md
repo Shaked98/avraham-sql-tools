@@ -136,12 +136,15 @@ settings deltas read as engine defaults to review, not noise.
 
 ### Benchmarks: where a 5.7 workload regresses on 8.0 vs MariaDB 10.11
 
-Three executed benchmark writeups — the tool dogfooding itself against
+Four executed benchmark writeups — the tool dogfooding itself against
 real `mysql:5.7`, `mysql:8.0` and `mariadb:10.11` containers — compare
 the same captured 5.7 workloads on both migration candidates:
 
 - [5.7 vs 8.0, general workload](docs/benchmarks/2026-07-16-mysql80-general.md)
   (stock server defaults — deliberately charset-confounded, see footnote 1)
+- [5.7 vs 8.0 parity-pinned, general workload](docs/benchmarks/2026-07-19-mysql80-parity.md)
+  (same run with the [parity `my.cnf` fragment](docs/parity-5.7-to-8.0.md)
+  on 8.0 — isolates the engine from drifted defaults)
 - [5.7 vs 8.0, huge-text payloads](docs/benchmarks/2026-07-16-mysql80-hugetext.md)
   (100KB–15MB LONGTEXT documents, charset pinned)
 - [5.7 vs MariaDB 10.11, both workloads](docs/benchmarks/2026-07-16-mariadb.md)
@@ -159,6 +162,11 @@ than 5.7.
 | pk point lookup | +8% | −3% |
 | hire-date secondary-index lookup | −6% | −4% |
 | short INSERT (audit row) | **+25%** ² (mean +7%) | +5% |
+| **General workload — 8.0 parity-pinned** vs **latin1-5.7** (full 5.7-defaults `my.cnf` fragment on 8.0¹) · [writeup](docs/benchmarks/2026-07-19-mysql80-parity.md) | | |
+| join + GROUP BY over VARCHAR keys | +8% ¹ | — |
+| pk point lookup | +9% | — |
+| hire-date secondary-index lookup | **+102%** ² (candidate abs. ≈ stock run's) | — |
+| short INSERT (audit row) | **+28%** ² (mean +20%) | — |
 | **Huge-text full fetches, single stream (C=1)** — charset pinned in both runs · [8.0 writeup](docs/benchmarks/2026-07-16-mysql80-hugetext.md) · [MariaDB writeup](docs/benchmarks/2026-07-16-mariadb.md) | | |
 | full fetch 100KB | −16% | −4% |
 | full fetch 1MB | +5% | −7% |
@@ -178,6 +186,13 @@ What the table says at a glance:
   engine — so it is tunable¹. **MariaDB 10.11 is 15% *faster* than 5.7
   on the same class** (p95 340 → 289 ms, charset pinned): the cliff is
   an 8.0 phenomenon, not a "leaving 5.7" phenomenon.
+- **Pinned back to 5.7's defaults, 8.0 is at par: the cliff was config,
+  not engine.** The parity-pinned rerun recovers ~98% of the GROUP BY
+  regression (p95 1145 → 222 ms, vs 5.7's 206 ms — a residual +8%), and
+  overall QPS lands at −2.6% vs stock's −60%. What survives everywhere
+  is a small consistent per-statement overhead — with the same
+  parameters, 8.0 is slightly slower on every class of this workload,
+  catastrophically slower on none.
 - **Huge-text transfer is at par on both candidates.** On ≥1MB full
   fetches 8.0's mean latency is 2–17% *lower* than 5.7's at every
   concurrency; MariaDB's means stay within single-digit percent either
@@ -210,7 +225,11 @@ Footnotes — read before quoting any number:
    8.0 huge-text run) pins utf8mb4 on both sides (**utf8mb4-5.7**
    baseline); the charset alone costs 5.7 about +68% p95 on the GROUP
    BY class (202 → 340 ms baseline). Pinning or deliberately converting
-   the charset shrinks 8.0's cliff accordingly.
+   the charset shrinks 8.0's cliff accordingly — measured directly by
+   the parity-pinned row group: with the full
+   [5.7-defaults fragment](docs/parity-5.7-to-8.0.md) applied to 8.0
+   (charset, temp-table engine, and 20+ other drifted defaults), the
+   class comes back to +8% p95.
 2. Sub-millisecond classes on a virtualized box are scheduler-noise
    territory at `compare`'s default 20% threshold: the direction (8.0's
    higher per-statement cost) is consistent across runs, the magnitudes

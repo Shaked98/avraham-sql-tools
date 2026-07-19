@@ -4,9 +4,10 @@
 **sql-replay:** 0.2.0, built `--release` from commit `8aa0c49` (same binary/method as the [prior general-workload head-to-head](2026-07-16-mysql80-general.md))
 **Servers:** mysql:5.7 → **5.7.44**, mysql:8.0 → **8.0.46**, run **sequentially** (never simultaneous), data on ext4 via Docker's default volume storage — never /mnt/c. The box was shared with other workloads, but they were idle during the runs.
 
-> One of three executed benchmark writeups behind the cross-engine table
+> One of four executed benchmark writeups behind the cross-engine table
 > in the main [README](../../README.md#benchmarks-where-a-57-workload-regresses-on-80-vs-mariadb-1011).
 > Companions: [5.7 vs 8.0, general workload](2026-07-16-mysql80-general.md) ·
+> [5.7 vs parity-pinned 8.0](2026-07-19-mysql80-parity.md) ·
 > [5.7 vs MariaDB 10.11, both workloads](2026-07-16-mariadb.md).
 
 Motivating question: *what happens when the workload fetches huge XML text — 5 MB documents and larger?* Extends the prior head-to-head, this time with the charset confound **removed** (pinned identically on both, see below).
